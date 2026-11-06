@@ -361,13 +361,21 @@ async fn events_are_namespaced_forwarded_and_do_not_break_rpc() {
     wait_state(&h.pool, "good", UpstreamState::Online).await;
     let mut socket=control_agent(h.addr).await;
     let sender=h.state.events.clone();
-    sender.send(UpstreamEvent { upstream:"good".into(), event:json!({"type":"event","seq":99,"payload":{"session_id":"session:e","view":{"session_id":"session:v"}}}) }).unwrap();
+    let before_tickets = h.state.tickets.pending();
+    sender.send(UpstreamEvent { upstream:"good".into(), event:json!({"type":"event","seq":99,"payload":{"session_id":"session:e","view":{"session_id":"session:v","ticket":"up-ticket"}}}) }).unwrap();
     tokio::time::sleep(tmo(30)).await;
     socket.send(tungstenite::Message::Text(json!({"type":"request","id":"correlate","method":"server.version","payload":{}}).to_string())).await.unwrap();
     let event=match socket.next().await.unwrap().unwrap() { tungstenite::Message::Text(text)=>serde_json::from_str::<Value>(&text).unwrap(), other=>panic!("unexpected {other:?}") };
     assert_eq!(event["type"],"event");
     assert_eq!(event["payload"]["session_id"],"good:session:e");
     assert_eq!(event["payload"]["view"]["session_id"],"good:session:v");
+    let ticket = event["payload"]["view"]["ticket"].as_str().unwrap();
+    assert_ne!(ticket, "up-ticket");
+    assert_eq!(h.state.tickets.pending(), before_tickets + 1, "event tickets rewritten once, not twice");
+    assert!(h.state.sessions.contains("good:session:e"), "event must record top-level session");
+    assert!(h.state.sessions.contains("good:session:v"), "event must record nested session");
+    let mapped = h.state.tickets.take(ticket, SECRET).unwrap();
+    assert_eq!(mapped.upstream_ticket, "up-ticket");
     let response=loop {
         match socket.next().await.unwrap().unwrap() {
             tungstenite::Message::Text(text)=>break serde_json::from_str::<Value>(&text).unwrap(),
@@ -377,6 +385,25 @@ async fn events_are_namespaced_forwarded_and_do_not_break_rpc() {
     };
     assert_eq!(response["id"],"correlate");
     assert_eq!(response["payload"],json!({"ok":true}));
+}
+
+#[tokio::test]
+async fn session_list_includes_degraded_and_skips_offline() {
+    let online = spawn_fake_rex(vec![json!({"session_id":"session:on"})], false).await;
+    let slow = spawn_fake_rex(vec![json!({"session_id":"session:slow"})], false).await;
+    let dead = dead_url().await;
+    // Long probe interval so our manual marks stick for the list call.
+    let h = start_gateway(&[("online", &online), ("slow", &slow), ("dead", &dead)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    wait_state(&h.pool, "online", UpstreamState::Online).await;
+    wait_state(&h.pool, "slow", UpstreamState::Online).await;
+    h.pool.mark("slow", UpstreamState::Degraded, Some(1500), 1).await;
+    h.pool.mark("dead", UpstreamState::Offline, None, 0).await;
+    let mut socket = control_agent(h.addr).await;
+    let reply = rpc(&mut socket, "session.list", json!({})).await;
+    assert_eq!(ids(&reply), ["online:session:on", "slow:session:slow"], "{reply}");
+    assert_eq!(reply["partial"], true);
+    assert_eq!(reply["failed_upstreams"], json!(["dead"]));
+    assert!(reply["upstream_errors"]["dead"].as_str().unwrap().contains("Offline"), "{reply}");
 }
 
 #[tokio::test]

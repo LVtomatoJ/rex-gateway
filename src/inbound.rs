@@ -30,7 +30,7 @@ use crate::{
     pool::UpstreamPool,
     status,
     sessions::{SessionStore, FORGOTTEN_ERROR},
-    protocol::{namespace_event, namespace_and_record, translate_session_id, SUBPROTOCOL},
+    protocol::{namespace_and_record, translate_session_id, SUBPROTOCOL},
 };
 
 const DATA_SUBPROTOCOL: &str = "rex.data.terminal.v1";
@@ -140,7 +140,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":13});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":14});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -175,14 +175,16 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             }
             event=events.recv()=> {
                 let event=match event { Ok(event)=>event, Err(broadcast::error::RecvError::Lagged(n))=>{ tracing::warn!(n,"agent event receiver lagged"); continue }, Err(_)=>break };
-                let event_upstream=event.upstream.clone();
-                if auth::Authenticator::permits(&acl,&event.upstream) {
-                    if let Some(event)=namespace_event(&event.event,&event.upstream,{ seq+=1; seq },&state.tickets,&owner) {
-                        // Discover references emitted asynchronously as well as in RPC responses.
-                        if let Some(payload)=event.get("payload"){let mut p=payload.clone();namespace_and_record(&mut p,&event_upstream,&state.tickets,&owner,&state.sessions);}
-                        if sink.send(Message::Text(event.to_string())).await.is_err() { break; }
-                    }
-                }
+                if event.event.get("type").and_then(Value::as_str) != Some("event") { continue; }
+                if !auth::Authenticator::permits(&acl,&event.upstream) { continue; }
+                // Namespace once, then record from the wrapped payload. Re-running
+                // namespace_and_record on an already-wrapped payload double-prefixes
+                // session ids (so recording fails) and re-issues orphan tickets.
+                let mut payload = event.event.get("payload").cloned().unwrap_or(Value::Null);
+                namespace_and_record(&mut payload, &event.upstream, &state.tickets, &owner, &state.sessions);
+                seq += 1;
+                let framed = json!({"type":"event","seq":seq,"payload":payload});
+                if sink.send(Message::Text(framed.to_string())).await.is_err() { break; }
             }
             _=pings.tick()=>if sink.send(Message::Ping(Vec::new())).await.is_err() { break; },
             _=idle.tick()=>if last_activity.elapsed()>=state.options.idle_timeout {
@@ -272,9 +274,10 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
 }
 
 /// Fans `session.list` out to every allowed upstream concurrently (each bounded by the upstream
-/// call timeout). Upstreams that are not Online or that fail are skipped and reported through the
-/// additive `partial` / `failed_upstreams` / `upstream_errors` fields; if every allowed upstream
-/// fails, the request fails.
+/// call timeout). Upstreams that are not routable (`Online`/`Degraded`) or that fail are skipped
+/// and reported through the additive `partial` / `failed_upstreams` / `upstream_errors` fields;
+/// if every allowed upstream fails, the request fails. This matches create/RPC routing, which
+/// already treats Degraded as usable.
 
 /// Hostless `session.create`: try candidates in score order. Transport failures (timeout,
 /// connect, missing client, socket closed, "retry in …") drop the reservation, optionally
@@ -359,7 +362,7 @@ fn string_list(payload: &Value, field: &str) -> Option<Vec<String>> {
 async fn list_sessions(state: &AppState, acl: &[String], store: &SessionStore) -> Result<Value, String> {
     let allowed = state.pool.list_allowed(acl).await;
     let results = futures_util::future::join_all(allowed.iter().map(|upstream| async move {
-        if upstream.state != UpstreamState::Online {
+        if !upstream.state.is_routable() {
             return (upstream.id.as_str(), Err(format!("upstream is {}", upstream.state.as_str())));
         }
         let Some(client) = state.clients.get(&upstream.id) else { return (upstream.id.as_str(), Err("upstream client missing".to_owned())) };
