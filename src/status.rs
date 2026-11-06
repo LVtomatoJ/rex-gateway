@@ -2,18 +2,32 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use crate::{metrics::MetricsSnapshot, pool::Upstream};
 
+/// Strips credentials from an upstream URL before it is displayed: userinfo (`user:pass@`),
+/// query string and fragment are removed; scheme, host, port and path are kept.
+pub fn redact_url(url: &str) -> String {
+    let (scheme, rest) = match url.split_once("://") {
+        Some((scheme, rest)) => (Some(scheme), rest),
+        None => (None, url),
+    };
+    let rest = rest.split(['?', '#']).next().unwrap_or_default();
+    let (authority, path) = match rest.find('/') { Some(i) => rest.split_at(i), None => (rest, "") };
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    match scheme { Some(scheme) => format!("{scheme}://{host}{path}"), None => format!("{host}{path}") }
+}
+
 /// Builds the `/status` JSON. `upstreams` must already be filtered by the caller's ACL
 /// (see `UpstreamPool::list_allowed`). Counters are gateway-wide.
 pub fn build(upstreams: &[Upstream], pending_tickets: usize, counters: MetricsSnapshot, now: Instant) -> Value {
     json!({
         "upstreams": upstreams.iter().map(|u| json!({
             "id": u.id,
-            "url": u.url,
+            "url": redact_url(&u.url),
             "source": u.source.as_str(),
             "state": u.state.as_str(),
             "latency_ms": u.latency_ms,
             "consecutive_failures": u.consecutive_failures,
-            "last_error": u.last_error,
+            // Errors may quote the URL; make sure they cannot leak embedded credentials either.
+            "last_error": u.last_error.as_ref().map(|e| e.replace(&u.url, &redact_url(&u.url))),
             "last_probe_age_ms": u.last_probe.map(|t| now.saturating_duration_since(t).as_millis() as u64),
             "session_count": u.session_count,
         })).collect::<Vec<_>>(),
@@ -33,6 +47,30 @@ pub fn build(upstreams: &[Upstream], pending_tickets: usize, counters: MetricsSn
 mod tests {
     use super::*;
     use crate::pool::{Source, UpstreamPool, UpstreamState};
+
+    #[test]
+    fn redacts_userinfo_query_and_fragment() {
+        assert_eq!(redact_url("http://127.0.0.1:7297"), "http://127.0.0.1:7297");
+        assert_eq!(redact_url("https://u:p%40ss@host.ts.net/rex?token=abc&x=1#frag"), "https://host.ts.net/rex");
+        assert_eq!(redact_url("https://secret@host:8443/"), "https://host:8443/");
+        assert_eq!(redact_url("http://a@b@host:1"), "http://host:1", "last @ delimits userinfo");
+        assert_eq!(redact_url("https://host?token=abc"), "https://host");
+        assert_eq!(redact_url("https://host#x"), "https://host");
+        assert_eq!(redact_url("http://[::1]:7297/x"), "http://[::1]:7297/x");
+        assert_eq!(redact_url("user:pw@host:1/p?q=1"), "host:1/p", "schemeless");
+        assert_eq!(redact_url("http://u:p@host/a@b"), "http://host/a@b", "@ in the path is not userinfo");
+    }
+
+    #[tokio::test]
+    async fn status_json_never_contains_url_credentials() {
+        let pool = UpstreamPool::new();
+        let url = "https://bob:hunter2@h.example:9/rex?key=SECRETKEY";
+        pool.upsert("x", url, Source::Manual).await;
+        pool.mark_failure("x", format!("connect to {url} failed")).await;
+        let body = build(&pool.list_allowed(&["*".into()]).await, 0, MetricsSnapshot::default(), Instant::now()).to_string();
+        for leaked in ["bob", "hunter2", "SECRETKEY", "key="] { assert!(!body.contains(leaked), "{leaked} leaked in {body}"); }
+        assert!(body.contains("https://h.example:9/rex"));
+    }
 
     #[tokio::test]
     async fn builds_json_and_filters_by_acl() {

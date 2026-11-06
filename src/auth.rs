@@ -1,14 +1,41 @@
-use std::{collections::HashMap, sync::Arc};
+use std::collections::HashMap;
+use sha2::{Digest, Sha256};
 
-#[derive(Clone)]
-pub struct Authenticator { tokens: Arc<HashMap<String, Vec<String>>> }
+type Digest32 = [u8; 32];
+
+fn digest(bytes: &[u8]) -> Digest32 { Sha256::digest(bytes).into() }
+
+/// Constant-time equality for two byte strings: the running time depends only on the lengths,
+/// never on where (or whether) the contents differ.
+pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    let mut diff = (a.len() ^ b.len()) as u64;
+    for i in 0..a.len().max(b.len()) {
+        diff |= u64::from(a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0));
+    }
+    diff == 0
+}
+
+/// Bearer-token authenticator, built once at startup and shared via `Arc`.
+///
+/// Configured tokens are stored only as SHA-256 digests. A presented token is hashed (so the
+/// compared values always have the same length, hiding token length) and compared against
+/// *every* configured digest in constant time, with no early exit on the first match.
+pub struct Authenticator { tokens: Vec<(Digest32, Vec<String>)> }
 
 impl Authenticator {
-    pub fn new(tokens: HashMap<String, Vec<String>>) -> Self { Self { tokens: Arc::new(tokens) } }
-    pub fn acl(&self, bearer: Option<&str>) -> Option<Vec<String>> {
-        let token = bearer?.strip_prefix("Bearer ")?;
-        self.tokens.get(token).cloned()
+    pub fn new(tokens: HashMap<String, Vec<String>>) -> Self {
+        Self { tokens: tokens.into_iter().map(|(token, acl)| (digest(token.as_bytes()), acl)).collect() }
     }
+
+    pub fn acl(&self, bearer: Option<&str>) -> Option<Vec<String>> {
+        let presented = digest(bearer?.strip_prefix("Bearer ")?.as_bytes());
+        let mut found: Option<&Vec<String>> = None;
+        for (stored, acl) in &self.tokens {
+            if ct_eq(stored, &presented) { found = Some(acl); }
+        }
+        found.cloned()
+    }
+
     pub fn permits(acl: &[String], upstream: &str) -> bool {
         acl.iter().any(|allowed| allowed == "*" || allowed == upstream)
     }
@@ -27,5 +54,39 @@ mod tests {
         assert!(Authenticator::permits(&["local".into()], "local"));
         assert!(!Authenticator::permits(&["local".into()], "other"));
         assert!(!Authenticator::permits(&[], "local"));
+    }
+
+    #[test]
+    fn bearer_prefix_is_required_and_exact() {
+        let auth = Authenticator::new(HashMap::from([("secret".into(), vec!["*".into()])]));
+        assert_eq!(auth.acl(Some("secret")), None, "scheme required");
+        assert_eq!(auth.acl(Some("bearer secret")), None, "scheme is case sensitive, as before");
+        assert_eq!(auth.acl(Some("Bearer  secret")), None);
+        assert_eq!(auth.acl(Some("Bearer secret ")), None);
+        assert_eq!(auth.acl(Some("Bearer secre")), None, "prefix of a token");
+        assert_eq!(auth.acl(Some("Bearer secrets")), None, "token plus suffix");
+        assert_eq!(auth.acl(Some("Bearer ")), None, "empty token");
+    }
+
+    #[test]
+    fn every_configured_token_resolves_to_its_own_acl() {
+        let tokens: HashMap<String, Vec<String>> = (0..20).map(|i| (format!("tok-{i}"), vec![format!("up{i}")])).collect();
+        let auth = Authenticator::new(tokens);
+        for i in 0..20 {
+            assert_eq!(auth.acl(Some(&format!("Bearer tok-{i}"))), Some(vec![format!("up{i}")]));
+        }
+        assert_eq!(auth.acl(Some("Bearer tok-20")), None);
+    }
+
+    #[test]
+    fn ct_eq_matches_slice_equality() {
+        assert!(ct_eq(b"", b""));
+        assert!(ct_eq(b"abc", b"abc"));
+        assert!(!ct_eq(b"abc", b"abd"), "last byte differs");
+        assert!(!ct_eq(b"xbc", b"abc"), "first byte differs");
+        assert!(!ct_eq(b"abc", b"ab"), "shorter");
+        assert!(!ct_eq(b"ab", b"abc"), "longer");
+        assert!(!ct_eq(b"", b"\0"), "length differs even when padding bytes are zero");
+        assert!(!ct_eq(b"a\0", b"a"));
     }
 }

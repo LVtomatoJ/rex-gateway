@@ -13,24 +13,35 @@ REX_GATEWAY_CONFIG=my-gateway.toml RUST_LOG=info cargo run
 The config contains `listen`, `probe_interval_ms`, repeated `[[upstreams]]` entries
 (`id`, `url`) and `[[auth.tokens]]` entries (`token`, `allow = ["*"]` or upstream IDs).
 Environment overrides are `REX_GATEWAY_CONFIG`, `REX_GATEWAY_LISTEN`,
-`REX_GATEWAY_PROBE_INTERVAL_MS`, `REX_GATEWAY_TICKET_TTL_MS`, `REX_GATEWAY_TICKET_MAX`, and `REX_GATEWAY_UPSTREAM_LOCAL_URL` (for the
-upstream id `local`). Optional top-level settings `ticket_ttl_ms` (default 30000) and
+`REX_GATEWAY_PROBE_INTERVAL_MS`, `REX_GATEWAY_TICKET_TTL_MS`, `REX_GATEWAY_TICKET_MAX`,
+`REX_GATEWAY_UPSTREAM_CALL_TIMEOUT_MS`, `REX_GATEWAY_DATA_CONNECT_TIMEOUT_MS`, and `REX_GATEWAY_UPSTREAM_LOCAL_URL` (for the
+upstream id `local`). Timeouts: `upstream_call_timeout_ms` (default 10000) bounds every call to an
+upstream and each (re)connect of its control socket; `data_connect_timeout_ms` (default 10000) bounds the
+agent's data-plane HELLO read and the connect to the upstream data socket. Zero is rejected for both. Optional top-level settings `ticket_ttl_ms` (default 30000) and
 `ticket_max` (default 1024) bound unused data tickets (see Data plane). Tokens and the token map are intentionally TOML-only for now.
 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
   Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 11).
-* `session.list` fans out to allowed `Online` upstreams in sorted upstream-ID order and
-  returns `local:session:<uuid>`-style namespaced IDs. An upstream failure fails that
-  list request rather than silently hiding part of the result.
+* `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
+  namespaced IDs in sorted upstream-ID order. Upstreams that are not `Online`, or that error or time
+  out, are skipped and reported: the response then also carries `"partial":true`,
+  `"failed_upstreams":["id",...]` and `"upstream_errors":{"id":"reason"}`. A complete list has none
+  of these fields. If every allowed upstream fails, the request returns an error instead
+  (`all upstreams failed: ...`). An ACL that permits no upstream returns an empty list.
 * Namespaced session calls are routed to their owner, with the prefix stripped upstream.
   Top-level returned session IDs, and session data nested beneath `view`, are wrapped.
 * `session.create` targets payload `host` when supplied, otherwise the first allowed
   online upstream by ID. Other non-session methods follow the same documented default.
   `host` is a gateway routing hint stripped before forwarding.
+* Startup never needs an upstream: control clients connect lazily on their first call (the probe loop
+  makes it) and reconnect after socket loss, with exponential backoff after failed connects
+  (200 ms doubling to 5 s; calls fail fast with `retry in N ms` meanwhile). Upstreams start
+  `Unknown` and the probe loop (concurrent per upstream) promotes them to `Online` once reachable.
 * Agents are read/served serially; upstream calls use a single actor-owned WebSocket,
-  ID to oneshot map, and support concurrent callers. Events between responses are ignored.
+  ID to oneshot map, and support concurrent callers; each call is bounded by
+  `upstream_call_timeout_ms`. Events between responses are ignored.
 * Probes use `session.list`: success under 1 second = Online, under/over threshold =
   Degraded; two consecutive failed probes = Offline. First failure is Degraded, initial
   state Unknown. Socket reconnection and a fresh hello happen on the next call.
@@ -72,7 +83,10 @@ by a background reaper that purges expired entries (period = TTL/2, clamped to 5
 At most `ticket_max` (default 1024) tickets are pending; when full, the oldest is evicted, so
 memory never grows unbounded. Unknown, expired, evicted, wrong-owner and already-used tickets
 all receive REJECT `0x82 0x01` (indistinguishable to the caller); malformed HELLO receives
-`0x82 0x05`. A wrong-owner attempt does not burn the legitimate owner's live ticket.
+`0x82 0x05`. An agent that connects but never sends HELLO within `data_connect_timeout_ms` gets
+`0x82 0x05` and a close `1008 "HELLO timeout"`; if the upstream data socket cannot be opened in that
+time (or fails), the agent socket is closed with `1011 "upstream connect timeout"` /
+`"upstream connection failed"`. A wrong-owner attempt does not burn the legitimate owner's live ticket.
 
 ## Status endpoint
 
@@ -92,11 +106,20 @@ all receive REJECT `0x82 0x01` (indistinguishable to the caller); malformed HELL
 }
 ```
 
-`upstreams` lists only upstreams the token's ACL permits (in any state, sorted by id).
+Upstream `url`s are shown without credentials: userinfo (`user:pass@`), query and fragment are
+stripped (and also removed from `last_error` text). `upstreams` lists only upstreams the token's ACL permits (in any state, sorted by id).
 `state` is `Unknown|Online|Degraded|Offline`; `latency_ms` is the last probe's latency
 (null if the last probe failed or none ran); `last_error` is the most recent probe error and is
 cleared by the next successful probe. `counters` are gateway-wide (not ACL-filtered), totals since
 start; `tickets_expired` counts TTL expiries, `tickets_evicted` capacity evictions.
+
+## Authentication
+
+Bearer tokens are hashed with SHA-256 at startup (the `Authenticator` is built once and shared via
+`Arc` in the app state). A presented token is hashed and compared in constant time against every
+configured digest with no early exit, so neither the token contents nor its length leak through
+timing. Ticket-owner binding uses a constant-time comparison too. Behavior is otherwise unchanged:
+`Authorization: Bearer <token>` (case-sensitive scheme), per-token upstream ACL list.
 
 ## Remaining TODOs
 

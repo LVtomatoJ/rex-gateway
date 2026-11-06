@@ -92,7 +92,7 @@ impl TicketMap {
             self.metrics.tickets_expired.fetch_add(1, Relaxed);
             return None;
         }
-        if entry.ticket.owner != owner { return None; }
+        if !crate::auth::ct_eq(entry.ticket.owner.as_bytes(), owner.as_bytes()) { return None; }
         let entry = inner.entries.remove(external)?;
         inner.order.remove(&entry.seq);
         self.metrics.tickets_consumed.fetch_add(1, Relaxed);

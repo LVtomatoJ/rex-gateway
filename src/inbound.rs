@@ -22,6 +22,7 @@ use tokio_tungstenite::{
 
 use crate::{
     auth::{self, Authenticator},
+    pool::UpstreamState,
     control_client::ControlClient,
     data::{decode_hello, TicketMap},
     metrics::{Gauge, Metrics},
@@ -37,20 +38,29 @@ type Clients = Arc<HashMap<String, Arc<ControlClient>>>;
 struct AppState {
     pool: UpstreamPool,
     clients: Clients,
-    tokens: Arc<HashMap<String, Vec<String>>>,
+    auth: Arc<Authenticator>,
     tickets: TicketMap,
     metrics: Arc<Metrics>,
+    options: Options,
+}
+
+/// Tunables of the inbound server.
+#[derive(Clone, Copy)]
+pub struct Options {
+    /// Bounds the agent's data-plane HELLO read and the connect to the upstream data socket.
+    pub data_connect_timeout: Duration,
 }
 
 pub async fn serve(
     listen: SocketAddr,
     pool: UpstreamPool,
     clients: HashMap<String, Arc<ControlClient>>,
-    tokens: Arc<HashMap<String, Vec<String>>>,
+    auth: Arc<Authenticator>,
     tickets: TicketMap,
     metrics: Arc<Metrics>,
+    options: Options,
 ) -> Result<()> {
-    let state = AppState { pool, clients: Arc::new(clients), tokens, tickets, metrics };
+    let state = AppState { pool, clients: Arc::new(clients), auth, tickets, metrics, options };
     let router = router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "gateway listening");
@@ -69,7 +79,7 @@ fn router(state: AppState) -> Router {
 /// `GET /status`: bearer-authenticated JSON snapshot, filtered by the token's ACL.
 async fn status_handler(headers: HeaderMap, State(state): State<AppState>) -> Response {
     let bearer = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
-    let Some(acl) = Authenticator::new((*state.tokens).clone()).acl(bearer) else {
+    let Some(acl) = state.auth.acl(bearer) else {
         return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")]).into_response();
     };
     let upstreams = state.pool.list_allowed(&acl).await;
@@ -84,7 +94,7 @@ fn authenticate(headers: &HeaderMap, state: &AppState, protocol: &str) -> Result
         .map(|v| v.split(',').any(|p| p.trim() == protocol)) == Some(true);
     if !selected { return Err(StatusCode::BAD_REQUEST); }
     let bearer = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or(StatusCode::UNAUTHORIZED)?;
-    let acl = Authenticator::new((*state.tokens).clone()).acl(Some(bearer)).ok_or(StatusCode::UNAUTHORIZED)?;
+    let acl = state.auth.acl(Some(bearer)).ok_or(StatusCode::UNAUTHORIZED)?;
     Ok((acl, bearer.to_owned()))
 }
 
@@ -132,18 +142,8 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
 }
 
 async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut payload: Value) -> Result<Value, String> {
+    if method == "session.list" { return list_sessions(state, acl).await; }
     let online = state.pool.list_allowed_online(acl).await;
-    if method == "session.list" {
-        let mut sessions = Vec::new();
-        for upstream in online {
-            let client = state.clients.get(&upstream.id).ok_or("upstream client missing")?;
-            let mut result = client.call(method, json!({})).await.map_err(|e| e.to_string())?;
-            for session in result["sessions"].as_array_mut().ok_or("upstream session.list omitted sessions")? {
-                if translate_session_id(session, &upstream.id, true) { sessions.push(session.take()); }
-            }
-        }
-        return Ok(json!({"sessions":sessions}));
-    }
     let owner_upstream = match payload.get("session_id").and_then(Value::as_str).and_then(crate::protocol::unwrap_session_id) {
         Some((upstream, _)) => upstream.to_owned(),
         None => payload.get("host").and_then(Value::as_str).map(str::to_owned)
@@ -170,6 +170,49 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
     Ok(response)
 }
 
+/// Fans `session.list` out to every allowed upstream concurrently (each bounded by the upstream
+/// call timeout). Upstreams that are not Online or that fail are skipped and reported through the
+/// additive `partial` / `failed_upstreams` / `upstream_errors` fields; if every allowed upstream
+/// fails, the request fails.
+async fn list_sessions(state: &AppState, acl: &[String]) -> Result<Value, String> {
+    let allowed = state.pool.list_allowed(acl).await;
+    let results = futures_util::future::join_all(allowed.iter().map(|upstream| async move {
+        if upstream.state != UpstreamState::Online {
+            return (upstream.id.as_str(), Err(format!("upstream is {}", upstream.state.as_str())));
+        }
+        let Some(client) = state.clients.get(&upstream.id) else { return (upstream.id.as_str(), Err("upstream client missing".to_owned())) };
+        let result = client.call("session.list", json!({})).await.map_err(|e| format!("{e:#}")).and_then(|reply| match reply {
+            Value::Object(mut object) => match object.remove("sessions") {
+                Some(Value::Array(sessions)) => Ok(sessions),
+                _ => Err("upstream session.list omitted sessions".to_owned()),
+            },
+            _ => Err("upstream session.list omitted sessions".to_owned()),
+        });
+        (upstream.id.as_str(), result)
+    })).await;
+    let mut sessions = Vec::new();
+    let mut errors = serde_json::Map::new();
+    for (id, result) in results {
+        match result {
+            Ok(items) => for mut session in items {
+                if translate_session_id(&mut session, id, true) { sessions.push(session); }
+            },
+            Err(error) => { tracing::warn!(upstream = id, %error, "session.list skipped upstream"); errors.insert(id.to_owned(), Value::String(error)); }
+        }
+    }
+    if !allowed.is_empty() && errors.len() == allowed.len() {
+        let detail: Vec<String> = errors.iter().map(|(id, e)| format!("{id}: {}", e.as_str().unwrap_or_default())).collect();
+        return Err(format!("all upstreams failed: {}", detail.join("; ")));
+    }
+    let mut response = json!({"sessions": sessions});
+    if !errors.is_empty() {
+        response["partial"] = Value::Bool(true);
+        response["failed_upstreams"] = Value::Array(errors.keys().cloned().map(Value::String).collect());
+        response["upstream_errors"] = Value::Object(errors);
+    }
+    Ok(response)
+}
+
 async fn data_upgrade(
     ws: WebSocketUpgrade,
     headers: HeaderMap,
@@ -180,10 +223,19 @@ async fn data_upgrade(
 }
 
 async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
-    let Some(Ok(Message::Binary(hello))) = agent.recv().await else {
-        let _ = agent.send(Message::Binary(vec![0x82, 0x05].into())).await;
-        let _ = agent.send(Message::Close(Some(CloseFrame { code: 1002, reason: Cow::Borrowed("malformed HELLO") }))).await;
-        return;
+    let hello = match tokio::time::timeout(state.options.data_connect_timeout, agent.recv()).await {
+        Ok(Some(Ok(Message::Binary(hello)))) => hello,
+        Err(_) => {
+            // Idle socket that never sent HELLO: REJECT (malformed/missing HELLO) and close.
+            let _ = agent.send(Message::Binary(vec![0x82, 0x05].into())).await;
+            let _ = agent.send(Message::Close(Some(CloseFrame { code: 1008, reason: Cow::Borrowed("HELLO timeout") }))).await;
+            return;
+        }
+        _ => {
+            let _ = agent.send(Message::Binary(vec![0x82, 0x05].into())).await;
+            let _ = agent.send(Message::Close(Some(CloseFrame { code: 1002, reason: Cow::Borrowed("malformed HELLO") }))).await;
+            return;
+        }
     };
     let Some(external) = decode_hello(&hello) else {
         let _ = agent.send(Message::Binary(vec![0x82, 0x05].into())).await;
@@ -207,9 +259,14 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
         Err(error) => { tracing::warn!(%error, "invalid upstream data URL"); return; }
     };
     request.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(DATA_SUBPROTOCOL));
-    let mut upstream_socket = match connect_async(request).await {
-        Ok((socket, _)) => socket,
-        Err(error) => {
+    let mut upstream_socket = match tokio::time::timeout(state.options.data_connect_timeout, connect_async(request)).await {
+        Ok(Ok((socket, _))) => socket,
+        Err(_) => {
+            tracing::warn!(upstream = %ticket.upstream, "upstream data connection timed out");
+            let _ = agent.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed("upstream connect timeout") }))).await;
+            return;
+        }
+        Ok(Err(error)) => {
             tracing::warn!(%error, "upstream data connection failed");
             let _ = agent.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed("upstream connection failed") }))).await;
             return;
@@ -263,6 +320,9 @@ fn to_agent_close(frame: tungstenite::protocol::CloseFrame) -> CloseFrame {
 }
 
 #[cfg(test)]
+mod integration_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::pool::{Source, UpstreamState};
@@ -276,12 +336,12 @@ mod tests {
         pool.mark("a", UpstreamState::Online, Some(7), 1).await;
         pool.mark_failure("b", "refused".into()).await;
         let metrics = Metrics::new();
-        let tokens = Arc::new(HashMap::from([
+        let auth = Arc::new(Authenticator::new(HashMap::from([
             ("all".to_owned(), vec!["*".to_owned()]),
             ("onlyb".to_owned(), vec!["b".to_owned()]),
-        ]));
+        ])));
         let tickets = TicketMap::new(Duration::from_secs(30), 16, metrics.clone());
-        let state = AppState { pool, clients: Arc::new(HashMap::new()), tokens, tickets, metrics };
+        let state = AppState { pool, clients: Arc::new(HashMap::new()), auth, tickets, metrics, options: Options { data_connect_timeout: Duration::from_secs(5) } };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router(state.clone());
