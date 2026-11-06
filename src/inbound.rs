@@ -126,7 +126,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":11});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":12});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -179,15 +179,21 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
 
 async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut payload: Value) -> Result<Value, String> {
     if method == "session.list" { return list_sessions(state, acl).await; }
-    let online = state.pool.list_allowed_online(acl).await;
     let owner_upstream = match payload.get("session_id").and_then(Value::as_str).and_then(crate::protocol::unwrap_session_id) {
         Some((upstream, _)) => upstream.to_owned(),
-        None => payload.get("host").and_then(Value::as_str).map(str::to_owned)
-            .or_else(|| method.strip_prefix("session.").filter(|_| method == "session.create").and_then(|_| online.first().map(|u| u.id.clone())))
-            .or_else(|| online.first().map(|u| u.id.clone())).ok_or("no allowed online upstream")?,
+        None => match payload.get("host").and_then(Value::as_str).map(str::to_owned) {
+            Some(host) => host,
+            None => state.pool.pick_for_create(acl).await.map(|u| u.id).ok_or("no allowed routable upstream")?,
+        },
     };
-    if !auth::Authenticator::permits(acl, &owner_upstream) || !online.iter().any(|u| u.id == owner_upstream) {
-        return Err(format!("upstream {owner_upstream} is not allowed and online"));
+    if !auth::Authenticator::permits(acl, &owner_upstream) {
+        return Err(format!("upstream {owner_upstream} is not allowed"));
+    }
+    let Some(upstream) = state.pool.get(&owner_upstream).await else {
+        return Err(format!("upstream {owner_upstream} is unknown"));
+    };
+    if !upstream.state.is_routable() {
+        return Err(format!("upstream {owner_upstream} is {}", upstream.state.as_str()));
     }
     if payload.get("session_id").is_some() && !translate_session_id(&mut payload, &owner_upstream, false) {
         return Err("invalid or mismatched namespaced session_id".into());
@@ -362,7 +368,14 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
                     break;
                 }
                 Some(Ok(tungstenite::Message::Frame(_))) => {}
-                Some(Err(_)) | None => break,
+                Some(Err(_)) | None => {
+                    let reason = match state.pool.get(&ticket.upstream).await {
+                        Some(u) if u.state == UpstreamState::Offline => "upstream offline",
+                        _ => "upstream closed",
+                    };
+                    let _ = agent_sink.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed(reason) }))).await;
+                    break;
+                }
             },
             _=pings.tick()=> {
                 if agent_sink.send(Message::Ping(Vec::new())).await.is_err() || upstream_sink.send(tungstenite::Message::Ping(Vec::new())).await.is_err() { break; }

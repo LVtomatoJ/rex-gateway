@@ -37,7 +37,13 @@ async fn spawn_fake_rex_on(listener: TcpListener, sessions: Vec<Value>, hung: bo
                     match message["type"].as_str() {
                         Some("hello") => { let _ = socket.send(tungstenite::Message::Text(json!({"type":"welcome"}).to_string())).await; }
                         Some("request") if !hung => {
-                            let payload = if message["method"] == "session.list" { json!({"sessions": sessions}) } else { json!({"ok": true}) };
+                            let payload = if message["method"] == "session.list" {
+                                json!({"sessions": sessions})
+                            } else if message["method"] == "session.create" {
+                                json!({"session_id":"session:created"})
+                            } else {
+                                json!({"ok": true})
+                            };
                             let reply = json!({"type":"response","id":message["id"],"payload":payload});
                             let _ = socket.send(tungstenite::Message::Text(reply.to_string())).await;
                         }
@@ -87,7 +93,10 @@ async fn start_gateway_with_limits(upstreams: &[(&str, &str)], call_timeout: Dur
     let state = AppState {
         pool: pool.clone(),
         clients,
-        auth: Arc::new(Authenticator::new(HashMap::from([("it-secret".to_owned(), vec!["*".to_owned()])]))),
+        auth: Arc::new(Authenticator::new(HashMap::from([
+            ("it-secret".to_owned(), vec!["*".to_owned()]),
+            ("only-online".to_owned(), vec!["online".to_owned()]),
+        ]))),
         tickets: TicketMap::new(Duration::from_secs(30), 16, metrics.clone()),
         metrics,
         options: Options { data_connect_timeout: data_timeout, ping_interval, idle_timeout, max_data_streams, max_data_streams_per_token },
@@ -102,9 +111,13 @@ async fn start_gateway_with_limits(upstreams: &[(&str, &str)], call_timeout: Dur
 }
 
 async fn agent(addr: SocketAddr, path: &str, protocol: &'static str) -> Agent {
+    agent_with_auth(addr, path, protocol, SECRET).await
+}
+
+async fn agent_with_auth(addr: SocketAddr, path: &str, protocol: &'static str, authorization: &'static str) -> Agent {
     let mut request = format!("ws://{addr}{path}").into_client_request().unwrap();
     request.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(protocol));
-    request.headers_mut().insert("authorization", HeaderValue::from_static(SECRET));
+    request.headers_mut().insert("authorization", HeaderValue::from_static(authorization));
     connect_async(request).await.unwrap().0
 }
 
@@ -121,7 +134,11 @@ async fn next_binary(socket: &mut Agent) -> Vec<u8> {
 }
 
 async fn control_agent(addr: SocketAddr) -> Agent {
-    let mut socket = agent(addr, "/api/control", SUBPROTOCOL).await;
+    control_agent_with_auth(addr, SECRET).await
+}
+
+async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) -> Agent {
+    let mut socket = agent_with_auth(addr, "/api/control", SUBPROTOCOL, authorization).await;
     socket.send(tungstenite::Message::Text(json!({"type":"hello"}).to_string())).await.unwrap();
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     assert_eq!(serde_json::from_str::<Value>(&welcome).unwrap()["type"], "welcome");
@@ -492,4 +509,101 @@ async fn data_stream_limit_closes_1013_without_burning_ticket() {
     // Ticket was not consumed on the capacity miss.
     let mapped=h.state.tickets.take(&second, SECRET).expect("limited ticket must remain usable");
     assert_eq!(mapped.upstream_ticket, "BBBBBBBBBBBBBBBBBBBBBB");
+}
+
+#[tokio::test]
+async fn namespaced_call_to_offline_upstream_returns_clear_error() {
+    let offline = spawn_fake_rex(vec![json!({"session_id":"session:o1"})], false).await;
+    let online = spawn_fake_rex(vec![json!({"session_id":"session:g1"})], false).await;
+    let h = start_gateway(&[("offline", &offline), ("online", &online)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("offline", UpstreamState::Offline, None, 0).await;
+    h.pool.mark("online", UpstreamState::Online, Some(1), 0).await;
+    let mut socket = control_agent(h.addr).await;
+    let reply = rpc(&mut socket, "session.rename", json!({"session_id":"offline:session:o1","label":"x"})).await;
+    let err = reply["error"].as_str().unwrap();
+    assert!(err.contains("Offline"), "{reply}");
+    assert!(!err.contains("not allowed and online"), "{reply}");
+
+    // Missing-from-pool (even with "*") is reported as unknown, not Offline.
+    let reply = rpc(&mut socket, "session.rename", json!({"session_id":"missing:session:x","label":"x"})).await;
+    assert!(reply["error"].as_str().unwrap().contains("unknown"), "{reply}");
+
+    // ACL denial stays distinct from Offline / Unknown.
+    let mut limited = control_agent_with_auth(h.addr, "Bearer only-online").await;
+    let reply = rpc(&mut limited, "session.rename", json!({"session_id":"offline:session:o1","label":"x"})).await;
+    let err = reply["error"].as_str().unwrap();
+    assert!(err.contains("not allowed"), "{reply}");
+    assert!(!err.contains("Offline"), "{reply}");
+}
+
+#[tokio::test]
+async fn host_targeted_unknown_and_degraded_routing() {
+    let live = spawn_fake_rex(vec![], false).await;
+    let h = start_gateway(&[("live", &live), ("gone", "http://127.0.0.1:9")], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    // Let the initial probe finish so later marks are not overwritten mid-flight.
+    wait_state(&h.pool, "live", UpstreamState::Online).await;
+    for _ in 0..200 {
+        if h.pool.get("gone").await.unwrap().state != UpstreamState::Unknown { break; }
+        tokio::time::sleep(tmo(25)).await;
+    }
+    h.pool.mark("live", UpstreamState::Degraded, Some(20), 0).await;
+    h.pool.mark("gone", UpstreamState::Unknown, None, 0).await;
+    let mut socket = control_agent(h.addr).await;
+
+    let reply = rpc(&mut socket, "server.version", json!({"host":"gone"})).await;
+    assert!(reply["error"].as_str().unwrap().contains("Unknown"), "{reply}");
+
+    // Degraded remains routable.
+    assert_eq!(rpc(&mut socket, "server.version", json!({"host":"live"})).await, json!({"ok":true}));
+}
+
+#[tokio::test]
+async fn session_create_picks_least_loaded_online_upstream() {
+    let heavy = spawn_fake_rex(vec![], false).await;
+    let light = spawn_fake_rex(vec![], false).await;
+    // ids intentionally reverse of load so "first by id" would pick heavy (aaa)
+    let h = start_gateway(&[("aaa-heavy", &heavy), ("zzz-light", &light)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    wait_state(&h.pool, "aaa-heavy", UpstreamState::Online).await;
+    wait_state(&h.pool, "zzz-light", UpstreamState::Online).await;
+    h.pool.mark("aaa-heavy", UpstreamState::Online, Some(1), 9).await;
+    h.pool.mark("zzz-light", UpstreamState::Online, Some(5), 1).await;
+    let mut socket = control_agent(h.addr).await;
+    let reply = rpc(&mut socket, "session.create", json!({})).await;
+    assert_eq!(reply["session_id"], "zzz-light:session:created", "{reply}");
+}
+
+#[tokio::test]
+async fn data_plane_unexpected_upstream_drop_closes_agent_1011() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let Ok(mut upstream) = accept_hdr_async(stream, |req: &Request, mut response: Response| {
+                if !req.uri().path().ends_with("/api/data") { return Err(ErrorResponse::new(None)); }
+                response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(DATA_SUBPROTOCOL));
+                Ok(response)
+            }).await else { continue };
+            let Some(Ok(tungstenite::Message::Binary(hello))) = upstream.next().await else { continue };
+            if hello.first() != Some(&1) { continue; }
+            let _ = upstream.send(tungstenite::Message::Binary(vec![0x81])).await;
+            // Abruptly drop the TCP side with no Close frame.
+            drop(upstream);
+            return;
+        }
+    });
+    let h = start_gateway(&[("local", &url)], tmo(300), Duration::from_secs(3600), tmo(300)).await;
+    let external = h.state.tickets.insert("local", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
+    let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat())).await.unwrap();
+    assert!(!next_binary(&mut socket).await.is_empty());
+    let close = loop {
+        match tokio::time::timeout(Duration::from_secs(2), socket.next()).await.expect("close").unwrap().unwrap() {
+            tungstenite::Message::Close(frame) => break frame.unwrap(),
+            tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) => {}
+            other => panic!("expected close after upstream drop, got {other:?}"),
+        }
+    };
+    assert_eq!((u16::from(close.code), close.reason.as_ref()), (1011, "upstream closed"));
 }

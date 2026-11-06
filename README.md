@@ -24,7 +24,7 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
-  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 11).
+  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 12).
 * `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
   namespaced IDs in sorted upstream-ID order. Upstreams that are not `Online`, or that error or time
   out, are skipped and reported: the response then also carries `"partial":true`,
@@ -33,9 +33,14 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
   (`all upstreams failed: ...`). An ACL that permits no upstream returns an empty list.
 * Namespaced session calls are routed to their owner, with the prefix stripped upstream.
   Top-level returned session IDs, and session data nested beneath `view`, are wrapped.
-* `session.create` targets payload `host` when supplied, otherwise the first allowed
-  online upstream by ID. Other non-session methods follow the same documented default.
-  `host` is a gateway routing hint stripped before forwarding.
+* `session.create` (and other hostless non-list methods) targets payload `host` when
+  supplied; otherwise the gateway picks an ACL-allowed upstream by policy: prefer
+  `Online`, then fall back to `Degraded`, choosing the least `session_count`, then lowest
+  `latency_ms` (`None` after `Some`), then `id` ascending. Explicit `host` must still be
+  ACL-allowed and `Online|Degraded` (not `Offline`/`Unknown`). `host` is a gateway routing
+  hint stripped before forwarding. Namespaced session calls stay sticky to their owner;
+  Offline/Unknown owners return a clear `upstream {id} is Offline|Unknown` error (ACL
+  denial stays `not allowed`).
 * Startup never needs an upstream: control clients connect lazily on their first call (the probe loop
   makes it) and reconnect after socket loss, with exponential backoff after failed connects
   (200 ms doubling to 5 s; calls fail fast with `retry in N ms` meanwhile). Upstreams start
@@ -49,8 +54,8 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 * Probes use `session.list`: success under 1 second = Online, under/over threshold =
   Degraded; two consecutive failed probes = Offline. First failure is Degraded, initial
   state Unknown. Socket reconnection and a fresh hello happen on the next call.
-* Routed calls are restricted to Online upstreams (the default router also ignores
-  Degraded). No upstream discovery or persistence yet.
+* Default create/hostless routing prefers Online and may fall back to Degraded; Offline
+  and Unknown are never selected. No upstream discovery or persistence yet.
 
 ## Verify
 
@@ -81,7 +86,9 @@ When the agent sends binary `0x01 || ticket`, the gateway consumes that ticket o
 connects to the owning upstream, and sends the real binary HELLO. ACCEPT/REJECT, terminal
 snapshots, terminal output, and agent input are relayed frame-for-frame between the data
 sockets. Ping/pong and close frames, including close codes and reasons, are forwarded.
-The gateway also originates keepalive pings on both legs and idle-closes both sides with
+If the upstream data socket ends mid-bridge without a Close frame, the agent is closed with
+`1011 "upstream closed"` (or `"upstream offline"` when the pool already marks that upstream
+Offline). The gateway also originates keepalive pings on both legs and idle-closes both sides with
 `1001 "idle timeout"` when no application (binary/text) traffic arrives for
 `ws_idle_timeout_ms`. Concurrent bridges are bounded by `max_data_streams` /
 `max_data_streams_per_token` (close `1013` on overflow, ticket preserved). This is not a

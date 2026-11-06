@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc, time::Instant};
 use tokio::sync::RwLock;
 use crate::auth::Authenticator;
 
@@ -17,6 +17,10 @@ impl UpstreamState {
     pub fn as_str(self) -> &'static str {
         match self { Self::Unknown => "Unknown", Self::Online => "Online", Self::Degraded => "Degraded", Self::Offline => "Offline" }
     }
+    /// Online and Degraded are eligible for create / default routing (Degraded is lower priority).
+    pub fn is_routable(self) -> bool {
+        matches!(self, Self::Online | Self::Degraded)
+    }
 }
 impl Source {
     pub fn as_str(self) -> &'static str {
@@ -26,6 +30,18 @@ impl Source {
 pub const OFFLINE_AFTER: u32 = 2;
 #[derive(Clone)]
 pub struct UpstreamPool { inner: Arc<RwLock<HashMap<String, Upstream>>> }
+
+/// Least sessions, then lowest known latency (`None` after `Some`), then id ascending.
+fn cmp_create_preference(a: &Upstream, b: &Upstream) -> Ordering {
+    a.session_count.cmp(&b.session_count)
+        .then_with(|| match (a.latency_ms, b.latency_ms) {
+            (Some(x), Some(y)) => x.cmp(&y),
+            (Some(_), None) => Ordering::Less,
+            (None, Some(_)) => Ordering::Greater,
+            (None, None) => Ordering::Equal,
+        })
+        .then_with(|| a.id.cmp(&b.id))
+}
 
 impl UpstreamPool {
     pub fn new() -> Self { Self { inner: Arc::new(RwLock::new(HashMap::new())) } }
@@ -37,9 +53,28 @@ impl UpstreamPool {
         });
     }
     pub async fn get(&self, id: &str) -> Option<Upstream> { self.inner.read().await.get(id).cloned() }
-    pub async fn list_allowed_online(&self, acl: &[String]) -> Vec<Upstream> {
-        let mut result: Vec<_> = self.inner.read().await.values().filter(|u| u.state == UpstreamState::Online && Authenticator::permits(acl, &u.id)).cloned().collect();
-        result.sort_by(|a,b| a.id.cmp(&b.id)); result
+/// Allowed Online|Degraded upstreams, Online group first then Degraded, each sorted by create preference.
+    pub async fn list_allowed_routable(&self, acl: &[String]) -> Vec<Upstream> {
+        let mut online = Vec::new();
+        let mut degraded = Vec::new();
+        for upstream in self.inner.read().await.values() {
+            if !Authenticator::permits(acl, &upstream.id) { continue; }
+            match upstream.state {
+                UpstreamState::Online => online.push(upstream.clone()),
+                UpstreamState::Degraded => degraded.push(upstream.clone()),
+                _ => {}
+            }
+        }
+        online.sort_by(cmp_create_preference);
+        degraded.sort_by(cmp_create_preference);
+        online.extend(degraded);
+        online
+    }
+    /// Pick an upstream for `session.create` / hostless default routing:
+    /// prefer allowed Online (least `session_count`, then lowest `latency_ms`, then `id`);
+    /// if none, the same order among allowed Degraded.
+    pub async fn pick_for_create(&self, acl: &[String]) -> Option<Upstream> {
+        self.list_allowed_routable(acl).await.into_iter().next()
     }
     /// All upstreams the ACL permits, in any state, sorted by id (for `/status`).
     pub async fn list_allowed(&self, acl: &[String]) -> Vec<Upstream> {
@@ -85,9 +120,9 @@ mod tests {
             assert_eq!(u.state,state); assert_eq!(u.latency_ms,latency); assert_eq!(u.session_count,count); assert!(u.last_probe.is_some());
         }
         pool.mark("a", UpstreamState::Online, Some(10),2).await; pool.mark("b", UpstreamState::Online,Some(20),1).await;
-        assert_eq!(pool.list_allowed_online(&["a".into()]).await.len(),1);
-        assert_eq!(pool.list_allowed_online(&["*".into()]).await.len(),2);
-        assert_eq!(pool.list_allowed_online(&[]).await.len(),0);
+        assert_eq!(pool.list_allowed_routable(&["a".into()]).await.len(),1);
+        assert_eq!(pool.list_allowed_routable(&["*".into()]).await.len(),2);
+        assert_eq!(pool.list_allowed_routable(&[]).await.len(),0);
     }
 
     #[tokio::test]
@@ -113,5 +148,64 @@ mod tests {
         assert_eq!(ids, ["a", "b"]);
         assert_eq!(pool.list_allowed(&["b".into()]).await.len(), 1);
         assert!(pool.list_allowed(&[]).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pick_for_create_orders_by_load_latency_then_id() {
+        let pool = UpstreamPool::new();
+        for id in ["c", "b", "a"] { pool.upsert(id, &format!("http://{id}"), Source::Manual).await; }
+        pool.mark("a", UpstreamState::Online, Some(50), 2).await;
+        pool.mark("b", UpstreamState::Online, Some(10), 2).await; // same load, lower latency
+        pool.mark("c", UpstreamState::Online, Some(5), 5).await;  // higher load
+        assert_eq!(pool.pick_for_create(&["*".into()]).await.unwrap().id, "b");
+
+        // None latency sorts after Some
+        pool.mark("a", UpstreamState::Online, None, 1).await;
+        pool.mark("b", UpstreamState::Online, Some(99), 1).await;
+        pool.mark("c", UpstreamState::Online, Some(1), 3).await;
+        assert_eq!(pool.pick_for_create(&["*".into()]).await.unwrap().id, "b");
+
+        // Equal load + latency → id ascending
+        pool.mark("a", UpstreamState::Online, Some(10), 0).await;
+        pool.mark("b", UpstreamState::Online, Some(10), 0).await;
+        pool.mark("c", UpstreamState::Online, Some(10), 0).await;
+        assert_eq!(pool.pick_for_create(&["*".into()]).await.unwrap().id, "a");
+    }
+
+    #[tokio::test]
+    async fn pick_for_create_prefers_online_over_degraded_and_respects_acl() {
+        let pool = UpstreamPool::new();
+        pool.upsert("busy", "http://busy", Source::Manual).await;
+        pool.upsert("slow", "http://slow", Source::Manual).await;
+        pool.upsert("denied", "http://denied", Source::Manual).await;
+        // busy is Online but loaded; slow is Degraded and empty — Online still wins
+        pool.mark("busy", UpstreamState::Online, Some(5), 10).await;
+        pool.mark("slow", UpstreamState::Degraded, Some(1), 0).await;
+        pool.mark("denied", UpstreamState::Online, Some(1), 0).await;
+        assert_eq!(pool.pick_for_create(&["busy".into(), "slow".into()]).await.unwrap().id, "busy");
+
+        // No Online in ACL → fall back to Degraded
+        pool.mark("busy", UpstreamState::Offline, None, 0).await;
+        assert_eq!(pool.pick_for_create(&["busy".into(), "slow".into()]).await.unwrap().id, "slow");
+
+        // Empty ACL / nothing routable
+        assert!(pool.pick_for_create(&[]).await.is_none());
+        assert!(pool.pick_for_create(&["denied".into()]).await.is_some()); // denied is Online
+        pool.mark("denied", UpstreamState::Unknown, None, 0).await;
+        assert!(pool.pick_for_create(&["denied".into()]).await.is_none());
+        assert!(pool.pick_for_create(&["busy".into()]).await.is_none()); // Offline only
+    }
+
+    #[tokio::test]
+    async fn list_allowed_routable_online_before_degraded() {
+        let pool = UpstreamPool::new();
+        pool.upsert("d", "http://d", Source::Manual).await;
+        pool.upsert("o", "http://o", Source::Manual).await;
+        pool.upsert("x", "http://x", Source::Manual).await;
+        pool.mark("d", UpstreamState::Degraded, Some(1), 0).await;
+        pool.mark("o", UpstreamState::Online, Some(1), 0).await;
+        pool.mark("x", UpstreamState::Offline, None, 0).await;
+        let ids: Vec<_> = pool.list_allowed_routable(&["*".into()]).await.into_iter().map(|u| u.id).collect();
+        assert_eq!(ids, ["o", "d"]);
     }
 }
