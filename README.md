@@ -1,7 +1,9 @@
-# Rex Gateway (control plane)
+# Rex Gateway
 
-A self-use authenticated control-plane gateway in front of Rex servers. Rust 2021,
-Axum, Tokio, tokio-tungstenite with Rustls. No repository or remote service was created.
+A self-use authenticated control + data gateway in front of one or more Rex servers.
+One listen address and one bearer key give agents open/list/send/read plus bidirectional
+terminal streams, with multi-upstream routing, health probes, failover, and ticketed
+data-plane bridging. Rust 2021, Axum, Tokio, tokio-tungstenite with Rustls.
 
 ## Run
 
@@ -15,16 +17,19 @@ The config contains `listen`, `probe_interval_ms`, repeated `[[upstreams]]` entr
 Environment overrides are `REX_GATEWAY_CONFIG`, `REX_GATEWAY_LISTEN`,
 `REX_GATEWAY_PROBE_INTERVAL_MS`, `REX_GATEWAY_TICKET_TTL_MS`, `REX_GATEWAY_TICKET_MAX`,
 `REX_GATEWAY_UPSTREAM_CALL_TIMEOUT_MS`, `REX_GATEWAY_DATA_CONNECT_TIMEOUT_MS`, `REX_GATEWAY_WS_PING_INTERVAL_MS`,
-`REX_GATEWAY_WS_IDLE_TIMEOUT_MS`, `REX_GATEWAY_UPSTREAM_LOCAL_URL` (for the
+`REX_GATEWAY_WS_IDLE_TIMEOUT_MS`, `REX_GATEWAY_MAX_DATA_STREAMS`,
+`REX_GATEWAY_MAX_DATA_STREAMS_PER_TOKEN`, `REX_GATEWAY_MAX_CONTROL_CONNECTIONS`,
+`REX_GATEWAY_MAX_CONTROL_CONNECTIONS_PER_TOKEN`, `REX_GATEWAY_UPSTREAM_LOCAL_URL` (for the
 upstream id `local`), and the discovery / session-store envs documented below. Timeouts: `upstream_call_timeout_ms` (default 10000) bounds every call to an
 upstream and each (re)connect of its control socket; `data_connect_timeout_ms` (default 10000) bounds the
 agent's data-plane HELLO read and the connect to the upstream data socket. Zero is rejected for both. Optional top-level settings `ticket_ttl_ms` (default 30000) and
-`ticket_max` (default 1024) bound unused data tickets (see Data plane). Tokens and the token map are intentionally TOML-only for now.
+`ticket_max` (default 1024) bound unused data tickets (see Data plane). Concurrent control sockets are bounded by `max_control_connections` /
+`max_control_connections_per_token` (defaults 128 / 32; close `1013` before welcome on overflow). Tokens and the token map are intentionally TOML-only for now.
 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
-  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 18).
+  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 19).
 * `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
   namespaced IDs (recursively wrapping nested `session_id` / `ticket` fields the same way as
   other responses) in sorted upstream-ID order. Upstreams that are not routable (`Online` or
@@ -147,11 +152,15 @@ snapshots, terminal output, and agent input are relayed frame-for-frame between 
 sockets. Ping/pong and close frames, including close codes and reasons, are forwarded.
 If the upstream data socket ends mid-bridge without a Close frame, the agent is closed with
 `1011 "upstream closed"` (or `"upstream offline"` when the pool already marks that upstream
-Offline). If the agent drops mid-bridge without a Close frame, the upstream is closed with
-`1001 "peer closed"` so Rex can release the terminal attach promptly. The gateway also originates keepalive pings on both legs and idle-closes both sides with
+Offline). If the agent drops mid-bridge without a Close frame, or if forwarding upstream→agent
+fails because the agent socket is already gone, the upstream is closed with
+`1001 "peer closed"` so Rex can release the terminal attach promptly (rather than waiting
+for idle timeout). The gateway also originates keepalive pings on both legs and idle-closes both sides with
 `1001 "idle timeout"` when no application (binary/text) traffic arrives for
 `ws_idle_timeout_ms`. Concurrent bridges are bounded by `max_data_streams` /
-`max_data_streams_per_token` (close `1013` on overflow, ticket preserved). This is not a
+`max_data_streams_per_token` (defaults 128 / 32; close `1013` on overflow, ticket preserved),
+and concurrent control sockets by `max_control_connections` /
+`max_control_connections_per_token` (same defaults; close `1013` before welcome). This is not a
 terminal protocol parser and does not rewrite bytes inside stream frames.
 
 Tickets are kept in memory, single-use and bound to the bearer token. An unused ticket lives

@@ -220,9 +220,12 @@ async fn start_gateway_with_keepalive(upstreams: &[(&str, &str)], call_timeout: 
 }
 
 async fn start_gateway_with_limits(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration, ping_interval: Duration, idle_timeout: Duration, max_data_streams: usize, max_data_streams_per_token: usize) -> Harness {
-    start_gateway_with_store(upstreams,call_timeout,probe_every,data_timeout,ping_interval,idle_timeout,max_data_streams,max_data_streams_per_token,None).await
+    start_gateway_with_store(upstreams,call_timeout,probe_every,data_timeout,ping_interval,idle_timeout,max_data_streams,max_data_streams_per_token,128,32,None).await
 }
-async fn start_gateway_with_store(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration, ping_interval: Duration, idle_timeout: Duration, max_data_streams: usize, max_data_streams_per_token: usize, store: Option<crate::sessions::SessionStore>) -> Harness {
+async fn start_gateway_with_control_limits(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration, max_control_connections: usize, max_control_connections_per_token: usize) -> Harness {
+    start_gateway_with_store(upstreams,call_timeout,probe_every,data_timeout,Duration::from_secs(20),Duration::from_secs(120),128,32,max_control_connections,max_control_connections_per_token,None).await
+}
+async fn start_gateway_with_store(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration, ping_interval: Duration, idle_timeout: Duration, max_data_streams: usize, max_data_streams_per_token: usize, max_control_connections: usize, max_control_connections_per_token: usize, store: Option<crate::sessions::SessionStore>) -> Harness {
     let pool = UpstreamPool::new();
     let clients = ClientMap::new();
     let (events, _) = broadcast::channel(32);
@@ -242,8 +245,9 @@ async fn start_gateway_with_store(upstreams: &[(&str, &str)], call_timeout: Dura
         tickets: TicketMap::new(Duration::from_secs(30), 16, metrics.clone()),
         sessions: store.unwrap_or_else(||crate::sessions::SessionStore::open(tempfile::tempdir().unwrap().path().join("sessions.json"),Duration::from_secs(86400),16384).unwrap()),
         metrics,
-        options: Options { data_connect_timeout: data_timeout, ping_interval, idle_timeout, max_data_streams, max_data_streams_per_token, create_reservation_ttl: Duration::from_secs(5) },
-        data_limiter: DataLimiter::new(),
+        options: Options { data_connect_timeout: data_timeout, ping_interval, idle_timeout, max_data_streams, max_data_streams_per_token, max_control_connections, max_control_connections_per_token, create_reservation_ttl: Duration::from_secs(5) },
+        data_limiter: OwnerLimiter::new(),
+        control_limiter: OwnerLimiter::new(),
         events,
         discovery: crate::discovery::DiscoveryHealth::disabled(),
     };
@@ -706,6 +710,57 @@ async fn agent_abrupt_disconnect_closes_upstream_data_socket() {
     assert_eq!((code, reason.as_str()), (1001, "peer closed"));
 }
 
+/// Upstream is mid-send when the agent disappears: either the agent_stream EOF arm or an
+/// agent_sink.send failure must close the upstream with 1001 "peer closed" (shared helper).
+#[tokio::test]
+async fn agent_gone_during_upstream_send_closes_upstream_1001() {
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url=format!("http://{}",listener.local_addr().unwrap());
+    let (closed_tx,closed_rx)=tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream,_))=listener.accept().await else { return };
+            let Ok(mut upstream)=accept_hdr_async(stream,|req:&Request,mut response:Response| {
+                if !req.uri().path().ends_with("/api/data") { return Err(ErrorResponse::new(None)); }
+                response.headers_mut().insert("sec-websocket-protocol",HeaderValue::from_static(DATA_SUBPROTOCOL)); Ok(response)
+            }).await else { continue };
+            let Some(Ok(tungstenite::Message::Binary(hello)))=upstream.next().await else { continue };
+            if hello.first()!=Some(&1) { continue; }
+            if upstream.send(tungstenite::Message::Binary(vec![0x81])).await.is_err() { continue; }
+            // Keep pushing application frames so a late agent_sink.send failure is exercised
+            // if the agent disappears after ACCEPT while traffic is in flight.
+            let mut closed_tx = Some(closed_tx);
+            loop {
+                if upstream.send(tungstenite::Message::Binary(vec![0x01, 0x02, 0x03, 0x04])).await.is_err() { return; }
+                match tokio::time::timeout(Duration::from_millis(50), upstream.next()).await {
+                    Ok(Some(Ok(tungstenite::Message::Close(frame)))) => {
+                        let frame = frame.expect("close frame");
+                        if let Some(tx) = closed_tx.take() {
+                            let _ = tx.send((u16::from(frame.code), frame.reason.to_string()));
+                        }
+                        return;
+                    }
+                    Ok(Some(Ok(_))) | Ok(None) | Err(_) => {}
+                    Ok(Some(Err(_))) => return,
+                }
+            }
+        }
+    });
+    let h=start_gateway(&[("local",&url)],tmo(300),Duration::from_secs(3600),tmo(300)).await;
+    let external=h.state.tickets.insert("local","AAAAAAAAAAAAAAAAAAAAAA",SECRET);
+    let raw=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,external).unwrap();
+    let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..],&raw].concat())).await.unwrap();
+    assert!(!next_binary(&mut socket).await.is_empty());
+    // Let at least one upstream→agent frame land, then drop without a Close frame.
+    let _ = tokio::time::timeout(Duration::from_millis(100), socket.next()).await;
+    drop(socket);
+    let (code, reason)=tokio::time::timeout(Duration::from_secs(2), closed_rx).await
+        .expect("upstream should observe peer-closed close")
+        .expect("oneshot");
+    assert_eq!((code, reason.as_str()), (1001, "peer closed"));
+}
+
 #[tokio::test]
 async fn data_stream_limit_closes_1013_without_burning_ticket() {
     let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -744,6 +799,38 @@ async fn data_stream_limit_closes_1013_without_burning_ticket() {
     // Ticket was not consumed on the capacity miss.
     let mapped=h.state.tickets.take(&second, SECRET).expect("limited ticket must remain usable");
     assert_eq!(mapped.upstream_ticket, "BBBBBBBBBBBBBBBBBBBBBB");
+}
+
+#[tokio::test]
+async fn control_per_token_limit_closes_1013_without_welcome() {
+    let url = spawn_fake_rex(vec![], false).await;
+    let h = start_gateway_with_control_limits(&[("local", &url)], tmo(300), Duration::from_secs(3600), tmo(300), 128, 1).await;
+    let _held = control_agent(h.addr).await;
+    let mut limited = agent(h.addr, "/api/control", SUBPROTOCOL).await;
+    let close = loop {
+        match tokio::time::timeout(Duration::from_secs(2), limited.next()).await.expect("limit close").unwrap().unwrap() {
+            tungstenite::Message::Close(frame) => break frame.unwrap(),
+            tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) => {}
+            other => panic!("expected limit close before welcome, got {other:?}"),
+        }
+    };
+    assert_eq!((u16::from(close.code), close.reason.as_ref()), (1013, "per-token control connection limit"));
+}
+
+#[tokio::test]
+async fn control_gateway_limit_closes_1013_without_welcome() {
+    let url = spawn_fake_rex(vec![], false).await;
+    let h = start_gateway_with_control_limits(&[("local", &url), ("online", &url)], tmo(300), Duration::from_secs(3600), tmo(300), 1, 32).await;
+    let _held = control_agent(h.addr).await;
+    let mut limited = agent_with_auth(h.addr, "/api/control", SUBPROTOCOL, "Bearer only-online").await;
+    let close = loop {
+        match tokio::time::timeout(Duration::from_secs(2), limited.next()).await.expect("limit close").unwrap().unwrap() {
+            tungstenite::Message::Close(frame) => break frame.unwrap(),
+            tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) => {}
+            other => panic!("expected gateway limit close before welcome, got {other:?}"),
+        }
+    };
+    assert_eq!((u16::from(close.code), close.reason.as_ref()), (1013, "gateway control connection limit"));
 }
 
 #[tokio::test]
@@ -910,7 +997,7 @@ async fn persist_harness_restart_ttl_and_capacity_route_or_error() {
     let live=spawn_fake_rex(vec![json!({"session_id":"session:a"})],false).await;
     let dir=tempfile::tempdir().unwrap();
     let store=crate::sessions::SessionStore::open(dir.path().join("sessions.json"),Duration::from_millis(20),1).unwrap();
-    let h=start_gateway_with_store(&[("a",&live)],tmo(300),Duration::from_secs(3600),tmo(300),Duration::from_secs(20),Duration::from_secs(120),128,32,Some(store.clone())).await;
+    let h=start_gateway_with_store(&[("a",&live)],tmo(300),Duration::from_secs(3600),tmo(300),Duration::from_secs(20),Duration::from_secs(120),128,32,128,32,Some(store.clone())).await;
     wait_state(&h.pool,"a",UpstreamState::Online).await;
     // The router and this test share the real temporary-file store.
     let mut socket=control_agent(h.addr).await;

@@ -26,7 +26,7 @@ use crate::{
     control_client::{ClientMap, UpstreamEvent, UpstreamReply},
     data::{decode_hello, TicketMap},
     discovery::DiscoveryHealth,
-    metrics::{DataLimiter, Gauge, Metrics},
+    metrics::{Gauge, Metrics, OwnerLimiter},
     pool::UpstreamPool,
     status,
     sessions::{SessionStore, FORGOTTEN_ERROR},
@@ -62,7 +62,8 @@ struct AppState {
     tickets: TicketMap,
     sessions: SessionStore,
     metrics: Arc<Metrics>,
-    data_limiter: DataLimiter,
+    data_limiter: OwnerLimiter,
+    control_limiter: OwnerLimiter,
     options: Options,
     events: broadcast::Sender<UpstreamEvent>,
     discovery: DiscoveryHealth,
@@ -77,6 +78,8 @@ pub struct Options {
     pub idle_timeout: Duration,
     pub max_data_streams: usize,
     pub max_data_streams_per_token: usize,
+    pub max_control_connections: usize,
+    pub max_control_connections_per_token: usize,
     pub create_reservation_ttl: Duration,
 }
 
@@ -92,7 +95,7 @@ pub async fn serve(
     events: broadcast::Sender<UpstreamEvent>,
     discovery: DiscoveryHealth,
 ) -> Result<()> {
-    let state = AppState { pool, clients, auth, tickets, sessions, metrics, data_limiter: DataLimiter::new(), options, events, discovery };
+    let state = AppState { pool, clients, auth, tickets, sessions, metrics, data_limiter: OwnerLimiter::new(), control_limiter: OwnerLimiter::new(), options, events, discovery };
     let router = router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "gateway listening");
@@ -148,7 +151,15 @@ async fn control_upgrade(
 }
 
 async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, owner: String) {
-    let _active = state.metrics.track(Gauge::Control);
+    // Reserve control slots before hello/welcome so a rejected agent never sees a fake welcome.
+    let Some(_owner_slot) = state.control_limiter.try_acquire(&owner, state.options.max_control_connections_per_token) else {
+        let _ = socket.send(Message::Close(Some(CloseFrame { code: 1013, reason: Cow::Borrowed("per-token control connection limit") }))).await;
+        return;
+    };
+    let Some(_active) = state.metrics.try_track(Gauge::Control, state.options.max_control_connections) else {
+        let _ = socket.send(Message::Close(Some(CloseFrame { code: 1013, reason: Cow::Borrowed("gateway control connection limit") }))).await;
+        return;
+    };
     match socket.recv().await {
         Some(Ok(Message::Text(text)))
             if serde_json::from_str::<Value>(&text).ok()
@@ -159,7 +170,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":18});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":19});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -593,11 +604,7 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
                 Some(Err(_)) | None => {
                     // Agent dropped without a Close frame: tell the upstream so Rex can
                     // release the terminal attach instead of waiting for idle timeout.
-                    let _ = upstream_sink.send(tungstenite::Message::Close(Some(tungstenite::protocol::CloseFrame {
-                        code: 1001.into(),
-                        reason: "peer closed".into(),
-                    }))).await;
-                    let _ = upstream_sink.close().await;
+                    close_upstream_peer_closed(&mut upstream_sink).await;
                     break;
                 }
             },
@@ -605,14 +612,30 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
                 Some(Ok(tungstenite::Message::Binary(bytes))) => {
                     last_activity=std::time::Instant::now();
                     if let Some(id)=ticket.session_id.as_deref(){state.sessions.touch(id);}
-                    if agent_sink.send(Message::Binary(bytes)).await.is_err() { break; }
+                    if agent_sink.send(Message::Binary(bytes)).await.is_err() {
+                        close_upstream_peer_closed(&mut upstream_sink).await;
+                        break;
+                    }
                 }
                 Some(Ok(tungstenite::Message::Text(text))) => {
                     last_activity=std::time::Instant::now();
-                    if agent_sink.send(Message::Text(text.as_str().into())).await.is_err() { break; }
+                    if agent_sink.send(Message::Text(text.as_str().into())).await.is_err() {
+                        close_upstream_peer_closed(&mut upstream_sink).await;
+                        break;
+                    }
                 }
-                Some(Ok(tungstenite::Message::Ping(bytes))) => if agent_sink.send(Message::Ping(bytes)).await.is_err() { break; },
-                Some(Ok(tungstenite::Message::Pong(bytes))) => if agent_sink.send(Message::Pong(bytes)).await.is_err() { break; },
+                Some(Ok(tungstenite::Message::Ping(bytes))) => {
+                    if agent_sink.send(Message::Ping(bytes)).await.is_err() {
+                        close_upstream_peer_closed(&mut upstream_sink).await;
+                        break;
+                    }
+                }
+                Some(Ok(tungstenite::Message::Pong(bytes))) => {
+                    if agent_sink.send(Message::Pong(bytes)).await.is_err() {
+                        close_upstream_peer_closed(&mut upstream_sink).await;
+                        break;
+                    }
+                }
                 Some(Ok(tungstenite::Message::Close(frame))) => {
                     let _ = agent_sink.send(Message::Close(frame.map(to_agent_close))).await;
                     break;
@@ -628,7 +651,14 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
                 }
             },
             _=pings.tick()=> {
-                if agent_sink.send(Message::Ping(Vec::new())).await.is_err() || upstream_sink.send(tungstenite::Message::Ping(Vec::new())).await.is_err() { break; }
+                if agent_sink.send(Message::Ping(Vec::new())).await.is_err() {
+                    close_upstream_peer_closed(&mut upstream_sink).await;
+                    break;
+                }
+                if upstream_sink.send(tungstenite::Message::Ping(Vec::new())).await.is_err() {
+                    let _ = agent_sink.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed("upstream closed") }))).await;
+                    break;
+                }
             }
             _=idle.tick()=>if last_activity.elapsed()>=state.options.idle_timeout {
                 let _=agent_sink.send(Message::Close(Some(CloseFrame { code:1001,reason:Cow::Borrowed("idle timeout") }))).await;
@@ -639,6 +669,19 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
             }
         }
     }
+}
+
+/// Notify the upstream data socket that the agent disappeared without a Close frame.
+async fn close_upstream_peer_closed(
+    upstream_sink: &mut (impl SinkExt<tungstenite::Message> + Unpin),
+) {
+    let _ = upstream_sink
+        .send(tungstenite::Message::Close(Some(tungstenite::protocol::CloseFrame {
+            code: 1001.into(),
+            reason: "peer closed".into(),
+        })))
+        .await;
+    let _ = upstream_sink.close().await;
 }
 
 fn to_upstream_close(frame: CloseFrame) -> tungstenite::protocol::CloseFrame {
@@ -672,7 +715,7 @@ mod tests {
             ("onlyb".to_owned(), vec!["b".to_owned()]),
         ])));
         let tickets = TicketMap::new(Duration::from_secs(30), 16, metrics.clone());
-        let state = AppState { pool, clients: ClientMap::new(), auth, tickets, sessions: SessionStore::open(tempfile::tempdir().unwrap().path().join("sessions.json"),Duration::from_secs(86400),16384).unwrap(), metrics, data_limiter: DataLimiter::new(), options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120), max_data_streams: 128, max_data_streams_per_token: 32, create_reservation_ttl: Duration::from_secs(5) }, events: broadcast::channel(8).0, discovery: DiscoveryHealth::disabled() };
+        let state = AppState { pool, clients: ClientMap::new(), auth, tickets, sessions: SessionStore::open(tempfile::tempdir().unwrap().path().join("sessions.json"),Duration::from_secs(86400),16384).unwrap(), metrics, data_limiter: OwnerLimiter::new(), control_limiter: OwnerLimiter::new(), options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120), max_data_streams: 128, max_data_streams_per_token: 32, max_control_connections: 128, max_control_connections_per_token: 32, create_reservation_ttl: Duration::from_secs(5) }, events: broadcast::channel(8).0, discovery: DiscoveryHealth::disabled() };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router(state.clone());

@@ -63,12 +63,13 @@ impl Metrics {
         }
     }
 
+    #[allow(dead_code)] // unconditional form; production paths use try_track
     pub fn track(self: &Arc<Self>, gauge: Gauge) -> Guard {
         Self::cell(self, gauge).fetch_add(1, Relaxed);
         Guard { metrics: self.clone(), gauge }
     }
 
-    /// Atomically reserves a gauge slot if under `max`. Used for data-plane backpressure.
+    /// Atomically reserves a gauge slot if under `max`. Used for connection/stream backpressure.
     pub fn try_track(self: &Arc<Self>, gauge: Gauge, max: usize) -> Option<Guard> {
         let cell = Self::cell(self, gauge);
         let max = max as u64;
@@ -86,18 +87,18 @@ impl Metrics {
     }
 }
 
-/// Per-bearer active data-stream counter. Paired with the gateway-wide data gauge.
+/// Per-bearer active connection/stream counter. Paired with a gateway-wide gauge.
 #[derive(Clone, Default)]
-pub struct DataLimiter {
+pub struct OwnerLimiter {
     by_owner: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
 }
 
 pub struct OwnerGuard {
-    limiter: DataLimiter,
+    limiter: OwnerLimiter,
     owner: String,
 }
 
-impl DataLimiter {
+impl OwnerLimiter {
     pub fn new() -> Self { Self::default() }
 
     pub fn try_acquire(&self, owner: &str, max_per_token: usize) -> Option<OwnerGuard> {
@@ -150,8 +151,8 @@ mod tests {
     }
 
     #[test]
-    fn data_limiter_caps_per_owner() {
-        let limiter = DataLimiter::new();
+    fn owner_limiter_caps_per_owner() {
+        let limiter = OwnerLimiter::new();
         let a = limiter.try_acquire("Bearer a", 1).unwrap();
         assert!(limiter.try_acquire("Bearer a", 1).is_none());
         assert!(limiter.try_acquire("Bearer b", 1).is_some());

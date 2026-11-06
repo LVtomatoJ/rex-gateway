@@ -36,6 +36,12 @@ pub struct Config {
     /// Maximum concurrently bridged data streams for one bearer token.
     #[serde(default = "default_max_data_per_token")]
     pub max_data_streams_per_token: usize,
+    /// Maximum concurrent agent control connections across the whole gateway.
+    #[serde(default = "default_max_control")]
+    pub max_control_connections: usize,
+    /// Maximum concurrent agent control connections for one bearer token.
+    #[serde(default = "default_max_control_per_token")]
+    pub max_control_connections_per_token: usize,
     /// Time an upstream selected for session.create carries one extra reservation.
     #[serde(default = "default_reservation_ttl")]
     pub create_reservation_ttl_ms: u64,
@@ -119,6 +125,8 @@ fn default_ping_interval() -> u64 { 20_000 }
 fn default_idle_timeout() -> u64 { 120_000 }
 fn default_max_data() -> usize { 128 }
 fn default_max_data_per_token() -> usize { 32 }
+fn default_max_control() -> usize { 128 }
+fn default_max_control_per_token() -> usize { 32 }
 fn default_reservation_ttl() -> u64 { 5_000 }
 fn default_session_store() -> PathBuf { PathBuf::from("rex-gateway-sessions.json") }
 fn default_session_ttl() -> u64 { 86_400_000 }
@@ -145,6 +153,8 @@ impl Config {
         if let Some(v) = env("REX_GATEWAY_WS_IDLE_TIMEOUT_MS") { config.ws_idle_timeout_ms = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_MAX_DATA_STREAMS") { config.max_data_streams = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_MAX_DATA_STREAMS_PER_TOKEN") { config.max_data_streams_per_token = v.parse()?; }
+        if let Some(v) = env("REX_GATEWAY_MAX_CONTROL_CONNECTIONS") { config.max_control_connections = v.parse()?; }
+        if let Some(v) = env("REX_GATEWAY_MAX_CONTROL_CONNECTIONS_PER_TOKEN") { config.max_control_connections_per_token = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_CREATE_RESERVATION_TTL_MS") { config.create_reservation_ttl_ms = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_SESSION_STORE_PATH") { config.session_store_path = v.into(); }
         if let Some(v) = env("REX_GATEWAY_SESSION_TTL_MS") { config.session_ttl_ms = v.parse()?; }
@@ -186,6 +196,7 @@ impl Config {
         }
         if config.ticket_ttl_ms == 0 || config.ticket_max == 0 || config.ws_ping_interval_ms == 0 || config.ws_idle_timeout_ms == 0 { bail!("ticket_ttl_ms, ticket_max, ws_ping_interval_ms and ws_idle_timeout_ms must be nonzero"); }
         if config.max_data_streams == 0 || config.max_data_streams_per_token == 0 { bail!("max_data_streams and max_data_streams_per_token must be nonzero"); }
+        if config.max_control_connections == 0 || config.max_control_connections_per_token == 0 { bail!("max_control_connections and max_control_connections_per_token must be nonzero"); }
         if config.ws_idle_timeout_ms <= config.ws_ping_interval_ms { bail!("ws_idle_timeout_ms must exceed ws_ping_interval_ms"); }
         if config.upstream_call_timeout_ms == 0 || config.data_connect_timeout_ms == 0 {
             bail!("upstream_call_timeout_ms and data_connect_timeout_ms must be nonzero");
@@ -294,6 +305,27 @@ mod data_limit_tests {
         assert_eq!((config.max_data_streams, config.max_data_streams_per_token), (4, 2));
         assert!(Config::from_toml(&format!("max_data_streams=0\n{BASE}"), |_| None).is_err());
         assert!(Config::from_toml(BASE, |k| (k == "REX_GATEWAY_MAX_DATA_STREAMS_PER_TOKEN").then(|| "0".into())).is_err());
+    }
+}
+
+#[cfg(test)]
+mod control_limit_tests {
+    use super::*;
+    const BASE: &str = "[[upstreams]]\nid=\"a\"\nurl=\"http://a\"\n[[auth.tokens]]\ntoken=\"t\"\nallow=[\"*\"]\n";
+    #[test]
+    fn max_control_connections_defaults_and_validation() {
+        let config = Config::from_toml(BASE, |_| None).unwrap();
+        assert_eq!((config.max_control_connections, config.max_control_connections_per_token), (128, 32));
+        let config = Config::from_toml(&format!("max_control_connections=4\nmax_control_connections_per_token=2\n{BASE}"), |_| None).unwrap();
+        assert_eq!((config.max_control_connections, config.max_control_connections_per_token), (4, 2));
+        assert!(Config::from_toml(&format!("max_control_connections=0\n{BASE}"), |_| None).is_err());
+        assert!(Config::from_toml(BASE, |k| (k == "REX_GATEWAY_MAX_CONTROL_CONNECTIONS_PER_TOKEN").then(|| "0".into())).is_err());
+        let config = Config::from_toml(BASE, |k| match k {
+            "REX_GATEWAY_MAX_CONTROL_CONNECTIONS" => Some("7".into()),
+            "REX_GATEWAY_MAX_CONTROL_CONNECTIONS_PER_TOKEN" => Some("3".into()),
+            _ => None,
+        }).unwrap();
+        assert_eq!((config.max_control_connections, config.max_control_connections_per_token), (7, 3));
     }
 }
 

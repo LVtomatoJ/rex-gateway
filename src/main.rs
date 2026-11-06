@@ -76,6 +76,8 @@ async fn main() -> Result<()> {
         idle_timeout: Duration::from_millis(config.ws_idle_timeout_ms),
         max_data_streams: config.max_data_streams,
         max_data_streams_per_token: config.max_data_streams_per_token,
+        max_control_connections: config.max_control_connections,
+        max_control_connections_per_token: config.max_control_connections_per_token,
         create_reservation_ttl: Duration::from_millis(config.create_reservation_ttl_ms),
     };
     inbound::serve(config.listen, pool, clients, auth, tickets, sessions, metrics, options, events, discovery_health).await
