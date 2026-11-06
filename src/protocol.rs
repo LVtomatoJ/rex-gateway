@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::data::TicketMap;
+use crate::{data::TicketMap, sessions::SessionStore};
 
 pub const SUBPROTOCOL: &str = "rex.control.v1";
 
@@ -42,6 +42,20 @@ pub fn namespace_response(value: &mut Value, upstream: &str, tickets: &TicketMap
 }
 
 /// Applies an upstream namespace to an event (including events nested in its payload).
+pub fn namespace_and_record(value: &mut Value, upstream: &str, tickets: &TicketMap, owner: &str, sessions: &SessionStore) {
+    namespace_response(value, upstream, tickets, owner);
+    fn walk(value: &Value, upstream: &str, sessions: &SessionStore) {
+        match value {
+            Value::Array(items)=>for item in items{walk(item,upstream,sessions)},
+            Value::Object(object)=>for (key,item) in object {
+                if key=="session_id" { if let Some(id)=item.as_str(){if let Some((owner,real))=unwrap_session_id(id){if owner==upstream{sessions.record(owner,real);}}} }
+                else {walk(item,upstream,sessions)}
+            }, _=>{}
+        }
+    }
+    walk(value,upstream,sessions);
+}
+
 pub fn namespace_event(event: &Value, upstream: &str, seq: u64, tickets: &TicketMap, owner: &str) -> Option<Value> {
     (event.get("type").and_then(Value::as_str) == Some("event")).then(|| {
         let mut payload = event.get("payload").cloned().unwrap_or(Value::Null);

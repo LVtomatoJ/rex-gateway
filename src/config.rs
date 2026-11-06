@@ -39,6 +39,15 @@ pub struct Config {
     /// Time an upstream selected for session.create carries one extra reservation.
     #[serde(default = "default_reservation_ttl")]
     pub create_reservation_ttl_ms: u64,
+    /// Durable namespace -> upstream session mapping (atomically replaced JSON).
+    #[serde(default = "default_session_store")]
+    pub session_store_path: PathBuf,
+    /// Idle session references are forgotten after this duration.
+    #[serde(default = "default_session_ttl")]
+    pub session_ttl_ms: u64,
+    /// Maximum remembered sessions; the least-recently active are forgotten first.
+    #[serde(default = "default_session_max")]
+    pub session_max: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -71,6 +80,9 @@ fn default_idle_timeout() -> u64 { 120_000 }
 fn default_max_data() -> usize { 128 }
 fn default_max_data_per_token() -> usize { 32 }
 fn default_reservation_ttl() -> u64 { 5_000 }
+fn default_session_store() -> PathBuf { PathBuf::from("rex-gateway-sessions.json") }
+fn default_session_ttl() -> u64 { 86_400_000 }
+fn default_session_max() -> usize { 16_384 }
 
 impl Config {
     pub fn load() -> Result<Self> {
@@ -93,6 +105,9 @@ impl Config {
         if let Some(v) = env("REX_GATEWAY_MAX_DATA_STREAMS") { config.max_data_streams = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_MAX_DATA_STREAMS_PER_TOKEN") { config.max_data_streams_per_token = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_CREATE_RESERVATION_TTL_MS") { config.create_reservation_ttl_ms = v.parse()?; }
+        if let Some(v) = env("REX_GATEWAY_SESSION_STORE_PATH") { config.session_store_path = v.into(); }
+        if let Some(v) = env("REX_GATEWAY_SESSION_TTL_MS") { config.session_ttl_ms = v.parse()?; }
+        if let Some(v) = env("REX_GATEWAY_SESSION_MAX") { config.session_max = v.parse()?; }
         // Per-upstream environment keys use the exact ID: REX_GATEWAY_UPSTREAM_<ID>_{TAGS,DESCRIPTION}.
         // Tags are comma-separated; an unset variable leaves TOML unchanged.
         for (index, token) in config.auth.tokens.iter_mut().enumerate() {
@@ -116,6 +131,8 @@ impl Config {
         }
         config.auth_entries()?;
         if config.create_reservation_ttl_ms == 0 { bail!("create_reservation_ttl_ms must be nonzero"); }
+        if config.session_ttl_ms == 0 || config.session_max == 0 { bail!("session_ttl_ms and session_max must be nonzero"); }
+        if config.session_store_path.as_os_str().is_empty() { bail!("session_store_path must be nonempty"); }
         Ok(config)
     }
 
@@ -218,6 +235,25 @@ mod data_limit_tests {
     }
 }
 
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    const BASE: &str = "[[upstreams]]\nid=\"a\"\nurl=\"http://a\"\n[[auth.tokens]]\ntoken=\"t\"\nallow=[\"*\"]\n";
+    #[test]
+    fn durable_session_defaults_toml_env_and_validation() {
+        let c=Config::from_toml(BASE, |_| None).unwrap();
+        assert_eq!((c.session_ttl_ms,c.session_max),(86_400_000,16_384));
+        assert_eq!(c.session_store_path,PathBuf::from("rex-gateway-sessions.json"));
+        let c=Config::from_toml(&format!("session_store_path=\"state/s.json\"\nsession_ttl_ms=99\nsession_max=3\n{BASE}"), |_|None).unwrap();
+        assert_eq!((c.session_ttl_ms,c.session_max),(99,3));
+        let env=|k:&str|match k { "REX_GATEWAY_SESSION_STORE_PATH"=>Some("x.json".into()),"REX_GATEWAY_SESSION_TTL_MS"=>Some("88".into()),"REX_GATEWAY_SESSION_MAX"=>Some("2".into()),_=>None };
+        let c=Config::from_toml(BASE,env).unwrap();
+        assert_eq!((c.session_store_path,c.session_ttl_ms,c.session_max),(PathBuf::from("x.json"),88,2));
+        assert!(Config::from_toml(&format!("session_ttl_ms=0\n{BASE}"), |_|None).is_err());
+        assert!(Config::from_toml(&format!("session_max=0\n{BASE}"), |_|None).is_err());
+    }
+}
 
 #[cfg(test)]
 mod routing_tests {

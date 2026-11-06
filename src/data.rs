@@ -13,6 +13,8 @@ pub struct Ticket {
     pub upstream: String,
     pub upstream_ticket: String,
     owner: String,
+    /// Namespaced reference used for clear stale-reference errors.
+    pub session_id: Option<String>,
 }
 
 struct Entry { ticket: Ticket, created: Instant, seq: u64 }
@@ -68,7 +70,7 @@ impl TicketMap {
         inner.next_seq += 1;
         inner.order.insert(seq, external.clone());
         inner.entries.insert(external.clone(), Entry {
-            ticket: Ticket { upstream: upstream.to_owned(), upstream_ticket: upstream_ticket.to_owned(), owner: owner.to_owned() },
+            ticket: Ticket { upstream: upstream.to_owned(), upstream_ticket: upstream_ticket.to_owned(), owner: owner.to_owned(), session_id: None },
             created: now,
             seq,
         });
@@ -115,6 +117,10 @@ impl TicketMap {
         removed
     }
 
+    /// Marks a ticket with its session before it is exposed to an agent.
+    pub fn bind_session(&self, external: &str, session_id: &str) {
+        if let Some(entry)=self.lock().entries.get_mut(external){entry.ticket.session_id=Some(session_id.to_owned());}
+    }
     pub fn pending(&self) -> usize { self.lock().entries.len() }
 
     /// Background task that purges expired tickets so unused ones never linger past the TTL
@@ -158,7 +164,7 @@ mod tests {
         assert_eq!(map.take_at(&external, "other", now), None);
         assert_eq!(map.pending(), 1, "wrong owner must not burn the ticket");
         assert_eq!(map.take_at(&external, "secret", now), Some(Ticket {
-            upstream: "local".into(), upstream_ticket: "real-ticket".into(), owner: "secret".into(),
+            upstream: "local".into(), upstream_ticket: "real-ticket".into(), owner: "secret".into(), session_id: None,
         }));
         assert_eq!(map.take_at(&external, "secret", now), None, "single use");
         assert_eq!(map.pending(), 0);

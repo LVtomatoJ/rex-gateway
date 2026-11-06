@@ -8,6 +8,7 @@ mod pool;
 mod probe;
 mod protocol;
 mod status;
+mod sessions;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::Result;
@@ -35,6 +36,8 @@ async fn main() -> Result<()> {
     let metrics = metrics::Metrics::new();
     let tickets = data::TicketMap::new(Duration::from_millis(config.ticket_ttl_ms), config.ticket_max, metrics.clone());
     tickets.spawn_reaper();
+    let sessions = sessions::SessionStore::open(&config.session_store_path, Duration::from_millis(config.session_ttl_ms), config.session_max)?;
+    sessions.spawn_reaper();
     let options = inbound::Options { data_connect_timeout: Duration::from_millis(config.data_connect_timeout_ms), ping_interval: Duration::from_millis(config.ws_ping_interval_ms), idle_timeout: Duration::from_millis(config.ws_idle_timeout_ms), max_data_streams: config.max_data_streams, max_data_streams_per_token: config.max_data_streams_per_token, create_reservation_ttl: Duration::from_millis(config.create_reservation_ttl_ms) };
-    inbound::serve(config.listen, pool, clients, auth, tickets, metrics, options, events).await
+    inbound::serve(config.listen, pool, clients, auth, tickets, sessions, metrics, options, events).await
 }

@@ -28,7 +28,8 @@ use crate::{
     metrics::{DataLimiter, Gauge, Metrics},
     pool::UpstreamPool,
     status,
-    protocol::{namespace_event, namespace_response, translate_session_id, SUBPROTOCOL},
+    sessions::{SessionStore, FORGOTTEN_ERROR},
+    protocol::{namespace_event, namespace_and_record, translate_session_id, SUBPROTOCOL},
 };
 
 const DATA_SUBPROTOCOL: &str = "rex.data.terminal.v1";
@@ -40,6 +41,7 @@ struct AppState {
     clients: Clients,
     auth: Arc<Authenticator>,
     tickets: TicketMap,
+    sessions: SessionStore,
     metrics: Arc<Metrics>,
     data_limiter: DataLimiter,
     options: Options,
@@ -64,11 +66,12 @@ pub async fn serve(
     clients: HashMap<String, Arc<ControlClient>>,
     auth: Arc<Authenticator>,
     tickets: TicketMap,
+    sessions: SessionStore,
     metrics: Arc<Metrics>,
     options: Options,
     events: broadcast::Sender<UpstreamEvent>,
 ) -> Result<()> {
-    let state = AppState { pool, clients: Arc::new(clients), auth, tickets, metrics, data_limiter: DataLimiter::new(), options, events };
+    let state = AppState { pool, clients: Arc::new(clients), auth, tickets, sessions, metrics, data_limiter: DataLimiter::new(), options, events };
     let router = router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "gateway listening");
@@ -163,8 +166,11 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             }
             event=events.recv()=> {
                 let event=match event { Ok(event)=>event, Err(broadcast::error::RecvError::Lagged(n))=>{ tracing::warn!(n,"agent event receiver lagged"); continue }, Err(_)=>break };
+                let event_upstream=event.upstream.clone();
                 if auth::Authenticator::permits(&acl,&event.upstream) {
                     if let Some(event)=namespace_event(&event.event,&event.upstream,{ seq+=1; seq },&state.tickets,&owner) {
+                        // Discover references emitted asynchronously as well as in RPC responses.
+                        if let Some(payload)=event.get("payload"){let mut p=payload.clone();namespace_and_record(&mut p,&event_upstream,&state.tickets,&owner,&state.sessions);}
                         if sink.send(Message::Text(event.to_string())).await.is_err() { break; }
                     }
                 }
@@ -180,7 +186,17 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
 }
 
 async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut payload: Value) -> Result<Value, String> {
-    if method == "session.list" { return list_sessions(state, acl).await; }
+    let external_session=payload.get("session_id").and_then(Value::as_str).map(str::to_owned);
+    if method == "session.list" { return list_sessions(state, acl, &state.sessions).await; }
+    if method == "session.forget" {
+        let external=payload.get("session_id").and_then(Value::as_str).ok_or("session.forget requires session_id")?;
+        let (upstream,_)=crate::protocol::unwrap_session_id(external).ok_or("invalid namespaced session_id")?;
+        if !auth::Authenticator::permits(acl,upstream){return Err(format!("upstream {upstream} is not allowed"));}
+        return Ok(json!({"forgotten":state.sessions.forget(external)?,"session_id":external}));
+    }
+    if let Some(external)=payload.get("session_id").and_then(Value::as_str) {
+        if crate::protocol::unwrap_session_id(external).is_some(){state.sessions.resolve(external)?;state.sessions.touch(external);}
+    }
     let defaults = state.auth.identify(Some(owner)).unwrap_or(crate::auth::Identity { acl: acl.to_vec(), prefer_tags: Vec::new(), avoid_tags: Vec::new() });
     let prefs = if method == "session.create" {
         TagPreferences { prefer: string_list(&payload, "prefer_tags").unwrap_or(defaults.prefer_tags), avoid: string_list(&payload, "avoid_tags").unwrap_or(defaults.avoid_tags) }
@@ -226,7 +242,8 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
     if method == "data.connect" && response.get("ticket").and_then(Value::as_str).is_none() {
         return Err("upstream data.connect omitted ticket".into());
     }
-    namespace_response(&mut response, &owner_upstream, &state.tickets, owner);
+    namespace_and_record(&mut response, &owner_upstream, &state.tickets, owner, &state.sessions);
+    if method=="data.connect" {if let (Some(ticket),Some(id))=(response.get("ticket").and_then(Value::as_str),external_session.as_deref()){state.tickets.bind_session(ticket,id);}}
     Ok(response)
 }
 
@@ -240,7 +257,7 @@ async fn dispatch_sole_client(state: &AppState, acl: &[String], ids: &[&str], me
         let upstream = state.pool.get(id).await.ok_or_else(|| format!("upstream {id} is unknown"))?;
         if !upstream.state.is_routable() { return Err(format!("upstream {id} is {}; the owning upstream is unavailable", upstream.state.as_str())); }
                 let mut response = state.clients.get(*id).ok_or("upstream client missing")?.call(method, payload).await.map_err(|e| e.to_string())?;
-        namespace_response(&mut response, id, &state.tickets, owner);
+        namespace_and_record(&mut response, id, &state.tickets, owner, &state.sessions);
         return Ok(response);
     }
     Err("no routable upstream".into())
@@ -250,7 +267,7 @@ fn string_list(payload: &Value, field: &str) -> Option<Vec<String>> {
     payload.get(field).and_then(Value::as_array).map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect())
 }
 
-async fn list_sessions(state: &AppState, acl: &[String]) -> Result<Value, String> {
+async fn list_sessions(state: &AppState, acl: &[String], store: &SessionStore) -> Result<Value, String> {
     let allowed = state.pool.list_allowed(acl).await;
     let results = futures_util::future::join_all(allowed.iter().map(|upstream| async move {
         if upstream.state != UpstreamState::Online {
@@ -271,7 +288,12 @@ async fn list_sessions(state: &AppState, acl: &[String]) -> Result<Value, String
     for (id, result) in results {
         match result {
             Ok(items) => for mut session in items {
-                if translate_session_id(&mut session, id, true) { sessions.push(session); }
+                if translate_session_id(&mut session, id, true) {
+                    if let Some(external)=session.get("session_id").and_then(Value::as_str){
+                        if let Some((owner,real))=crate::protocol::unwrap_session_id(external){store.record(owner,real);}
+                    }
+                    sessions.push(session);
+                }
             },
             Err(error) => { tracing::warn!(upstream = id, %error, "session.list skipped upstream"); errors.insert(id.to_owned(), Value::String(error)); }
         }
@@ -327,11 +349,17 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
         let _ = agent.send(Message::Close(Some(CloseFrame { code: 1013, reason: Cow::Borrowed("gateway data stream limit") }))).await;
         return;
     };
+    // Lookup of a ticket attached to a forgotten session still leads to a clear refusal.
+    // The gateway keeps the ticket's owning upstream private; stale tickets cannot be replayed.
     let Some(ticket) = state.tickets.take(&external, &owner) else {
         let _ = agent.send(Message::Binary(vec![0x82, 0x01].into())).await;
         let _ = agent.send(Message::Close(Some(CloseFrame { code: 1008, reason: Cow::Borrowed("bad or used ticket") }))).await;
         return;
     };
+    if let Some(id)=ticket.session_id.as_deref(){
+        if state.sessions.resolve(id).is_err(){let _=agent.send(Message::Close(Some(CloseFrame{code:1008,reason:Cow::Borrowed(FORGOTTEN_ERROR)}))).await;return;}
+        state.sessions.touch(id);
+    }
     let Some(upstream) = state.pool.get(&ticket.upstream).await else {
         let _ = agent.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed("upstream unavailable") }))).await;
         return;
@@ -376,6 +404,7 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
             incoming = agent_stream.next() => match incoming {
                 Some(Ok(Message::Binary(bytes))) => {
                     last_activity=std::time::Instant::now();
+                    if let Some(id)=ticket.session_id.as_deref(){state.sessions.touch(id);}
                     if upstream_sink.send(tungstenite::Message::Binary(bytes)).await.is_err() { break; }
                 }
                 Some(Ok(Message::Text(text))) => {
@@ -393,6 +422,7 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
             outgoing = upstream_stream.next() => match outgoing {
                 Some(Ok(tungstenite::Message::Binary(bytes))) => {
                     last_activity=std::time::Instant::now();
+                    if let Some(id)=ticket.session_id.as_deref(){state.sessions.touch(id);}
                     if agent_sink.send(Message::Binary(bytes)).await.is_err() { break; }
                 }
                 Some(Ok(tungstenite::Message::Text(text))) => {
@@ -459,7 +489,7 @@ mod tests {
             ("onlyb".to_owned(), vec!["b".to_owned()]),
         ])));
         let tickets = TicketMap::new(Duration::from_secs(30), 16, metrics.clone());
-        let state = AppState { pool, clients: Arc::new(HashMap::new()), auth, tickets, metrics, data_limiter: DataLimiter::new(), options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120), max_data_streams: 128, max_data_streams_per_token: 32, create_reservation_ttl: Duration::from_secs(5) }, events: broadcast::channel(8).0 };
+        let state = AppState { pool, clients: Arc::new(HashMap::new()), auth, tickets, sessions: SessionStore::open(tempfile::tempdir().unwrap().path().join("sessions.json"),Duration::from_secs(86400),16384).unwrap(), metrics, data_limiter: DataLimiter::new(), options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120), max_data_streams: 128, max_data_streams_per_token: 32, create_reservation_ttl: Duration::from_secs(5) }, events: broadcast::channel(8).0 };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router(state.clone());

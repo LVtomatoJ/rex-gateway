@@ -80,6 +80,9 @@ async fn start_gateway_with_keepalive(upstreams: &[(&str, &str)], call_timeout: 
 }
 
 async fn start_gateway_with_limits(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration, ping_interval: Duration, idle_timeout: Duration, max_data_streams: usize, max_data_streams_per_token: usize) -> Harness {
+    start_gateway_with_store(upstreams,call_timeout,probe_every,data_timeout,ping_interval,idle_timeout,max_data_streams,max_data_streams_per_token,None).await
+}
+async fn start_gateway_with_store(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration, ping_interval: Duration, idle_timeout: Duration, max_data_streams: usize, max_data_streams_per_token: usize, store: Option<crate::sessions::SessionStore>) -> Harness {
     let pool = UpstreamPool::new();
     let mut clients = HashMap::new();
     let (events, _) = broadcast::channel(32);
@@ -98,6 +101,7 @@ async fn start_gateway_with_limits(upstreams: &[(&str, &str)], call_timeout: Dur
             ("only-online".to_owned(), vec!["online".to_owned()]),
         ]))),
         tickets: TicketMap::new(Duration::from_secs(30), 16, metrics.clone()),
+        sessions: store.unwrap_or_else(||crate::sessions::SessionStore::open(tempfile::tempdir().unwrap().path().join("sessions.json"),Duration::from_secs(86400),16384).unwrap()),
         metrics,
         options: Options { data_connect_timeout: data_timeout, ping_interval, idle_timeout, max_data_streams, max_data_streams_per_token, create_reservation_ttl: Duration::from_secs(5) },
         data_limiter: DataLimiter::new(),
@@ -636,4 +640,60 @@ async fn capability_tags_create_routing_bootstrap_and_owner_degradation() {
     h.pool.mark("low",UpstreamState::Degraded,Some(5),1).await;
     let reply=rpc(&mut socket,"session.create",json!({"host":"low","avoid_tags":["perf"],"prefer_tags":["macos"]})).await;
     assert_eq!(reply["session_id"],"low:session:created", "explicit host pin wins over tag constraints");
+}
+
+#[tokio::test]
+async fn manual_forget_then_every_session_call_fails_clearly() {
+    let live=spawn_fake_rex(vec![json!({"session_id":"session:kept"})],false).await;
+    let h=start_gateway(&[("local",&live)],tmo(500),Duration::from_secs(3600),tmo(300)).await;
+    wait_state(&h.pool,"local",UpstreamState::Online).await;
+    let mut socket=control_agent(h.addr).await;
+    let listed=rpc(&mut socket,"session.list",json!({})).await;
+    let id=listed["sessions"][0]["session_id"].as_str().unwrap().to_owned();
+    let reply=rpc(&mut socket,"session.forget",json!({"session_id":id})).await;
+    assert_eq!(reply["forgotten"],true);
+    for method in ["session.rename","session.read","session.send","session.bootstrap"] {
+        let reply=rpc(&mut socket,method,json!({"session_id":id,"label":"x"})).await;
+        assert_eq!(reply["error"],crate::sessions::FORGOTTEN_ERROR,"{method}: {reply}");
+    }
+}
+
+#[tokio::test]
+async fn data_attach_after_forget_rejects_before_upstream() {
+    let url="http://127.0.0.1:9";
+    let h=start_gateway(&[("local",url)],tmo(100),Duration::from_secs(3600),tmo(300)).await;
+    h.pool.mark("local",UpstreamState::Online,Some(1),0).await;
+    let id="local:session:stale";
+    h.state.sessions.record("local","session:stale");
+    let external=h.state.tickets.insert("local","AAAAAAAAAAAAAAAAAAAAAA",SECRET);
+    h.state.tickets.bind_session(&external,id);
+    assert!(h.state.sessions.forget(id).unwrap());
+    let raw=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,external).unwrap();
+    let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..],&raw].concat())).await.unwrap();
+    match socket.next().await.unwrap().unwrap(){tungstenite::Message::Close(Some(frame))=>assert_eq!((u16::from(frame.code),frame.reason.as_ref()),(1008,crate::sessions::FORGOTTEN_ERROR)),other=>panic!("{other:?}")}
+}
+
+#[tokio::test]
+async fn persist_harness_restart_ttl_and_capacity_route_or_error() {
+    let live=spawn_fake_rex(vec![json!({"session_id":"session:a"})],false).await;
+    let dir=tempfile::tempdir().unwrap();
+    let store=crate::sessions::SessionStore::open(dir.path().join("sessions.json"),Duration::from_millis(20),1).unwrap();
+    let h=start_gateway_with_store(&[("a",&live)],tmo(300),Duration::from_secs(3600),tmo(300),Duration::from_secs(20),Duration::from_secs(120),128,32,Some(store.clone())).await;
+    wait_state(&h.pool,"a",UpstreamState::Online).await;
+    // The router and this test share the real temporary-file store.
+    let mut socket=control_agent(h.addr).await;
+    let id=ids(&rpc(&mut socket,"session.list",json!({})).await)[0].clone();
+    assert_eq!(rpc(&mut socket,"session.rename",json!({"session_id":id})).await,json!({"ok":true}));
+    // A new handle against the same JSON file models a gateway process restart.
+    let restarted=crate::sessions::SessionStore::open(dir.path().join("sessions.json"),Duration::from_millis(20),1).unwrap();
+    assert_eq!(restarted.resolve(&id).unwrap().session_id,"session:a");
+    store.reap_at(u64::MAX);
+    assert_eq!(rpc(&mut socket,"session.rename",json!({"session_id":id})).await["error"],crate::sessions::FORGOTTEN_ERROR);
+    // A second reference under max=1 removes the older one, not the freshly learned one.
+    h.state.sessions.record_at("a","session:old",1);
+    h.state.sessions.record_at("a","session:new",2);
+    h.state.sessions.reap_at(3);
+    assert_eq!(rpc(&mut socket,"session.rename",json!({"session_id":"a:session:old"})).await["error"],crate::sessions::FORGOTTEN_ERROR);
+    assert_eq!(rpc(&mut socket,"session.rename",json!({"session_id":"a:session:new"})).await,json!({"ok":true}));
 }
