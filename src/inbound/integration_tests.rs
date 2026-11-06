@@ -9,7 +9,7 @@ use crate::{
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
-    accept_hdr_async,
+    accept_hdr_async, connect_async,
     tungstenite::handshake::server::{ErrorResponse, Request, Response},
     MaybeTlsStream, WebSocketStream,
 };
@@ -930,6 +930,69 @@ async fn data_plane_unexpected_upstream_drop_closes_agent_1011() {
     assert_eq!((u16::from(close.code), close.reason.as_ref()), (1011, "upstream closed"));
 }
 
+/// When forwarding agent→upstream fails (upstream already gone), the agent must get a clean
+/// 1011 "upstream closed" — mirroring the upstream→agent peer-close path.
+#[tokio::test]
+async fn agent_to_upstream_send_failure_closes_agent_1011() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let Ok(mut upstream) = accept_hdr_async(stream, |req: &Request, mut response: Response| {
+                if !req.uri().path().ends_with("/api/data") { return Err(ErrorResponse::new(None)); }
+                response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(DATA_SUBPROTOCOL));
+                Ok(response)
+            }).await else { continue };
+            let Some(Ok(tungstenite::Message::Binary(hello))) = upstream.next().await else { continue };
+            if hello.first() != Some(&1) { continue; }
+            let _ = upstream.send(tungstenite::Message::Binary(vec![0x81])).await;
+            // Tear down the TCP immediately so the next gateway→upstream write fails (or the
+            // upstream stream ends); either arm must close the agent with 1011.
+            drop(upstream);
+            return;
+        }
+    });
+    let h = start_gateway(&[("local", &url)], tmo(300), Duration::from_secs(3600), tmo(300)).await;
+    let external = h.state.tickets.insert("local", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
+    let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat())).await.unwrap();
+    assert!(!next_binary(&mut socket).await.is_empty());
+    // Push an application frame so the bridge exercises agent→upstream send after the peer is gone.
+    let _ = socket.send(tungstenite::Message::Binary(vec![0x01, 0x02, 0x03])).await;
+    let close = loop {
+        match tokio::time::timeout(Duration::from_secs(2), socket.next()).await.expect("close").unwrap().unwrap() {
+            tungstenite::Message::Close(frame) => break frame.unwrap(),
+            tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_) => {}
+            tungstenite::Message::Binary(_) | tungstenite::Message::Text(_) => {}
+            other => panic!("expected close after upstream send failure, got {other:?}"),
+        }
+    };
+    assert_eq!((u16::from(close.code), close.reason.as_ref()), (1011, "upstream closed"));
+}
+
+#[tokio::test]
+async fn status_reports_session_store_gauges() {
+    let h = start_gateway(&[("local", &spawn_fake_rex(vec![], false).await)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    let id = h.state.sessions.record_at("local", "session:gauge", 10);
+    assert!(h.state.sessions.forget(&id).unwrap());
+    let _ = h.state.sessions.record_at("local", "session:live", 20);
+    let stream = tokio::net::TcpStream::connect(h.addr).await.unwrap();
+    let (mut reader, mut writer) = tokio::io::split(stream);
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    writer.write_all(format!("GET /status HTTP/1.1\r\nHost: x\r\nAuthorization: {SECRET}\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8(buf).unwrap();
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or(&text);
+    // HTTP may use \n; find JSON object
+    let json_start = text.find('{').expect("json");
+    let json: Value = serde_json::from_str(&text[json_start..]).unwrap();
+    assert_eq!(json["counters"]["session_refs"], 1, "{json}");
+    assert!(json["counters"]["session_forgotten"].as_u64().unwrap() >= 1, "{json}");
+    let _ = body;
+}
 
 #[tokio::test]
 async fn capability_tags_create_routing_bootstrap_and_owner_degradation() {

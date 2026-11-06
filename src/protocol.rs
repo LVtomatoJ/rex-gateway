@@ -4,6 +4,10 @@ use crate::{data::TicketMap, sessions::SessionStore};
 
 pub const SUBPROTOCOL: &str = "rex.control.v1";
 
+/// Single source of truth for agent and upstream control+data WebSocket message caps.
+/// Advertised in the welcome `limits.max_message_bytes` and matches Rex itself (1 MiB).
+pub const MAX_MESSAGE_BYTES: usize = 1_048_576;
+
 /// Stateless session namespace: `<upstream>:<real session:...>`.
 /// Already-namespaced ids (any owner) are left unchanged so a second wrap cannot
 /// produce `local:local:session:…` and break recording / routing.

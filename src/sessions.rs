@@ -98,12 +98,21 @@ impl SessionStore {
         let store=self.clone();let period=(self.ttl/4).clamp(Duration::from_millis(50),Duration::from_secs(60));
         tokio::spawn(async move{let mut tick=tokio::time::interval(period);tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);loop{tick.tick().await;store.reap();}})
     }
-    #[cfg(test)] pub fn len(&self)->usize{self.lock().disk.entries.len()}
+    /// Active remembered entries and forgotten-set size (for `/status` gauges).
+    pub fn stats(&self) -> SessionStoreStats {
+        let inner = self.lock();
+        SessionStoreStats { refs: inner.disk.entries.len(), forgotten: inner.disk.forgotten.len() }
+    }
+    #[cfg(test)] pub fn len(&self)->usize{self.stats().refs}
     /// True when any remembered reference is owned by `upstream` (sticky discovery check).
     pub fn has_upstream(&self, upstream: &str) -> bool {
         self.lock().disk.entries.values().any(|e| e.upstream == upstream)
     }
 }
+
+/// Snapshot of session-store sizes exposed on `GET /status`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SessionStoreStats { pub refs: usize, pub forgotten: usize }
 
 
 #[cfg(test)]mod tests{
@@ -112,6 +121,19 @@ impl SessionStore {
  #[test]fn round_trip_restart_and_manual_delete(){let(s,d)=store(5);let id=s.record_at("local","session:a",10);assert_eq!(s.resolve(&id).unwrap().session_id,"session:a");let loaded=SessionStore::open(d.path().join("state.json"),Duration::from_secs(60),5).unwrap();assert!(loaded.touch_at(&id,20));assert!(loaded.forget(&id).unwrap());assert_eq!(loaded.resolve(&id),Err(FORGOTTEN_ERROR.into()));let again=SessionStore::open(d.path().join("state.json"),Duration::from_secs(60),5).unwrap();assert_eq!(again.resolve(&id),Err(FORGOTTEN_ERROR.into()));}
  #[test]fn ttl_and_capacity_forget_lru(){let(s,_)=store(2);let a=s.record_at("a","session:a",1);let b=s.record_at("a","session:b",2);assert!(s.touch_at(&a,3));let c=s.record_at("a","session:c",4);assert_eq!(s.reap_at(5),1);assert_eq!(s.resolve(&b),Err(FORGOTTEN_ERROR.into()));assert!(s.contains(&a)&&s.contains(&c));assert_eq!(s.reap_at(70_000),2);assert_eq!(s.len(),0);}
  #[test]fn unknown_differs_from_forgotten(){let(s,_)=store(1);assert!(s.resolve("a:session:no").is_ok()); assert!(s.resolve("malformed").is_err());}
+ #[test]fn stats_counts_refs_and_forgotten(){
+    let(s,_)=store(2);
+    assert_eq!(s.stats(), SessionStoreStats{refs:0,forgotten:0});
+    let a=s.record_at("local","session:a",1);
+    let b=s.record_at("local","session:b",2);
+    assert_eq!(s.stats(), SessionStoreStats{refs:2,forgotten:0});
+    assert!(s.forget(&a).unwrap());
+    assert_eq!(s.stats(), SessionStoreStats{refs:1,forgotten:1});
+    assert_eq!(s.reap_at(70_000),1);
+    assert_eq!(s.stats().refs,0);
+    assert!(s.stats().forgotten >= 2, "{:?}", s.stats());
+    let _=b;
+ }
  #[test]fn reap_persists_forgotten_across_restart(){
     let d=tempfile::tempdir().unwrap();
     let path=d.path().join("state.json");

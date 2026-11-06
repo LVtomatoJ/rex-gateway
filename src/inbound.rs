@@ -16,7 +16,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio_tungstenite::{
-    connect_async,
+    connect_async_with_config,
     tungstenite::{self, client::IntoClientRequest, http::HeaderValue},
 };
 
@@ -30,12 +30,10 @@ use crate::{
     pool::UpstreamPool,
     status,
     sessions::{SessionStore, FORGOTTEN_ERROR},
-    protocol::{namespace_and_record, translate_session_id, SUBPROTOCOL},
+    protocol::{namespace_and_record, translate_session_id, MAX_MESSAGE_BYTES, SUBPROTOCOL},
 };
 
 const DATA_SUBPROTOCOL: &str = "rex.data.terminal.v1";
-/// Matches the control-plane welcome `limits.max_message_bytes` (and Rex itself).
-const MAX_MESSAGE_BYTES: usize = 1_048_576;
 
 /// What the agent control response frame carries after a successful `handle`.
 /// Gateway-originated failures stay `Err(String)` → `payload: {"error":…}` for
@@ -122,6 +120,7 @@ async fn status_handler(headers: HeaderMap, State(state): State<AppState>) -> Re
     let body = status::build(
         &upstreams,
         state.tickets.pending(),
+        state.sessions.stats(),
         state.metrics.snapshot(),
         state.discovery.snapshot(now),
         now,
@@ -170,7 +169,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":19});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":20});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -501,7 +500,7 @@ async fn data_upgrade(
     State(state): State<AppState>,
 ) -> Result<Response, StatusCode> {
     let (_, owner) = authenticate(&headers, &state, DATA_SUBPROTOCOL)?;
-    Ok(ws.protocols([DATA_SUBPROTOCOL]).on_upgrade(move |socket| proxy_data(socket, state, owner)))
+    Ok(ws.protocols([DATA_SUBPROTOCOL]).max_message_size(MAX_MESSAGE_BYTES).on_upgrade(move |socket| proxy_data(socket, state, owner)))
 }
 
 async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
@@ -556,7 +555,10 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
         Err(error) => { tracing::warn!(%error, "invalid upstream data URL"); return; }
     };
     request.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(DATA_SUBPROTOCOL));
-    let mut upstream_socket = match tokio::time::timeout(state.options.data_connect_timeout, connect_async(request)).await {
+    let mut upstream_socket = match tokio::time::timeout(
+        state.options.data_connect_timeout,
+        connect_async_with_config(request, Some(crate::control_client::websocket_config()), false),
+    ).await {
         Ok(Ok((socket, _))) => socket,
         Err(_) => {
             tracing::warn!(upstream = %ticket.upstream, "upstream data connection timed out");
@@ -589,14 +591,30 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
                 Some(Ok(Message::Binary(bytes))) => {
                     last_activity=std::time::Instant::now();
                     if let Some(id)=ticket.session_id.as_deref(){state.sessions.touch(id);}
-                    if upstream_sink.send(tungstenite::Message::Binary(bytes)).await.is_err() { break; }
+                    if upstream_sink.send(tungstenite::Message::Binary(bytes)).await.is_err() {
+                        close_agent_upstream_closed(&mut agent_sink).await;
+                        break;
+                    }
                 }
                 Some(Ok(Message::Text(text))) => {
                     last_activity=std::time::Instant::now();
-                    if upstream_sink.send(tungstenite::Message::Text(text.as_str().into())).await.is_err() { break; }
+                    if upstream_sink.send(tungstenite::Message::Text(text.as_str().into())).await.is_err() {
+                        close_agent_upstream_closed(&mut agent_sink).await;
+                        break;
+                    }
                 }
-                Some(Ok(Message::Ping(bytes))) => if upstream_sink.send(tungstenite::Message::Ping(bytes)).await.is_err() { break; },
-                Some(Ok(Message::Pong(bytes))) => if upstream_sink.send(tungstenite::Message::Pong(bytes)).await.is_err() { break; },
+                Some(Ok(Message::Ping(bytes))) => {
+                    if upstream_sink.send(tungstenite::Message::Ping(bytes)).await.is_err() {
+                        close_agent_upstream_closed(&mut agent_sink).await;
+                        break;
+                    }
+                }
+                Some(Ok(Message::Pong(bytes))) => {
+                    if upstream_sink.send(tungstenite::Message::Pong(bytes)).await.is_err() {
+                        close_agent_upstream_closed(&mut agent_sink).await;
+                        break;
+                    }
+                }
                 Some(Ok(Message::Close(frame))) => {
                     let _ = upstream_sink.send(tungstenite::Message::Close(frame.map(to_upstream_close))).await;
                     break;
@@ -656,7 +674,7 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
                     break;
                 }
                 if upstream_sink.send(tungstenite::Message::Ping(Vec::new())).await.is_err() {
-                    let _ = agent_sink.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed("upstream closed") }))).await;
+                    close_agent_upstream_closed(&mut agent_sink).await;
                     break;
                 }
             }
@@ -669,6 +687,16 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
             }
         }
     }
+}
+
+/// Notify the agent that forwarding to the upstream failed mid-bridge (no clean upstream Close).
+async fn close_agent_upstream_closed(agent_sink: &mut (impl SinkExt<Message> + Unpin)) {
+    let _ = agent_sink
+        .send(Message::Close(Some(CloseFrame {
+            code: 1011,
+            reason: Cow::Borrowed("upstream closed"),
+        })))
+        .await;
 }
 
 /// Notify the upstream data socket that the agent disappeared without a Close frame.
@@ -749,6 +777,8 @@ mod tests {
         assert_eq!(json["upstreams"][0]["state"], "Online");
         assert_eq!(json["upstreams"][1]["last_error"], "refused");
         assert_eq!(json["counters"]["pending_tickets"], 1);
+        assert_eq!(json["counters"]["session_refs"], 0);
+        assert_eq!(json["counters"]["session_forgotten"], 0);
         assert_eq!(json["counters"]["tickets_issued"], 1);
         assert_eq!(json["counters"]["active_control_connections"], 1);
         assert_eq!(json["counters"]["create_transport_failovers"], 0);

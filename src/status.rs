@@ -1,6 +1,6 @@
 use std::time::Instant;
 use serde_json::{json, Value};
-use crate::{discovery::DiscoverySnapshot, metrics::MetricsSnapshot, pool::Upstream};
+use crate::{discovery::DiscoverySnapshot, metrics::MetricsSnapshot, pool::Upstream, sessions::SessionStoreStats};
 
 /// Strips credentials from an upstream URL before it is displayed: userinfo (`user:pass@`),
 /// query string and fragment are removed; scheme, host, port and path are kept.
@@ -17,7 +17,14 @@ pub fn redact_url(url: &str) -> String {
 
 /// Builds the `/status` JSON. `upstreams` must already be filtered by the caller's ACL
 /// (see `UpstreamPool::list_allowed`). Counters and discovery health are gateway-wide.
-pub fn build(upstreams: &[Upstream], pending_tickets: usize, counters: MetricsSnapshot, discovery: DiscoverySnapshot, now: Instant) -> Value {
+pub fn build(
+    upstreams: &[Upstream],
+    pending_tickets: usize,
+    sessions: SessionStoreStats,
+    counters: MetricsSnapshot,
+    discovery: DiscoverySnapshot,
+    now: Instant,
+) -> Value {
     json!({
         "upstreams": upstreams.iter().map(|u| json!({
             "id": u.id,
@@ -37,6 +44,8 @@ pub fn build(upstreams: &[Upstream], pending_tickets: usize, counters: MetricsSn
         })).collect::<Vec<_>>(),
         "counters": {
             "pending_tickets": pending_tickets,
+            "session_refs": sessions.refs,
+            "session_forgotten": sessions.forgotten,
             "active_control_connections": counters.active_control,
             "active_data_streams": counters.active_data,
             "tickets_issued": counters.tickets_issued,
@@ -90,7 +99,7 @@ mod tests {
         let url = "https://bob:hunter2@h.example:9/rex?key=SECRETKEY";
         pool.upsert("x", url, Source::Manual).await;
         pool.mark_failure("x", format!("connect to {url} failed")).await;
-        let body = build(&pool.list_allowed(&["*".into()]).await, 0, MetricsSnapshot::default(), disc(), Instant::now()).to_string();
+        let body = build(&pool.list_allowed(&["*".into()]).await, 0, SessionStoreStats::default(), MetricsSnapshot::default(), disc(), Instant::now()).to_string();
         for leaked in ["bob", "hunter2", "SECRETKEY", "key="] { assert!(!body.contains(leaked), "{leaked} leaked in {body}"); }
         assert!(body.contains("https://h.example:9/rex"));
     }
@@ -110,7 +119,7 @@ mod tests {
             create_failover_exhausted: 1, hostless_failover_exhausted: 0,
         };
 
-        let all = build(&pool.list_allowed(&["*".into()]).await, 4, counters, disc(), Instant::now());
+        let all = build(&pool.list_allowed(&["*".into()]).await, 4, SessionStoreStats { refs: 3, forgotten: 2 }, counters, disc(), Instant::now());
         let ups = all["upstreams"].as_array().unwrap();
         assert_eq!(ups.iter().map(|u| u["id"].as_str().unwrap()).collect::<Vec<_>>(), ["a", "b", "c"]);
         assert_eq!(ups[0]["state"], "Online");
@@ -129,7 +138,8 @@ mod tests {
         assert_eq!(ups[2]["source"], "Lan");
         assert!(ups[2]["last_probe_age_ms"].is_null());
         assert_eq!(all["counters"], json!({
-            "pending_tickets": 4, "active_control_connections": 2, "active_data_streams": 1,
+            "pending_tickets": 4, "session_refs": 3, "session_forgotten": 2,
+            "active_control_connections": 2, "active_data_streams": 1,
             "tickets_issued": 5, "tickets_consumed": 3, "tickets_expired": 1, "tickets_evicted": 1,
             "create_transport_failovers": 2, "hostless_transport_failovers": 3,
             "create_failover_exhausted": 1, "hostless_failover_exhausted": 0,
@@ -139,10 +149,10 @@ mod tests {
             "last_error_age_ms": null, "last_applied": false, "refresh_count": 0, "error_count": 0,
         }));
 
-        let some = build(&pool.list_allowed(&["b".into(), "nonexistent".into()]).await, 0, counters, disc(), Instant::now());
+        let some = build(&pool.list_allowed(&["b".into(), "nonexistent".into()]).await, 0, SessionStoreStats::default(), counters, disc(), Instant::now());
         assert_eq!(some["upstreams"].as_array().unwrap().len(), 1);
         assert_eq!(some["upstreams"][0]["id"], "b");
-        let none = build(&pool.list_allowed(&[]).await, 0, counters, disc(), Instant::now());
+        let none = build(&pool.list_allowed(&[]).await, 0, SessionStoreStats::default(), counters, disc(), Instant::now());
         assert!(none["upstreams"].as_array().unwrap().is_empty());
     }
 
@@ -152,7 +162,7 @@ mod tests {
         health.record_ok(true);
         health.record_err("bad json".into());
         let snap = health.snapshot(Instant::now());
-        let body = build(&[], 0, MetricsSnapshot::default(), snap, Instant::now());
+        let body = build(&[], 0, SessionStoreStats::default(), MetricsSnapshot::default(), snap, Instant::now());
         assert_eq!(body["discovery"]["enabled"], true);
         assert_eq!(body["discovery"]["mode"], "file");
         assert_eq!(body["discovery"]["last_error"], "bad json");

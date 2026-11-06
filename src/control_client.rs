@@ -4,8 +4,21 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot};
-use tokio_tungstenite::{connect_async, tungstenite::{client::IntoClientRequest, http::HeaderValue, Message}, MaybeTlsStream, WebSocketStream};
-use crate::protocol::SUBPROTOCOL;
+use tokio_tungstenite::{
+    connect_async_with_config,
+    tungstenite::{client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig, Message},
+    MaybeTlsStream, WebSocketStream,
+};
+use crate::protocol::{MAX_MESSAGE_BYTES, SUBPROTOCOL};
+
+/// Shared client-side WebSocket limits for upstream control and data connects.
+pub fn websocket_config() -> WebSocketConfig {
+    WebSocketConfig {
+        max_message_size: Some(MAX_MESSAGE_BYTES),
+        max_frame_size: Some(MAX_MESSAGE_BYTES),
+        ..Default::default()
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Options {
@@ -166,7 +179,7 @@ async fn open_socket(url:&str)->Result<Socket> {
     let url=url.strip_prefix("http://").map(|rest|format!("ws://{rest}")).or_else(||url.strip_prefix("https://").map(|rest|format!("wss://{rest}"))).unwrap_or(url);
     let mut request=url.as_str().into_client_request()?;
     request.headers_mut().insert("sec-websocket-protocol",HeaderValue::from_static(SUBPROTOCOL));
-    let (mut socket,response)=connect_async(request).await.context("upstream WebSocket connect")?;
+    let (mut socket,response)=connect_async_with_config(request, Some(websocket_config()), false).await.context("upstream WebSocket connect")?;
     if response.headers().get("sec-websocket-protocol").and_then(|v|v.to_str().ok())!=Some(SUBPROTOCOL) { bail!("upstream did not select {SUBPROTOCOL}"); }
     socket.send(Message::Text(json!({"type":"hello"}).to_string())).await?;
     while let Some(frame)=socket.next().await {
@@ -244,6 +257,14 @@ mod tests {
         assert!(reply.payload.is_null(), "{reply:?}");
         assert_eq!(reply.error, Some(json!({"code":"method_not_found","message":"nope","status":404})));
         assert!(reply.is_application_error());
+    }
+
+    #[test]
+    fn websocket_config_caps_message_and_frame_at_1_mib() {
+        let cfg = websocket_config();
+        assert_eq!(cfg.max_message_size, Some(MAX_MESSAGE_BYTES));
+        assert_eq!(cfg.max_frame_size, Some(MAX_MESSAGE_BYTES));
+        assert_eq!(MAX_MESSAGE_BYTES, 1_048_576);
     }
 
     #[test]

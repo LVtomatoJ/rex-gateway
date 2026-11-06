@@ -29,7 +29,7 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
-  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 19).
+  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 20).
 * `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
   namespaced IDs (recursively wrapping nested `session_id` / `ticket` fields the same way as
   other responses) in sorted upstream-ID order. Upstreams that are not routable (`Online` or
@@ -152,10 +152,11 @@ snapshots, terminal output, and agent input are relayed frame-for-frame between 
 sockets. Ping/pong and close frames, including close codes and reasons, are forwarded.
 If the upstream data socket ends mid-bridge without a Close frame, the agent is closed with
 `1011 "upstream closed"` (or `"upstream offline"` when the pool already marks that upstream
-Offline). If the agent drops mid-bridge without a Close frame, or if forwarding upstream→agent
-fails because the agent socket is already gone, the upstream is closed with
-`1001 "peer closed"` so Rex can release the terminal attach promptly (rather than waiting
-for idle timeout). The gateway also originates keepalive pings on both legs and idle-closes both sides with
+Offline). The same `1011 "upstream closed"` is sent when forwarding agent→upstream fails
+(Binary/Text/Ping/Pong), so the agent always sees a clean close. If the agent drops mid-bridge
+without a Close frame, or if forwarding upstream→agent fails because the agent socket is
+already gone, the upstream is closed with `1001 "peer closed"` so Rex can release the terminal
+attach promptly (rather than waiting for idle timeout). The gateway also originates keepalive pings on both legs and idle-closes both sides with
 `1001 "idle timeout"` when no application (binary/text) traffic arrives for
 `ws_idle_timeout_ms`. Concurrent bridges are bounded by `max_data_streams` /
 `max_data_streams_per_token` (defaults 128 / 32; close `1013` on overflow, ticket preserved),
@@ -229,7 +230,8 @@ least-recently-active capacity cleanup, manual deletion, and the data-plane clos
      "effective_session_count":2,"tags":["perf"],"description":"heavy compile host"}
   ],
   "counters": {
-    "pending_tickets":0,"active_control_connections":1,"active_data_streams":0,
+    "pending_tickets":0,"session_refs":2,"session_forgotten":1,
+    "active_control_connections":1,"active_data_streams":0,
     "tickets_issued":5,"tickets_consumed":4,"tickets_expired":1,"tickets_evicted":0,
     "create_transport_failovers":0,"hostless_transport_failovers":0,
     "create_failover_exhausted":0,"hostless_failover_exhausted":0
@@ -247,6 +249,8 @@ stripped (and also removed from `last_error` text). `upstreams` lists only upstr
 (null if the last probe failed or none ran); `last_error` is the most recent probe error and is
 cleared by the next successful probe. `counters` are gateway-wide (not ACL-filtered), totals since
 start; `tickets_expired` counts TTL expiries, `tickets_evicted` capacity evictions.
+`session_refs` / `session_forgotten` are the durable session-store sizes (active remembered
+entries and the forgotten set).
 Hostless transport-failover activity is also counted: `create_transport_failovers` /
 `hostless_transport_failovers` increment once per tried upstream that failed with a
 transport error (each hop / retry trigger); `create_failover_exhausted` /
@@ -274,9 +278,10 @@ agent and upstream sides. Incoming application frames and pong frames keep a con
 close 1001 / `idle timeout`; data idle closes both bridge endpoints. The idle timeout must be
 greater than the ping interval and both must be nonzero. An agent control initial HELLO/welcome
 is completed before the keepalive loop; data HELLO/setup timeouts remain separate as above.
-Control upgrades set WebSocket `max_message_size` to the advertised `limits.max_message_bytes`
-(1 MiB), matching Rex; the data plane keeps the library default so large terminal snapshots
-are not truncated.
+Agent control and data upgrades, and upstream control+data client connects, all enforce the
+same WebSocket `max_message_size` / `max_frame_size` cap as the advertised
+`limits.max_message_bytes` (1 MiB), matching Rex. The constant lives in one place
+(`MAX_MESSAGE_BYTES`) so inbound and upstream sockets cannot drift.
 ## Upstream discovery
 
 Optional `[discovery]` fills the upstream pool from a `rex-discover --json` snapshot —
