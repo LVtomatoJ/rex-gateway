@@ -25,6 +25,7 @@ use crate::{
     pool::{UpstreamState, TagPreferences},
     control_client::{ClientMap, UpstreamEvent},
     data::{decode_hello, TicketMap},
+    discovery::DiscoveryHealth,
     metrics::{DataLimiter, Gauge, Metrics},
     pool::UpstreamPool,
     status,
@@ -45,6 +46,7 @@ struct AppState {
     data_limiter: DataLimiter,
     options: Options,
     events: broadcast::Sender<UpstreamEvent>,
+    discovery: DiscoveryHealth,
 }
 
 /// Tunables of the inbound server.
@@ -69,8 +71,9 @@ pub async fn serve(
     metrics: Arc<Metrics>,
     options: Options,
     events: broadcast::Sender<UpstreamEvent>,
+    discovery: DiscoveryHealth,
 ) -> Result<()> {
-    let state = AppState { pool, clients, auth, tickets, sessions, metrics, data_limiter: DataLimiter::new(), options, events };
+    let state = AppState { pool, clients, auth, tickets, sessions, metrics, data_limiter: DataLimiter::new(), options, events, discovery };
     let router = router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "gateway listening");
@@ -92,8 +95,15 @@ async fn status_handler(headers: HeaderMap, State(state): State<AppState>) -> Re
     let Some(acl) = state.auth.acl(bearer) else {
         return (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Bearer")]).into_response();
     };
+    let now = std::time::Instant::now();
     let upstreams = state.pool.list_allowed(&acl).await;
-    let body = status::build(&upstreams, state.tickets.pending(), state.metrics.snapshot(), std::time::Instant::now());
+    let body = status::build(
+        &upstreams,
+        state.tickets.pending(),
+        state.metrics.snapshot(),
+        state.discovery.snapshot(now),
+        now,
+    );
     Json(body).into_response()
 }
 
@@ -130,7 +140,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":12});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":13});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -207,7 +217,6 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
             avoid_hosts: string_list(&payload, "avoid_hosts").unwrap_or(defaults.avoid_hosts),
         }
     } else { TagPreferences::default() };
-    let mut reservation = None;
     let owner_upstream = match payload.get("session_id").and_then(Value::as_str).and_then(crate::protocol::unwrap_session_id) {
         Some((upstream, _)) => upstream.to_owned(),
         None => match payload.get("host").and_then(Value::as_str).map(str::to_owned) {
@@ -223,8 +232,7 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
                     let upstream = state.pool.pick_default(acl).await.ok_or_else(|| "no routable upstream".to_owned())?;
                     upstream.id
                 } else {
-                    let (upstream, reserved) = state.pool.reserve_for_create(acl, &prefs, state.options.create_reservation_ttl).await?;
-                    reservation = Some(reserved); upstream.id
+                    return create_with_failover(state, acl, owner, prefs, payload).await;
                 }
             }
         },
@@ -248,8 +256,8 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
     let mut response = state.clients.get(&owner_upstream).ok_or("upstream client missing")?
         .call(method, payload).await.map_err(|e| e.to_string())?;
     if method == "session.create" {
+        // Hard-pin create (no reservation). Hostless create returns earlier via create_with_failover.
         if response.get("error").is_some() { return Ok(response); }
-        if let Some(reserved) = reservation.take() { reserved.finish(); }
     }
     if method == "session.bootstrap" {
         response["upstream"] = json!({"id":upstream.id,"tags":upstream.tags,"description":upstream.description,"state":upstream.state.as_str(),"latency_ms":upstream.latency_ms,"session_count":upstream.session_count});
@@ -267,6 +275,71 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
 /// call timeout). Upstreams that are not Online or that fail are skipped and reported through the
 /// additive `partial` / `failed_upstreams` / `upstream_errors` fields; if every allowed upstream
 /// fails, the request fails.
+
+/// Hostless `session.create`: try candidates in score order. Transport failures (timeout,
+/// connect, missing client, socket closed, "retry in …") drop the reservation, optionally
+/// mark the upstream failed, and retry the next candidate under the same TagPreferences
+/// while excluding already-tried host ids for this request only. Application-level
+/// `{"error":…}` responses and hard `host` pins do not failover (pin stays single-shot
+/// in [`handle`]).
+async fn create_with_failover(
+    state: &AppState,
+    acl: &[String],
+    owner: &str,
+    prefs: TagPreferences,
+    mut payload: Value,
+) -> Result<Value, String> {
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("host");
+        object.remove("prefer_tags");
+        object.remove("avoid_tags");
+        object.remove("prefer_hosts");
+        object.remove("avoid_hosts");
+    }
+    let mut tried: Vec<(String, String)> = Vec::new();
+    loop {
+        let exclude: Vec<String> = tried.iter().map(|(id, _)| id.clone()).collect();
+        let (upstream, reserved) = match state
+            .pool
+            .reserve_for_create_excluding(acl, &prefs, state.options.create_reservation_ttl, &exclude)
+            .await
+        {
+            Ok(pair) => pair,
+            Err(e) if tried.is_empty() => return Err(e),
+            Err(_) => {
+                let detail = tried
+                    .iter()
+                    .map(|(id, err)| format!("{id}: {err}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(format!("session.create failed on all candidates: {detail}"));
+            }
+        };
+        let id = upstream.id.clone();
+        let call = match state.clients.get(&id) {
+            Some(client) => client.call("session.create", payload.clone()).await.map_err(|e| e.to_string()),
+            None => Err("upstream client missing".into()),
+        };
+        match call {
+            Ok(mut response) => {
+                if response.get("error").is_some() {
+                    // Application error: do not failover; drop reservation via Drop.
+                    drop(reserved);
+                    return Ok(response);
+                }
+                reserved.finish();
+                namespace_and_record(&mut response, &id, &state.tickets, owner, &state.sessions);
+                return Ok(response);
+            }
+            Err(err) => {
+                drop(reserved);
+                let _ = state.pool.mark_failure(&id, err.clone()).await;
+                tried.push((id, err));
+            }
+        }
+    }
+}
+
 async fn dispatch_sole_client(state: &AppState, acl: &[String], ids: &[&str], method: &str, payload: Value, owner: &str) -> Result<Value, String> {
     if let [id] = ids {
         if !auth::Authenticator::permits(acl, id) { return Err(format!("upstream {id} is not allowed")); }
@@ -506,7 +579,7 @@ mod tests {
             ("onlyb".to_owned(), vec!["b".to_owned()]),
         ])));
         let tickets = TicketMap::new(Duration::from_secs(30), 16, metrics.clone());
-        let state = AppState { pool, clients: ClientMap::new(), auth, tickets, sessions: SessionStore::open(tempfile::tempdir().unwrap().path().join("sessions.json"),Duration::from_secs(86400),16384).unwrap(), metrics, data_limiter: DataLimiter::new(), options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120), max_data_streams: 128, max_data_streams_per_token: 32, create_reservation_ttl: Duration::from_secs(5) }, events: broadcast::channel(8).0 };
+        let state = AppState { pool, clients: ClientMap::new(), auth, tickets, sessions: SessionStore::open(tempfile::tempdir().unwrap().path().join("sessions.json"),Duration::from_secs(86400),16384).unwrap(), metrics, data_limiter: DataLimiter::new(), options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120), max_data_streams: 128, max_data_streams_per_token: 32, create_reservation_ttl: Duration::from_secs(5) }, events: broadcast::channel(8).0, discovery: DiscoveryHealth::disabled() };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router(state.clone());
@@ -542,6 +615,9 @@ mod tests {
         assert_eq!(json["counters"]["pending_tickets"], 1);
         assert_eq!(json["counters"]["tickets_issued"], 1);
         assert_eq!(json["counters"]["active_control_connections"], 1);
+        assert_eq!(json["discovery"]["enabled"], false);
+        assert_eq!(json["discovery"]["mode"], "none");
+        assert_eq!(json["discovery"]["refresh_count"], 0);
 
         let (code, body) = get_status(addr, Some("Bearer onlyb")).await;
         assert_eq!(code, 200);

@@ -133,6 +133,26 @@ impl UpstreamPool {
         let reservation = Reservation { pool: self.clone(), id: selected.id.clone(), expires, active: true };
         Ok((selected, reservation))
     }
+    /// Like [`reserve_for_create`], but also soft-avoids `exclude` host ids for this attempt only
+    /// (unioned with `prefs.avoid_hosts`; does not mutate the caller's preferences).
+    pub async fn reserve_for_create_excluding(
+        &self,
+        acl: &[String],
+        prefs: &TagPreferences,
+        ttl: Duration,
+        exclude: &[String],
+    ) -> Result<(Upstream, Reservation), String> {
+        if exclude.is_empty() {
+            return self.reserve_for_create(acl, prefs, ttl).await;
+        }
+        let mut prefs = prefs.clone();
+        for id in exclude {
+            if !prefs.avoid_hosts.iter().any(|h| h == id) {
+                prefs.avoid_hosts.push(id.clone());
+            }
+        }
+        self.reserve_for_create(acl, &prefs, ttl).await
+    }
     fn release_expired_sync(&self, id: &str, expires: Instant) {
         let mut guard = self.inner.lock().expect("pool mutex");
         if let Some(u) = guard.get_mut(id) {
@@ -386,4 +406,23 @@ mod tests {
         p.mark("local",UpstreamState::Offline,None,0).await;
         assert_eq!(p.pick_default(&["*".into()]).await.unwrap().id, "z-disc");
     }
+
+    #[tokio::test]
+    async fn reserve_excluding_skips_tried_hosts() {
+        let p = UpstreamPool::new();
+        p.upsert("alpha", "http://a", Source::Manual).await;
+        p.upsert("beta", "http://b", Source::Manual).await;
+        p.mark("alpha", UpstreamState::Online, Some(1), 0).await;
+        p.mark("beta", UpstreamState::Online, Some(1), 0).await;
+        let (u, r) = p.reserve_for_create_excluding(
+            &["*".into()], &TagPreferences::default(), Duration::from_secs(1), &["alpha".into()],
+        ).await.unwrap();
+        assert_eq!(u.id, "beta");
+        r.finish();
+        let e = p.reserve_for_create_excluding(
+            &["*".into()], &TagPreferences::default(), Duration::from_secs(1), &["alpha".into(), "beta".into()],
+        ).await.unwrap_err();
+        assert!(e.contains("avoid_hosts") || e.contains("no upstream"), "{e}");
+    }
+
 }
