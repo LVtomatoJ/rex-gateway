@@ -586,6 +586,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64",
  "futures-util",
  "http",
  "serde",

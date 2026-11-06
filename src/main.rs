@@ -1,6 +1,7 @@
 mod auth;
 mod config;
 mod control_client;
+mod data;
 mod inbound;
 mod pool;
 mod probe;
@@ -26,5 +27,6 @@ async fn main() -> Result<()> {
         clients.insert(item.id.clone(), Arc::new(client));
     }
     probe::spawn(pool.clone(), Arc::new(clients.clone()), Duration::from_millis(config.probe_interval_ms));
-    inbound::serve(config.listen, pool, clients, auth).await
+    let tickets = data::TicketMap::new();
+    inbound::serve(config.listen, pool, clients, auth, tickets).await
 }

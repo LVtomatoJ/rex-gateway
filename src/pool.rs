@@ -23,6 +23,7 @@ impl UpstreamPool {
             latency_ms: None, session_count: 0, last_probe: None,
         });
     }
+    pub async fn get(&self, id: &str) -> Option<Upstream> { self.inner.read().await.get(id).cloned() }
     pub async fn list_allowed_online(&self, acl: &[String]) -> Vec<Upstream> {
         let mut result: Vec<_> = self.inner.read().await.values().filter(|u| u.state == UpstreamState::Online && Authenticator::permits(acl, &u.id)).cloned().collect();
         result.sort_by(|a,b| a.id.cmp(&b.id)); result

@@ -34,7 +34,7 @@ upstream id `local`). Tokens and the token map are intentionally TOML-only for n
   Degraded; two consecutive failed probes = Offline. First failure is Degraded, initial
   state Unknown. Socket reconnection and a fresh hello happen on the next call.
 * Routed calls are restricted to Online upstreams (the default router also ignores
-  Degraded). No upstream discovery, persistence, data-plane proxy, or event forwarding yet.
+  Degraded). No upstream discovery, persistence, or event forwarding yet.
 
 ## Verify
 
@@ -48,9 +48,41 @@ python3 smoke.py > smoke.out
 The smoke test checks absent/wrong tokens, hello/welcome, aggregated namespaced list,
 default `server.version`, and translating/routing `session.rename`.
 
-## Data-plane TODO
+## Data plane
 
-Do not treat `/api/data`, terminal block streams, binary hello/tickets, ticket refresh,
-or terminal controls as implemented. A later phase should add those plus multiplexed
-inbound event routing and a richer recursive response-namespacing strategy for
-`session.bootstrap`/`session.attach_all` data ticket fields.
+`GET /api/data` uses subprotocol `rex.data.terminal.v1` and the same `Authorization:
+Bearer ...` token as `/api/control`. Authentication happens before WebSocket upgrade.
+A data ticket is additionally bound to that bearer string, so one configured token cannot
+consume another token's ticket. The control connection itself need not remain open after
+`data.connect`; keep it open if upstream attachment semantics require it.
+
+The gateway rewrites only the ticket returned by `data.connect`. It records the real
+upstream ticket privately and returns a new random 16-byte base64url ticket to the agent.
+When the agent sends binary `0x01 || ticket`, the gateway consumes that ticket once,
+connects to the owning upstream, and sends the real binary HELLO. ACCEPT/REJECT, terminal
+snapshots, terminal output, and agent input are relayed frame-for-frame between the data
+sockets. Ping/pong and close frames, including close codes and reasons, are forwarded.
+This is not a terminal protocol parser and does not rewrite bytes inside stream frames.
+
+Tickets are kept in memory. They expire only when consumed or the gateway restarts;
+Unused-ticket expiry/capacity limits are a hardening TODO. Unknown and already-used
+tickets receive REJECT `0x82 0x01`; malformed HELLO receives `0x82 0x05`.
+
+## Remaining TODOs
+
+- Reaper with bounded unused-ticket TTL/capacity.
+- Multiplexed inbound event forwarding on control connections.
+- Richer recursive response namespacing for ticket-bearing `session.bootstrap` payloads.
+- Preserve fragmented-message boundaries if a future Rex version relies on them (Rex
+  currently sends complete binary messages; relay preserves each message's bytes/type).
+
+## Data-plane verification
+
+With the supplied local configuration and a running Rex server:
+
+```sh
+python3 smoke_data.py > smoke_data.out
+```
+
+This obtains a ticket through the gateway, asserts data ACCEPT, sends terminal output via
+the real Rex CLI, and checks that `HELLO_FROM_GATEWAY` appears on the gateway data socket.

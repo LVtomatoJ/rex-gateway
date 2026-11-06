@@ -1,0 +1,12 @@
+/api/control upgrade: HTTP/1.1 101 Switching Protocols
+welcome: {"api_server_revision":11,"client":{"id":"client:29e21d50-c71e-4a8d-a571-0aa3c0060896","reconnect_token":"2b719b72-a057-4a58-84ce-56c7c702edad"},"limits":{"max_message_bytes":1048576},"protocol":"rex.control.v1","type":"welcome"}
+session.attach -> {"id": "attach", "payload": {"client_id": "client:01a1b0fb-2373-7e96-abc7-460e25cc5bfc", "view": {"active_window_id": "window:01a1b0eb-20bb-7539-9449-04bf2c70d3c6", "label": "bold-strait", "revision": 1, "session_id": "local:session:01a1b0eb-20ad-73fb-9c27-0bdf0ed5bfee", "windows": [{"focused_block_id": "block:01a1b0eb-20ae-72e5-9999-1fe4212d9650", "label": "Window 2c70d3c6", "layers": [{"blocks": [{"block_id": "block:01a1b0eb-20ae-72e5-9999-1fe4212d9650", "creator_name": "com.superlogical.terminal", "flavor": "com.superlogical.terminal.shell", "host_id": "1eef2a76-2f3e-442c-957e-1c4e21661e97", "label": "shell", "owner": "client:01a1b0eb-20ab-79f3-ba45-5464b18557b4"}], "bounds": [0, 0, 1, 1], "kind": "tiled", "layer_id": "layer:01a1b0eb-20bb-7540-956a-bb39682d78a3", "layout": {"block_id": "block:01a1b0eb-20ae-72e5-9999-1fe4212d9650", "rect": [0, 0, 1, 1]}}], "window_id": "window:01a1b0eb-20bb-7539-9449-04bf2c70d3c6"}]}}, "seq": 1, "type": "response"}
+data.connect -> {"id": "connect", "payload": {"expires_in_ms": 60000, "ticket": "eg4oIvBRQVa8eOSb35XdUQ"}, "seq": 2, "type": "response"}
+gateway issued a 16-byte single-use ticket
+/api/data upgrade: HTTP/1.1 101 Switching Protocols
+PASS: upstream ACCEPT passed through gateway: 813b97e3a216270a435611dcb28a1071e700000060ea0000bc921d44e5c1a55c
+PASS: full-screen snapshot preserved: 2044 bytes
+terminal binary frame: 168 bytes; marker: True
+PASS: HELLO_FROM_GATEWAY terminal output streamed through /api/data
+/api/data upgrade: HTTP/1.1 101 Switching Protocols
+PASS: reused ticket rejected 0x82 0x01 and close 1008 propagated
