@@ -1,6 +1,10 @@
-//! Fill the upstream pool from a `rex-discover --json` file (and optional restart snapshot).
+//! Fill the upstream pool from a `rex-discover --json` file and/or a live discover command
+//! (optional restart snapshot via `store_path`).
 //!
-//! Reconciliation rule: discovered (non-Manual) upstreams that disappear from the file are
+//! When both `command` and `file` are set, **command wins** for each live refresh tick; `file`
+//! is only used when `command` is unset.
+//!
+//! Reconciliation rule: discovered (non-Manual) upstreams that disappear from the snapshot are
 //! **removed when idle** (no remembered session references). If sessions still point at them
 //! they stay in the pool (sticky) so attach/list/RPC keep working, but `accept_creates` is
 //! cleared so new `session.create` will not pick them. Manual upstreams are never overwritten
@@ -10,13 +14,14 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    process::Stdio,
     sync::Arc,
     time::Duration,
 };
 
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::sync::broadcast;
+use tokio::{process::Command, sync::broadcast};
 
 use crate::{
     control_client::{ClientMap, ControlClient, Options, UpstreamEvent},
@@ -185,9 +190,80 @@ pub async fn load_store_if_present(
     }
 }
 
-/// Background loop: re-read `file` every `interval`, apply, optionally persist `store_path`.
+/// Minimum wall-clock budget for one discover command run (LAN scans can be slow).
+pub const COMMAND_TIMEOUT_FLOOR: Duration = Duration::from_secs(60);
+
+/// Spawn `argv` (program + args), capture stdout, parse as `rex-discover --json`.
+///
+/// Waits up to `timeout` (caller should pass at least [`COMMAND_TIMEOUT_FLOOR`]). Nonzero exit
+/// returns Err with exit code and a truncated stderr snippet; bad JSON likewise.
+pub async fn run_command(argv: &[String], timeout: Duration) -> Result<Vec<ParsedUpstream>, String> {
+    if argv.is_empty() || argv[0].trim().is_empty() {
+        return Err("discovery command argv is empty".into());
+    }
+    let child = Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("spawn {}: {e}", argv[0]))?;
+    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
+        Ok(Ok(o)) => o,
+        Ok(Err(e)) => return Err(format!("wait {}: {e}", argv[0])),
+        Err(_) => {
+            // kill_on_drop will reap the child when this Future is dropped
+            return Err(format!("discovery command timed out after {}s", timeout.as_secs()));
+        }
+    };
+    if !output.status.success() {
+        let code = output.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into());
+        let err = String::from_utf8_lossy(&output.stderr);
+        let snippet: String = err.chars().take(512).collect();
+        return Err(format!("discovery command exit {code}: {snippet}"));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    parse_discover_json(&stdout)
+}
+
+/// One refresh tick: command (if set) else file. On success applies + optionally persists.
+/// Returns Ok(true) when a snapshot was applied, Ok(false) when the file is still missing,
+/// or Err with a warning-worthy message (nonzero exit / bad JSON / unreadable file).
+pub async fn refresh_once(
+    command: Option<&[String]>,
+    file: Option<&Path>,
+    command_timeout: Duration,
+    store_path: Option<&Path>,
+    pool: &UpstreamPool,
+    clients: &ClientMap,
+    sessions: &SessionStore,
+    client_options: Options,
+    events: broadcast::Sender<UpstreamEvent>,
+) -> Result<bool, String> {
+    let entries = if let Some(argv) = command.filter(|c| !c.is_empty()) {
+        run_command(argv, command_timeout).await?
+    } else if let Some(path) = file {
+        match read_path(path) {
+            Ok(e) => e,
+            Err(_) if !path.exists() => return Ok(false),
+            Err(e) => return Err(e),
+        }
+    } else {
+        return Ok(false);
+    };
+    apply(pool, clients, Some(sessions), &entries, client_options, events).await;
+    if let Some(store) = store_path {
+        if let Err(e) = write_store_atomic(store, &entries) {
+            tracing::warn!(%e, "could not persist discovery store");
+        }
+    }
+    Ok(true)
+}
+
+/// Background loop: every `interval`, refresh from `command` (preferred) or `file`.
 pub fn spawn(
-    file: PathBuf,
+    command: Option<Vec<String>>,
+    file: Option<PathBuf>,
     interval: Duration,
     store_path: Option<PathBuf>,
     pool: UpstreamPool,
@@ -196,22 +272,25 @@ pub fn spawn(
     client_options: Options,
     events: broadcast::Sender<UpstreamEvent>,
 ) {
+    let command_timeout = interval.max(COMMAND_TIMEOUT_FLOOR);
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            match read_path(&file) {
-                Ok(entries) => {
-                    apply(&pool, &clients, Some(&sessions), &entries, client_options, events.clone()).await;
-                    if let Some(ref store) = store_path {
-                        if let Err(e) = write_store_atomic(store, &entries) {
-                            tracing::warn!(%e, "could not persist discovery store");
-                        }
-                    }
-                }
-                Err(e) if file.exists() => tracing::warn!(%e, "discovery file unreadable"),
-                Err(_) => {} // file not yet present — wait for the next interval
+            match refresh_once(
+                command.as_deref(),
+                file.as_deref(),
+                command_timeout,
+                store_path.as_deref(),
+                &pool,
+                &clients,
+                &sessions,
+                client_options,
+                events.clone(),
+            ).await {
+                Ok(_) => {}
+                Err(e) => tracing::warn!(%e, "discovery refresh failed"),
             }
         }
     });
@@ -291,5 +370,109 @@ mod tests {
         let reloaded = read_path(&store).unwrap();
         assert_eq!(reloaded[0].id, "again");
         assert_eq!(reloaded[0].source, Source::Lan);
+    }
+
+    #[tokio::test]
+    async fn run_command_parses_stdout_json() {
+        let json = r#"[{"source":"lan","name":"stub-lan","addr":"http://127.0.0.1:7297","mode":"7297"}]"#;
+        let argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            format!("printf '%s' '{json}'"),
+        ];
+        let parsed = run_command(&argv, Duration::from_secs(5)).await.unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].id, "stub-lan");
+        assert_eq!(parsed[0].url, "http://127.0.0.1:7297");
+        assert_eq!(parsed[0].source, Source::Lan);
+    }
+
+    #[tokio::test]
+    async fn run_command_nonzero_exit_is_err() {
+        let argv = vec!["/bin/sh".into(), "-c".into(), "echo boom >&2; exit 3".into()];
+        let err = run_command(&argv, Duration::from_secs(5)).await.unwrap_err();
+        assert!(err.contains("exit 3"), "{err}");
+        assert!(err.contains("boom"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn run_command_bad_json_is_err() {
+        let argv = vec!["/bin/sh".into(), "-c".into(), "printf 'not-json'".into()];
+        let err = run_command(&argv, Duration::from_secs(5)).await.unwrap_err();
+        assert!(err.contains("discovery JSON"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn refresh_once_command_applies_and_persists() {
+        let dir = tempdir().unwrap();
+        let pool = UpstreamPool::new();
+        let clients = ClientMap::new();
+        let sessions = SessionStore::open(dir.path().join("sessions.json"), Duration::from_secs(60), 16).unwrap();
+        let (events, _) = broadcast::channel(8);
+        let opts = Options { call_timeout: Duration::from_millis(50), ping_interval: Duration::from_secs(10), idle_timeout: Duration::from_secs(30) };
+        pool.upsert_with_metadata("local", "http://127.0.0.1:7297", Source::Manual, vec![], None).await;
+
+        let store = dir.path().join("store.json");
+        let json = r#"[{"source":"lan","name":"cmd-peer","addr":"http://10.0.0.5:7297","mode":"7297"}]"#;
+        let argv = vec!["/bin/sh".into(), "-c".into(), format!("printf '%s' '{json}'")];
+        assert!(refresh_once(
+            Some(&argv), None, Duration::from_secs(5), Some(&store),
+            &pool, &clients, &sessions, opts, events.clone(),
+        ).await.unwrap());
+        assert_eq!(pool.get("cmd-peer").await.unwrap().source, Source::Lan);
+        assert!(clients.contains("cmd-peer"));
+        assert!(store.exists());
+        // Manual still preferred for hostless default when both Online
+        pool.mark("local", UpstreamState::Online, Some(1), 0).await;
+        pool.mark("cmd-peer", UpstreamState::Online, Some(1), 0).await;
+        assert_eq!(pool.pick_default(&["*".into()]).await.unwrap().id, "local");
+
+        // Empty snapshot removes idle discovered peer
+        let argv = vec!["/bin/sh".into(), "-c".into(), "printf '[]'".into()];
+        assert!(refresh_once(
+            Some(&argv), None, Duration::from_secs(5), Some(&store),
+            &pool, &clients, &sessions, opts, events.clone(),
+        ).await.unwrap());
+        assert!(pool.get("cmd-peer").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_once_failed_command_leaves_pool_unchanged() {
+        let dir = tempdir().unwrap();
+        let pool = UpstreamPool::new();
+        let clients = ClientMap::new();
+        let sessions = SessionStore::open(dir.path().join("sessions.json"), Duration::from_secs(60), 16).unwrap();
+        let (events, _) = broadcast::channel(8);
+        let opts = Options { call_timeout: Duration::from_millis(50), ping_interval: Duration::from_secs(10), idle_timeout: Duration::from_secs(30) };
+        pool.upsert_with_metadata("keep", "http://1.1.1.1:1", Source::Lan, vec![], None).await;
+        let argv = vec!["/bin/sh".into(), "-c".into(), "exit 1".into()];
+        let err = refresh_once(
+            Some(&argv), None, Duration::from_secs(5), None,
+            &pool, &clients, &sessions, opts, events,
+        ).await.unwrap_err();
+        assert!(err.contains("exit 1"), "{err}");
+        assert!(pool.get("keep").await.is_some());
+    }
+
+    #[tokio::test]
+    async fn refresh_once_prefers_command_over_file() {
+        let dir = tempdir().unwrap();
+        let pool = UpstreamPool::new();
+        let clients = ClientMap::new();
+        let sessions = SessionStore::open(dir.path().join("sessions.json"), Duration::from_secs(60), 16).unwrap();
+        let (events, _) = broadcast::channel(8);
+        let opts = Options { call_timeout: Duration::from_millis(50), ping_interval: Duration::from_secs(10), idle_timeout: Duration::from_secs(30) };
+        let file = dir.path().join("discovered.json");
+        fs::write(&file, r#"[{"source":"lan","name":"from-file","addr":"http://9.9.9.9:1","mode":"7297"}]"#).unwrap();
+        let argv = vec![
+            "/bin/sh".into(), "-c".into(),
+            r#"printf '%s' '[{"source":"tailnet","name":"from-cmd","addr":"http://8.8.8.8:1","mode":"7297"}]'"#.into(),
+        ];
+        assert!(refresh_once(
+            Some(&argv), Some(&file), Duration::from_secs(5), None,
+            &pool, &clients, &sessions, opts, events,
+        ).await.unwrap());
+        assert!(pool.get("from-cmd").await.is_some());
+        assert!(pool.get("from-file").await.is_none());
     }
 }

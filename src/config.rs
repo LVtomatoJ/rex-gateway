@@ -48,7 +48,7 @@ pub struct Config {
     /// Maximum remembered sessions; the least-recently active are forgotten first.
     #[serde(default = "default_session_max")]
     pub session_max: usize,
-    /// Optional rex-discover JSON file watcher that fills the upstream pool.
+    /// Optional rex-discover file watcher and/or live command that fills the upstream pool.
     #[serde(default)]
     pub discovery: DiscoveryConfig,
 }
@@ -76,9 +76,14 @@ pub struct TokenConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DiscoveryConfig {
-    /// Path to a JSON file in `rex-discover --json` format; re-read on interval when set.
+    /// Path to a JSON file in `rex-discover --json` format; re-read on interval when set
+    /// and `command` is unset.
     pub file: Option<PathBuf>,
-    /// How often to re-read `file` (ignored when `file` is unset).
+    /// Optional argv for a live discover subprocess (first element = program). When set,
+    /// each interval runs this command and applies its stdout JSON; takes precedence over `file`.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// How often to refresh discovery (file read or command run).
     #[serde(default = "default_discovery_interval")]
     pub interval_ms: u64,
     /// Optional path to persist the last successfully applied discovery snapshot.
@@ -87,7 +92,20 @@ pub struct DiscoveryConfig {
 
 impl Default for DiscoveryConfig {
     fn default() -> Self {
-        Self { file: None, interval_ms: default_discovery_interval(), store_path: None }
+        Self {
+            file: None,
+            command: None,
+            interval_ms: default_discovery_interval(),
+            store_path: None,
+        }
+    }
+}
+
+impl DiscoveryConfig {
+    /// True when either a nonempty file path or a nonempty command argv is configured.
+    pub fn enabled(&self) -> bool {
+        self.file.as_ref().is_some_and(|p| !p.as_os_str().is_empty())
+            || self.command.as_ref().is_some_and(|c| !c.is_empty())
     }
 }
 
@@ -132,6 +150,10 @@ impl Config {
         if let Some(v) = env("REX_GATEWAY_SESSION_TTL_MS") { config.session_ttl_ms = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_SESSION_MAX") { config.session_max = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_DISCOVERY_FILE") { config.discovery.file = Some(v.into()); }
+        if let Some(v) = env("REX_GATEWAY_DISCOVERY_COMMAND") {
+            let argv: Vec<String> = v.split_ascii_whitespace().map(str::to_owned).collect();
+            config.discovery.command = if argv.is_empty() { None } else { Some(argv) };
+        }
         if let Some(v) = env("REX_GATEWAY_DISCOVERY_INTERVAL_MS") { config.discovery.interval_ms = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_DISCOVERY_STORE_PATH") { config.discovery.store_path = Some(v.into()); }
         // Per-upstream environment keys use the exact ID: REX_GATEWAY_UPSTREAM_<ID>_{TAGS,DESCRIPTION}.
@@ -150,10 +172,18 @@ impl Config {
         if let Some(url) = env("REX_GATEWAY_UPSTREAM_LOCAL_URL") {
             if let Some(upstream) = config.upstreams.iter_mut().find(|u| u.id == "local") { upstream.url = url; }
         }
-        let discovery_enabled = config.discovery.file.as_ref().is_some_and(|p| !p.as_os_str().is_empty());
-        if config.upstreams.is_empty() && !discovery_enabled { bail!("at least one upstream is required (or set discovery.file)"); }
+        if let Some(ref cmd) = config.discovery.command {
+            if cmd.is_empty() { bail!("discovery.command must be nonempty when set"); }
+            if cmd[0].trim().is_empty() { bail!("discovery.command program must be nonempty"); }
+        }
+        let discovery_enabled = config.discovery.enabled();
+        if config.upstreams.is_empty() && !discovery_enabled {
+            bail!("at least one upstream is required (or set discovery.file / discovery.command)");
+        }
         if config.probe_interval_ms == 0 { bail!("a nonzero probe interval is required"); }
-        if discovery_enabled && config.discovery.interval_ms == 0 { bail!("discovery.interval_ms must be nonzero when discovery.file is set"); }
+        if discovery_enabled && config.discovery.interval_ms == 0 {
+            bail!("discovery.interval_ms must be nonzero when discovery is enabled");
+        }
         if config.ticket_ttl_ms == 0 || config.ticket_max == 0 || config.ws_ping_interval_ms == 0 || config.ws_idle_timeout_ms == 0 { bail!("ticket_ttl_ms, ticket_max, ws_ping_interval_ms and ws_idle_timeout_ms must be nonzero"); }
         if config.max_data_streams == 0 || config.max_data_streams_per_token == 0 { bail!("max_data_streams and max_data_streams_per_token must be nonzero"); }
         if config.ws_idle_timeout_ms <= config.ws_ping_interval_ms { bail!("ws_idle_timeout_ms must exceed ws_ping_interval_ms"); }
@@ -341,16 +371,24 @@ avoid_hosts=["clash-box"]
         assert_eq!(auth[0].prefer_hosts,["high-mem"]);
         assert_eq!(auth[0].avoid_hosts,["clash-box"]);
         assert!(c.discovery.file.is_none());
+        assert!(c.discovery.command.is_none());
+        assert!(!c.discovery.enabled());
         assert_eq!(c.discovery.interval_ms,30_000);
         let toml = format!("[discovery]\nfile=\"discovered.json\"\ninterval_ms=1000\nstore_path=\"snap.json\"\n{BASE}");
         let c=Config::from_toml(&toml, |_| None).unwrap();
         assert_eq!(c.discovery.file.as_deref(), Some(std::path::Path::new("discovered.json")));
         assert_eq!(c.discovery.interval_ms,1000);
         assert_eq!(c.discovery.store_path.as_deref(), Some(std::path::Path::new("snap.json")));
+        assert!(c.discovery.enabled());
+        let toml = format!("[discovery]\ncommand=[\"rex-discover\",\"--json\",\"--tailnet-only\"]\ninterval_ms=5000\n{BASE}");
+        let c=Config::from_toml(&toml, |_| None).unwrap();
+        assert_eq!(c.discovery.command.as_deref(), Some(&["rex-discover".into(),"--json".into(),"--tailnet-only".into()][..]));
+        assert!(c.discovery.enabled());
         let env=|k:&str| match k {
             "REX_GATEWAY_AUTH_TOKEN_0_PREFER_HOSTS"=>Some("a, b".into()),
             "REX_GATEWAY_AUTH_TOKEN_0_AVOID_HOSTS"=>Some("c".into()),
             "REX_GATEWAY_DISCOVERY_FILE"=>Some("env.json".into()),
+            "REX_GATEWAY_DISCOVERY_COMMAND"=>Some("rex-discover --json".into()),
             "REX_GATEWAY_DISCOVERY_INTERVAL_MS"=>Some("500".into()),
             "REX_GATEWAY_DISCOVERY_STORE_PATH"=>Some("env-store.json".into()),
             _=>None
@@ -359,11 +397,21 @@ avoid_hosts=["clash-box"]
         assert_eq!(c.auth_entries().unwrap()[0].prefer_hosts,["a","b"]);
         assert_eq!(c.auth_entries().unwrap()[0].avoid_hosts,["c"]);
         assert_eq!(c.discovery.file.as_deref(), Some(std::path::Path::new("env.json")));
+        assert_eq!(c.discovery.command.as_deref(), Some(&["rex-discover".into(),"--json".into()][..]));
         assert_eq!(c.discovery.interval_ms,500);
         assert_eq!(c.discovery.store_path.as_deref(), Some(std::path::Path::new("env-store.json")));
         let c=Config::from_toml("[[auth.tokens]]\ntoken=\"t\"\nallow=[\"*\"]\n[discovery]\nfile=\"d.json\"\n", |_| None).unwrap();
         assert!(c.upstreams.is_empty());
+        let c=Config::from_toml("[[auth.tokens]]\ntoken=\"t\"\nallow=[\"*\"]\n[discovery]\ncommand=[\"rex-discover\",\"--json\"]\n", |_| None).unwrap();
+        assert!(c.upstreams.is_empty());
+        assert!(c.discovery.enabled());
         assert!(Config::from_toml("[[auth.tokens]]\ntoken=\"t\"\nallow=[\"*\"]\n", |_| None).is_err());
         assert!(Config::from_toml(&format!("[discovery]\nfile=\"d.json\"\ninterval_ms=0\n{BASE}"), |_| None).is_err());
+        assert!(Config::from_toml(&format!("[discovery]\ncommand=[\"rex-discover\"]\ninterval_ms=0\n{BASE}"), |_| None).is_err());
+        assert!(Config::from_toml(&format!("[discovery]\ncommand=[]\n{BASE}"), |_| None).is_err());
+        assert!(Config::from_toml(&format!("[discovery]\ncommand=[\"\"]\n{BASE}"), |_| None).is_err());
+        let env=|k:&str| (k == "REX_GATEWAY_DISCOVERY_COMMAND").then(|| "   ".into());
+        let c=Config::from_toml(BASE,env).unwrap();
+        assert!(c.discovery.command.is_none());
     }
 }

@@ -40,23 +40,24 @@ async fn main() -> Result<()> {
         clients.insert(item.id.clone(), Arc::new(ControlClient::new(item.id.clone(), item.url.clone(), client_options, events.clone())));
     }
     let sessions = sessions::SessionStore::open(&config.session_store_path, Duration::from_millis(config.session_ttl_ms), config.session_max)?;
-    // Reload last discovery snapshot before the live file is refreshed (Manual always wins).
+    // Reload last discovery snapshot before the live refresh (Manual always wins).
     if let Some(ref store) = config.discovery.store_path {
         discovery::load_store_if_present(store, &pool, &clients, Some(&sessions), client_options, events.clone()).await;
     }
-    if let Some(ref file) = config.discovery.file {
-        if !file.as_os_str().is_empty() {
-            discovery::spawn(
-                file.clone(),
-                Duration::from_millis(config.discovery.interval_ms),
-                config.discovery.store_path.clone(),
-                pool.clone(),
-                clients.clone(),
-                sessions.clone(),
-                client_options,
-                events.clone(),
-            );
-        }
+    if config.discovery.enabled() {
+        let command = config.discovery.command.clone().filter(|c| !c.is_empty());
+        let file = config.discovery.file.clone().filter(|p| !p.as_os_str().is_empty());
+        discovery::spawn(
+            command,
+            file,
+            Duration::from_millis(config.discovery.interval_ms),
+            config.discovery.store_path.clone(),
+            pool.clone(),
+            clients.clone(),
+            sessions.clone(),
+            client_options,
+            events.clone(),
+        );
     }
     probe::spawn(pool.clone(), clients.clone(), Duration::from_millis(config.probe_interval_ms));
     let metrics = metrics::Metrics::new();
