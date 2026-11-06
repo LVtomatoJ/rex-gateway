@@ -3,3 +3,7 @@
 *.out
 
 *-latest.out
+
+# Runtime state (local smoke / live runs)
+rex-gateway-sessions.json
+rex-gateway-discovered.json
