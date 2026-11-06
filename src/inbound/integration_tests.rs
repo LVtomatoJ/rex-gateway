@@ -846,6 +846,9 @@ async fn create_failovers_transport_error_to_next_upstream() {
     let mut socket = control_agent(h.addr).await;
     let reply = rpc(&mut socket, "session.create", json!({})).await;
     assert_eq!(reply["session_id"], "zzz-live:session:created", "{reply}");
+    let snap = h.state.metrics.snapshot();
+    assert_eq!(snap.create_transport_failovers, 1, "{snap:?}");
+    assert_eq!(snap.create_failover_exhausted, 0, "{snap:?}");
 }
 
 #[tokio::test]
@@ -861,6 +864,9 @@ async fn create_hard_host_pin_does_not_failover() {
     // Live still works after the pinned failure.
     let reply = rpc(&mut socket, "session.create", json!({"host":"live"})).await;
     assert_eq!(reply["session_id"], "live:session:created", "{reply}");
+    let snap = h.state.metrics.snapshot();
+    assert_eq!(snap.create_transport_failovers, 0, "{snap:?}");
+    assert_eq!(snap.create_failover_exhausted, 0, "{snap:?}");
 }
 
 #[tokio::test]
@@ -875,6 +881,9 @@ async fn create_application_error_does_not_failover() {
     let reply = rpc(&mut socket, "session.create", json!({})).await;
     assert_eq!(reply["error"], "quota exceeded", "{reply}");
     assert!(reply.get("session_id").is_none(), "{reply}");
+    let snap = h.state.metrics.snapshot();
+    assert_eq!(snap.create_transport_failovers, 0, "{snap:?}");
+    assert_eq!(snap.create_failover_exhausted, 0, "{snap:?}");
 }
 
 #[tokio::test]
@@ -890,6 +899,9 @@ async fn create_all_transport_failures_aggregate_error() {
     assert!(err.contains("session.create failed on all candidates"), "{reply}");
     assert!(err.contains("host-a"), "{reply}");
     assert!(err.contains("host-b"), "{reply}");
+    let snap = h.state.metrics.snapshot();
+    assert_eq!(snap.create_transport_failovers, 2, "{snap:?}");
+    assert_eq!(snap.create_failover_exhausted, 1, "{snap:?}");
 }
 
 #[tokio::test]
@@ -906,6 +918,9 @@ async fn hostless_failovers_transport_error_to_next_upstream() {
     // Hung host should have been marked failed (Degraded after one transport failure).
     let state = h.pool.get("aaa-hung").await.unwrap().state;
     assert!(matches!(state, UpstreamState::Degraded | UpstreamState::Offline), "{state:?}");
+    let snap = h.state.metrics.snapshot();
+    assert_eq!(snap.hostless_transport_failovers, 1, "{snap:?}");
+    assert_eq!(snap.hostless_failover_exhausted, 0, "{snap:?}");
 }
 
 #[tokio::test]
@@ -920,6 +935,9 @@ async fn hostless_hard_host_pin_does_not_failover() {
     assert!(reply["error"].as_str().unwrap().contains("timeout") || reply["error"].as_str().unwrap().contains("unavailable") || reply["error"].as_str().unwrap().contains("closed"), "{reply}");
     let reply = rpc(&mut socket, "server.version", json!({"host":"live"})).await;
     assert_eq!(reply["ok"], true, "{reply}");
+    let snap = h.state.metrics.snapshot();
+    assert_eq!(snap.hostless_transport_failovers, 0, "{snap:?}");
+    assert_eq!(snap.hostless_failover_exhausted, 0, "{snap:?}");
 }
 
 #[tokio::test]
@@ -932,6 +950,9 @@ async fn hostless_application_error_does_not_failover() {
     let mut socket = control_agent(h.addr).await;
     let reply = rpc(&mut socket, "server.version", json!({})).await;
     assert_eq!(reply["error"], "not supported", "{reply}");
+    let snap = h.state.metrics.snapshot();
+    assert_eq!(snap.hostless_transport_failovers, 0, "{snap:?}");
+    assert_eq!(snap.hostless_failover_exhausted, 0, "{snap:?}");
 }
 
 #[tokio::test]
@@ -947,4 +968,7 @@ async fn hostless_all_transport_failures_aggregate_error() {
     assert!(err.contains("server.version failed on all candidates"), "{reply}");
     assert!(err.contains("host-a"), "{reply}");
     assert!(err.contains("host-b"), "{reply}");
+    let snap = h.state.metrics.snapshot();
+    assert_eq!(snap.hostless_transport_failovers, 2, "{snap:?}");
+    assert_eq!(snap.hostless_failover_exhausted, 1, "{snap:?}");
 }

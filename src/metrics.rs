@@ -15,6 +15,14 @@ pub struct Metrics {
     pub tickets_evicted: AtomicU64,
     pub active_control: AtomicU64,
     pub active_data: AtomicU64,
+    /// Hostless `session.create` transport-error hops (each tried upstream recorded).
+    pub create_transport_failovers: AtomicU64,
+    /// Other hostless RPC transport-error hops.
+    pub hostless_transport_failovers: AtomicU64,
+    /// `session.create` exhausted every candidate with transport errors.
+    pub create_failover_exhausted: AtomicU64,
+    /// Hostless non-create RPC exhausted every candidate with transport errors.
+    pub hostless_failover_exhausted: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -25,6 +33,10 @@ pub struct MetricsSnapshot {
     pub tickets_evicted: u64,
     pub active_control: u64,
     pub active_data: u64,
+    pub create_transport_failovers: u64,
+    pub hostless_transport_failovers: u64,
+    pub create_failover_exhausted: u64,
+    pub hostless_failover_exhausted: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -44,6 +56,10 @@ impl Metrics {
             tickets_evicted: self.tickets_evicted.load(Relaxed),
             active_control: self.active_control.load(Relaxed),
             active_data: self.active_data.load(Relaxed),
+            create_transport_failovers: self.create_transport_failovers.load(Relaxed),
+            hostless_transport_failovers: self.hostless_transport_failovers.load(Relaxed),
+            create_failover_exhausted: self.create_failover_exhausted.load(Relaxed),
+            hostless_failover_exhausted: self.hostless_failover_exhausted.load(Relaxed),
         }
     }
 
@@ -141,5 +157,19 @@ mod tests {
         assert!(limiter.try_acquire("Bearer b", 1).is_some());
         drop(a);
         assert!(limiter.try_acquire("Bearer a", 1).is_some());
+    }
+
+    #[test]
+    fn failover_counters_accumulate() {
+        let metrics = Metrics::new();
+        metrics.create_transport_failovers.fetch_add(2, Relaxed);
+        metrics.hostless_transport_failovers.fetch_add(3, Relaxed);
+        metrics.create_failover_exhausted.fetch_add(1, Relaxed);
+        metrics.hostless_failover_exhausted.fetch_add(1, Relaxed);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.create_transport_failovers, 2);
+        assert_eq!(snap.hostless_transport_failovers, 3);
+        assert_eq!(snap.create_failover_exhausted, 1);
+        assert_eq!(snap.hostless_failover_exhausted, 1);
     }
 }

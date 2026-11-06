@@ -43,6 +43,10 @@ pub fn build(upstreams: &[Upstream], pending_tickets: usize, counters: MetricsSn
             "tickets_consumed": counters.tickets_consumed,
             "tickets_expired": counters.tickets_expired,
             "tickets_evicted": counters.tickets_evicted,
+            "create_transport_failovers": counters.create_transport_failovers,
+            "hostless_transport_failovers": counters.hostless_transport_failovers,
+            "create_failover_exhausted": counters.create_failover_exhausted,
+            "hostless_failover_exhausted": counters.hostless_failover_exhausted,
         },
         "discovery": {
             "enabled": discovery.enabled,
@@ -99,7 +103,12 @@ mod tests {
         pool.upsert("c", "http://c:3", Source::Lan).await;
         pool.mark("a", UpstreamState::Online, Some(12), 3).await;
         pool.mark_failure("b", "connection refused".into()).await;
-        let counters = MetricsSnapshot { tickets_issued: 5, tickets_consumed: 3, tickets_expired: 1, tickets_evicted: 1, active_control: 2, active_data: 1 };
+        let counters = MetricsSnapshot {
+            tickets_issued: 5, tickets_consumed: 3, tickets_expired: 1, tickets_evicted: 1,
+            active_control: 2, active_data: 1,
+            create_transport_failovers: 2, hostless_transport_failovers: 3,
+            create_failover_exhausted: 1, hostless_failover_exhausted: 0,
+        };
 
         let all = build(&pool.list_allowed(&["*".into()]).await, 4, counters, disc(), Instant::now());
         let ups = all["upstreams"].as_array().unwrap();
@@ -122,6 +131,8 @@ mod tests {
         assert_eq!(all["counters"], json!({
             "pending_tickets": 4, "active_control_connections": 2, "active_data_streams": 1,
             "tickets_issued": 5, "tickets_consumed": 3, "tickets_expired": 1, "tickets_evicted": 1,
+            "create_transport_failovers": 2, "hostless_transport_failovers": 3,
+            "create_failover_exhausted": 1, "hostless_failover_exhausted": 0,
         }));
         assert_eq!(all["discovery"], json!({
             "enabled": false, "mode": "none", "last_success_age_ms": null, "last_error": null,

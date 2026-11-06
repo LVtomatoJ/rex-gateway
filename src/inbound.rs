@@ -140,7 +140,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":15});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":16});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -305,6 +305,7 @@ async fn create_with_failover(
             Ok(pair) => pair,
             Err(e) if tried.is_empty() => return Err(e),
             Err(_) => {
+                state.metrics.create_failover_exhausted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let detail = tried
                     .iter()
                     .map(|(id, err)| format!("{id}: {err}"))
@@ -333,6 +334,7 @@ async fn create_with_failover(
                 drop(reserved);
                 let _ = state.pool.mark_failure(&id, err.clone()).await;
                 tried.push((id, err));
+                state.metrics.create_transport_failovers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -368,6 +370,7 @@ async fn hostless_with_failover(
             if tried.is_empty() {
                 return Err("no routable upstream".into());
             }
+            state.metrics.hostless_failover_exhausted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let detail = tried
                 .iter()
                 .map(|(id, err)| format!("{id}: {err}"))
@@ -392,6 +395,7 @@ async fn hostless_with_failover(
             Err(err) => {
                 let _ = state.pool.mark_failure(&id, err.clone()).await;
                 tried.push((id, err));
+                state.metrics.hostless_transport_failovers.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
     }
@@ -660,6 +664,10 @@ mod tests {
         assert_eq!(json["counters"]["pending_tickets"], 1);
         assert_eq!(json["counters"]["tickets_issued"], 1);
         assert_eq!(json["counters"]["active_control_connections"], 1);
+        assert_eq!(json["counters"]["create_transport_failovers"], 0);
+        assert_eq!(json["counters"]["hostless_transport_failovers"], 0);
+        assert_eq!(json["counters"]["create_failover_exhausted"], 0);
+        assert_eq!(json["counters"]["hostless_failover_exhausted"], 0);
         assert_eq!(json["discovery"]["enabled"], false);
         assert_eq!(json["discovery"]["mode"], "none");
         assert_eq!(json["discovery"]["refresh_count"], 0);
