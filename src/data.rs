@@ -54,11 +54,20 @@ impl TicketMap {
         now.saturating_duration_since(created) >= self.ttl
     }
 
+    /// Unbound insert (no session reference). Prefer [`insert_bound`] when a session is known.
+    /// Kept for tests and call sites that intentionally leave `session_id` unset.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn insert(&self, upstream: &str, upstream_ticket: &str, owner: &str) -> String {
-        self.insert_at(upstream, upstream_ticket, owner, Instant::now())
+        self.insert_bound(upstream, upstream_ticket, owner, None)
     }
 
-    pub fn insert_at(&self, upstream: &str, upstream_ticket: &str, owner: &str, now: Instant) -> String {
+    /// Like [`insert`], optionally binding the ticket to a namespaced session reference so
+    /// data-plane attach can refuse forgotten/expired sessions with a clear close.
+    pub fn insert_bound(&self, upstream: &str, upstream_ticket: &str, owner: &str, session_id: Option<&str>) -> String {
+        self.insert_at(upstream, upstream_ticket, owner, session_id, Instant::now())
+    }
+
+    pub fn insert_at(&self, upstream: &str, upstream_ticket: &str, owner: &str, session_id: Option<&str>, now: Instant) -> String {
         let external = URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes());
         let mut inner = self.lock();
         while inner.entries.len() >= self.max {
@@ -70,7 +79,12 @@ impl TicketMap {
         inner.next_seq += 1;
         inner.order.insert(seq, external.clone());
         inner.entries.insert(external.clone(), Entry {
-            ticket: Ticket { upstream: upstream.to_owned(), upstream_ticket: upstream_ticket.to_owned(), owner: owner.to_owned(), session_id: None },
+            ticket: Ticket {
+                upstream: upstream.to_owned(),
+                upstream_ticket: upstream_ticket.to_owned(),
+                owner: owner.to_owned(),
+                session_id: session_id.map(str::to_owned),
+            },
             created: now,
             seq,
         });
@@ -118,6 +132,8 @@ impl TicketMap {
     }
 
     /// Marks a ticket with its session before it is exposed to an agent.
+    /// Production rewriting uses [`insert_bound`]; this remains for tests that insert first.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn bind_session(&self, external: &str, session_id: &str) {
         if let Some(entry)=self.lock().entries.get_mut(external){entry.ticket.session_id=Some(session_id.to_owned());}
     }
@@ -160,7 +176,7 @@ mod tests {
     fn ticket_routes_once_and_checks_owner() {
         let (map, metrics) = map(8);
         let now = Instant::now();
-        let external = map.insert_at("local", "real-ticket", "secret", now);
+        let external = map.insert_at("local", "real-ticket", "secret", None, now);
         assert_eq!(map.take_at(&external, "other", now), None);
         assert_eq!(map.pending(), 1, "wrong owner must not burn the ticket");
         assert_eq!(map.take_at(&external, "secret", now), Some(Ticket {
@@ -182,8 +198,8 @@ mod tests {
     fn expired_on_consume_is_rejected_and_removed() {
         let (map, metrics) = map(8);
         let t0 = Instant::now();
-        let fresh = map.insert_at("a", "t1", "secret", t0);
-        let stale = map.insert_at("a", "t2", "secret", t0);
+        let fresh = map.insert_at("a", "t1", "secret", None, t0);
+        let stale = map.insert_at("a", "t2", "secret", None, t0);
         assert!(map.take_at(&fresh, "secret", t0 + TTL - Duration::from_millis(1)).is_some(), "just before TTL is valid");
         assert_eq!(map.take_at(&stale, "secret", t0 + TTL), None, "at TTL it is expired");
         assert_eq!(map.pending(), 0, "expired entry removed on consume");
@@ -195,7 +211,7 @@ mod tests {
     fn expired_wrong_owner_is_still_rejected() {
         let (map, _) = map(8);
         let t0 = Instant::now();
-        let external = map.insert_at("a", "t", "secret", t0);
+        let external = map.insert_at("a", "t", "secret", None, t0);
         assert_eq!(map.take_at(&external, "other", t0 + TTL * 2), None);
         assert_eq!(map.take_at(&external, "secret", t0 + TTL * 2), None);
     }
@@ -204,9 +220,9 @@ mod tests {
     fn reap_purges_only_expired() {
         let (map, metrics) = map(8);
         let t0 = Instant::now();
-        let old1 = map.insert_at("a", "t1", "secret", t0);
-        let _old2 = map.insert_at("a", "t2", "secret", t0 + Duration::from_secs(5));
-        let young = map.insert_at("a", "t3", "secret", t0 + Duration::from_secs(20));
+        let old1 = map.insert_at("a", "t1", "secret", None, t0);
+        let _old2 = map.insert_at("a", "t2", "secret", None, t0 + Duration::from_secs(5));
+        let young = map.insert_at("a", "t3", "secret", None, t0 + Duration::from_secs(20));
         assert_eq!(map.reap_at(t0 + Duration::from_secs(29)), 0);
         assert_eq!(map.reap_at(t0 + Duration::from_secs(36)), 2);
         assert_eq!(map.pending(), 1);
@@ -221,7 +237,7 @@ mod tests {
     fn capacity_evicts_oldest() {
         let (map, metrics) = map(3);
         let t0 = Instant::now();
-        let ids: Vec<_> = (0..5).map(|i| map.insert_at("a", &format!("t{i}"), "secret", t0 + Duration::from_millis(i))).collect();
+        let ids: Vec<_> = (0..5).map(|i| map.insert_at("a", &format!("t{i}"), "secret", None, t0 + Duration::from_millis(i))).collect();
         assert_eq!(map.pending(), 3, "never grows past the cap");
         assert_eq!(map.take_at(&ids[0], "secret", t0), None);
         assert_eq!(map.take_at(&ids[1], "secret", t0), None);
@@ -234,10 +250,10 @@ mod tests {
     fn capacity_after_consume_does_not_evict_live_tickets() {
         let (map, metrics) = map(2);
         let t0 = Instant::now();
-        let a = map.insert_at("a", "t0", "secret", t0);
-        let b = map.insert_at("a", "t1", "secret", t0);
+        let a = map.insert_at("a", "t0", "secret", None, t0);
+        let b = map.insert_at("a", "t1", "secret", None, t0);
         assert!(map.take_at(&a, "secret", t0).is_some());
-        let c = map.insert_at("a", "t2", "secret", t0);
+        let c = map.insert_at("a", "t2", "secret", None, t0);
         assert_eq!(metrics.snapshot().tickets_evicted, 0);
         assert!(map.take_at(&b, "secret", t0).is_some());
         assert!(map.take_at(&c, "secret", t0).is_some());
@@ -255,6 +271,17 @@ mod tests {
         assert_eq!(metrics.snapshot().tickets_expired, 1);
         assert_eq!(map.take(&external, "secret"), None);
         reaper.abort();
+    }
+
+    #[test]
+    fn insert_bound_attaches_session_reference() {
+        let (map, _) = map(8);
+        let now = Instant::now();
+        let external = map.insert_at("local", "real", "secret", Some("local:session:a"), now);
+        let ticket = map.take_at(&external, "secret", now).unwrap();
+        assert_eq!(ticket.session_id.as_deref(), Some("local:session:a"));
+        let unbound = map.insert_at("local", "real2", "secret", None, now);
+        assert_eq!(map.take_at(&unbound, "secret", now).unwrap().session_id, None);
     }
 
     #[test]

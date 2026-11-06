@@ -349,7 +349,7 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let welcome: Value = serde_json::from_str(&welcome).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["api_server_revision"], 22);
+    assert_eq!(welcome["api_server_revision"], 23);
     assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
@@ -539,6 +539,7 @@ async fn events_are_namespaced_forwarded_and_do_not_break_rpc() {
     assert!(h.state.sessions.contains("good:session:v"), "event must record nested session");
     let mapped = h.state.tickets.take(ticket, SECRET).unwrap();
     assert_eq!(mapped.upstream_ticket, "up-ticket");
+    assert_eq!(mapped.session_id.as_deref(), Some("good:session:v"), "event tickets bind to nearest session");
     let response=loop {
         match socket.next().await.unwrap().unwrap() {
             tungstenite::Message::Text(text)=>break serde_json::from_str::<Value>(&text).unwrap(),
@@ -588,6 +589,7 @@ async fn session_list_recursively_rewrites_nested_tickets() {
     assert_ne!(ticket, "list-ticket");
     let mapped = h.state.tickets.take(ticket, SECRET).unwrap();
     assert_eq!(mapped.upstream_ticket, "list-ticket");
+    assert_eq!(mapped.session_id.as_deref(), Some("live:session:view"), "list tickets bind to nearest session");
     assert!(h.state.sessions.contains("live:session:root"));
     assert!(h.state.sessions.contains("live:session:view"));
 }
@@ -1114,6 +1116,35 @@ async fn data_attach_after_forget_rejects_before_upstream() {
     let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
     socket.send(tungstenite::Message::Binary([&[1u8][..],&raw].concat())).await.unwrap();
     match socket.next().await.unwrap().unwrap(){tungstenite::Message::Close(Some(frame))=>assert_eq!((u16::from(frame.code),frame.reason.as_ref()),(1008,crate::sessions::FORGOTTEN_ERROR)),other=>panic!("{other:?}")}
+}
+
+/// Tickets rewritten out of session.list / bootstrap / events must refuse attach after
+/// session.forget without any manual bind_session — that was previously only wired for
+/// top-level data.connect responses.
+#[tokio::test]
+async fn list_issued_ticket_rejects_after_forget() {
+    let live = spawn_fake_rex(vec![json!({
+        "session_id":"session:root",
+        "view":{"session_id":"session:view","ticket":"AAAAAAAAAAAAAAAAAAAAAA"}
+    })], false).await;
+    let h = start_gateway(&[("live", &live)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    wait_state(&h.pool, "live", UpstreamState::Online).await;
+    let mut socket = control_agent(h.addr).await;
+    let reply = rpc(&mut socket, "session.list", json!({})).await;
+    let external = reply["sessions"][0]["view"]["ticket"].as_str().unwrap().to_owned();
+    let view_id = reply["sessions"][0]["view"]["session_id"].as_str().unwrap().to_owned();
+    assert_eq!(view_id, "live:session:view");
+    // Forget the view session the ticket is bound to.
+    assert_eq!(rpc(&mut socket, "session.forget", json!({"session_id": view_id})).await["forgotten"], true);
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
+    let mut data = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
+    data.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat())).await.unwrap();
+    match data.next().await.unwrap().unwrap() {
+        tungstenite::Message::Close(Some(frame)) => {
+            assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1008, crate::sessions::FORGOTTEN_ERROR));
+        }
+        other => panic!("expected forgotten close, got {other:?}"),
+    }
 }
 
 #[tokio::test]

@@ -174,7 +174,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":22});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":23});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -264,7 +264,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                 // namespace_and_record on an already-wrapped payload double-prefixes
                 // session ids (so recording fails) and re-issues orphan tickets.
                 let mut payload = event.event.get("payload").cloned().unwrap_or(Value::Null);
-                namespace_and_record(&mut payload, &event.upstream, &state.tickets, &owner, &state.sessions);
+                namespace_and_record(&mut payload, &event.upstream, &state.tickets, &owner, &state.sessions, None);
                 seq += 1;
                 let framed = json!({"type":"event","seq":seq,"payload":payload});
                 if sink.send(Message::Text(framed.to_string())).await.is_err() { break; }
@@ -354,8 +354,16 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
     if method == "data.connect" && response.get("ticket").and_then(Value::as_str).is_none() {
         return Err("upstream data.connect omitted ticket".into());
     }
-    namespace_and_record(&mut response, &owner_upstream, &state.tickets, owner, &state.sessions);
-    if method=="data.connect" {if let (Some(ticket),Some(id))=(response.get("ticket").and_then(Value::as_str),external_session.as_deref()){state.tickets.bind_session(ticket,id);}}
+    // Bind tickets to the request session (covers bare data.connect ticket payloads) or to
+    // the nearest nested session_id found while walking the response.
+    namespace_and_record(
+        &mut response,
+        &owner_upstream,
+        &state.tickets,
+        owner,
+        &state.sessions,
+        external_session.as_deref(),
+    );
     Ok(AgentReply::Payload(response))
 }
 
@@ -419,7 +427,7 @@ async fn create_with_failover(
             Ok(reply) => {
                 reserved.finish();
                 let mut response = reply.payload;
-                namespace_and_record(&mut response, &id, &state.tickets, owner, &state.sessions);
+                namespace_and_record(&mut response, &id, &state.tickets, owner, &state.sessions, None);
                 return Ok(AgentReply::Payload(response));
             }
             Err(err) => {
@@ -482,7 +490,7 @@ async fn hostless_with_failover(
             }
             Ok(reply) => {
                 let mut response = reply.payload;
-                namespace_and_record(&mut response, &id, &state.tickets, owner, &state.sessions);
+                namespace_and_record(&mut response, &id, &state.tickets, owner, &state.sessions, None);
                 return Ok(AgentReply::Payload(response));
             }
             Err(err) => {
@@ -529,7 +537,7 @@ async fn list_sessions(state: &AppState, acl: &[String], owner: &str, store: &Se
                 // session/ticket fields the same way responses and events do.
                 let Some(raw) = session.get("session_id").and_then(Value::as_str) else { continue };
                 if !raw.starts_with("session:") { continue; }
-                namespace_and_record(&mut session, id, &state.tickets, owner, store);
+                namespace_and_record(&mut session, id, &state.tickets, owner, store, None);
                 sessions.push(session);
             },
             Err(error) => { tracing::warn!(upstream = id, %error, "session.list skipped upstream"); errors.insert(id.to_owned(), Value::String(error)); }

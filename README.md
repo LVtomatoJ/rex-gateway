@@ -29,7 +29,7 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
-  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 22).
+  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 23).
 * `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
   namespaced IDs (recursively wrapping nested `session_id` / `ticket` fields the same way as
   other responses) in sorted upstream-ID order. Upstreams that are not routable (`Online` or
@@ -42,6 +42,8 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 * Namespaced session calls are routed to their owner, with the prefix stripped upstream.
   Top-level returned session IDs, and session data nested beneath `view`, are wrapped.
   `wrap_session_id` is idempotent: an already-namespaced id is never double-prefixed.
+  Rewritten nested `ticket` fields are bound to the nearest enclosing namespaced session
+  so later data-plane attach honors forget/TTL (see Data plane).
 * `session.create` (and other hostless non-list methods) targets payload `host` when
   supplied; otherwise the gateway picks an ACL-allowed upstream by policy: prefer
   `Online`, then fall back to `Degraded`, scoring by capability tags, soft preferred host
@@ -173,7 +175,12 @@ and concurrent control sockets by `max_control_connections` /
 `max_control_connections_per_token` (same defaults; close `1013` before welcome). This is not a
 terminal protocol parser and does not rewrite bytes inside stream frames.
 
-Tickets are kept in memory, single-use and bound to the bearer token. An unused ticket lives
+Tickets are kept in memory, single-use and bound to the bearer token. Every rewritten ticket
+is also bound to the nearest enclosing namespaced `session_id` (or, for a bare `data.connect`
+ticket payload, to the request's session). That covers tickets issued from `session.list`,
+`session.bootstrap`, `session.create`, events, and `data.connect` alike: after
+`session.forget` / TTL / capacity GC, data attach closes `1008` with
+`session reference expired/forgotten` before dialing upstream. An unused ticket lives
 at most `ticket_ttl_ms` (default 30000 ms): expiry is enforced when the ticket is consumed and
 by a background reaper that purges expired entries (period = TTL/2, clamped to 50 ms..5 s).
 At most `ticket_max` (default 1024) tickets are pending; when full, the oldest is evicted, so
@@ -207,7 +214,9 @@ forgotten references. It never kills the Rex session itself. Session RPCs, listi
 and binary terminal traffic refresh activity; fetching the full session list refreshes all listed
 references by design. After TTL/capacity cleanup or `session.forget`, list/send/read/bootstrap/
 attach/data.connect receive the clear control error **`session reference expired/forgotten`**.
-If a data ticket was already issued, attach closes with WebSocket **1008** and the same reason.
+If a data ticket was already issued (from list/bootstrap/create/event/`data.connect`), attach
+closes with WebSocket **1008** and the same reason — tickets carry the session binding
+automatically when the gateway rewrites them.
 
 ### Live verification
 
