@@ -29,7 +29,7 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
-  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 21).
+  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 22).
 * `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
   namespaced IDs (recursively wrapping nested `session_id` / `ticket` fields the same way as
   other responses) in sorted upstream-ID order. Upstreams that are not routable (`Online` or
@@ -80,10 +80,13 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
   `upstream_call_timeout_ms`. Upstream events are forwarded independently to agent controls
   whose token can access the owning upstream, with recursively namespaced session references
   and gateway ticket rewrites (events are namespaced once and recorded into the session store;
-  they are not re-wrapped). Event and response sequence numbers share one monotonically
-  increasing per-agent sequence (assigned only when the frame is written to the agent sink);
-  request/response IDs retain upstream-independent correlation. The welcome `limits` object
-  advertises `max_in_flight_control_rpcs` alongside `max_message_bytes`.
+  they are not re-wrapped). A lagged agent receiver gets a synthetic
+  `gateway.notice=events_lagged` event (see Status) rather than silent loss. Forwarded events
+  also refresh control application-idle so passive listeners are not reaped. Event and response
+  sequence numbers share one monotonically increasing per-agent sequence (assigned only when
+  the frame is written to the agent sink); request/response IDs retain upstream-independent
+  correlation. The welcome `limits` object advertises `max_in_flight_control_rpcs` alongside
+  `max_message_bytes`.
 * Rex frame-level errors (`{"type":"response","id":…,"error":{"code","message","status"}}`,
   no `payload`) are forwarded to the agent with the same top-level `error` object. The gateway
   does not collapse them to `payload: null`, does not decorate failed `session.bootstrap` with
@@ -265,9 +268,12 @@ transport error (each hop / retry trigger); `create_failover_exhausted` /
 the aggregate `… failed on all candidates: …` error. Application-level errors and hard
 `host` pins do not touch these counters.
 Broadcast event delivery is also counted: `events_forwarded` increments on each successful
-agent event send; `events_lagged` sums the skipped counts from `RecvError::Lagged(n)` when
-an agent control receiver falls behind the broadcast channel (those events are skipped after
-a warn log, not buffered unboundedly).
+upstream-originated agent event send; `events_lagged` sums the skipped counts from
+`RecvError::Lagged(n)` when an agent control receiver falls behind the broadcast channel.
+On lag the agent also receives a synthetic event
+`{"type":"event","seq":N,"payload":{"gateway":{"notice":"events_lagged","skipped":n}}}`
+so it can resync via `session.list` / `session.bootstrap` (the notice itself is not counted
+in `events_forwarded`). Missed events are not replayed.
 `discovery` reports whether pool fill is configured (`enabled`/`mode` = `command`|`file`|`none`),
 ages since last success/error (`null` if never), whether the last refresh applied a snapshot
 (`last_applied`), and `refresh_count` / `error_count` since process start. When discovery is
@@ -283,16 +289,24 @@ timing. Ticket-owner binding uses a constant-time comparison too. Behavior is ot
 
 ## WebSocket keepalive and idle handling
 Control and data sockets emit WebSocket pings at `ws_ping_interval_ms` (default 20000) on both
-agent and upstream sides. Incoming application frames and pong frames keep a connection alive
-(WebSocket libraries normally answer pings automatically). If no incoming frame arrives for
-`ws_idle_timeout_ms` (default 120000), the affected connection closes: agent-side idle uses
-close 1001 / `idle timeout`; data idle closes both bridge endpoints. The idle timeout must be
-greater than the ping interval and both must be nonzero. An agent control initial HELLO/welcome
-is completed before the keepalive loop; data HELLO/setup timeouts remain separate as above.
-Agent control and data upgrades, and upstream control+data client connects, all enforce the
-same WebSocket `max_message_size` / `max_frame_size` cap as the advertised
-`limits.max_message_bytes` (1 MiB), matching Rex. The constant lives in one place
-(`MAX_MESSAGE_BYTES`) so inbound and upstream sockets cannot drift.
+agent and upstream sides (WebSocket libraries normally answer pings automatically). Idle is
+**application-idle**, not pong-idle: ping/pong alone do not refresh the timer, so truly unused
+agent sockets are still reaped even while keepalive works. What refreshes idle:
+
+* **Agent control:** inbound application Text (RPCs), successfully forwarded upstream events,
+  and the synthetic `events_lagged` notice. After `ws_idle_timeout_ms` (default 120000) with
+  none of those, the agent is closed 1001 / `idle timeout`.
+* **Data bridge:** inbound application Binary/Text on either leg refreshes; idle closes both
+  endpoints with 1001 / `idle timeout`.
+* **Upstream control client:** pong/text/ping from the upstream *do* refresh (the gateway wants
+  that socket to stay up for probes and event fanout); idle still closes a silent upstream.
+
+The idle timeout must be greater than the ping interval and both must be nonzero. An agent
+control initial HELLO/welcome is completed before the keepalive loop; data HELLO/setup
+timeouts remain separate as above. Agent control and data upgrades, and upstream control+data
+client connects, all enforce the same WebSocket `max_message_size` / `max_frame_size` cap as
+the advertised `limits.max_message_bytes` (1 MiB), matching Rex. The constant lives in one
+place (`MAX_MESSAGE_BYTES`) so inbound and upstream sockets cannot drift.
 ## Upstream discovery
 
 Optional `[discovery]` fills the upstream pool from a `rex-discover --json` snapshot —

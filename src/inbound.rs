@@ -174,7 +174,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":21});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":22});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -240,8 +240,20 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                 let event=match event {
                     Ok(event)=>event,
                     Err(broadcast::error::RecvError::Lagged(n))=>{
+                        // Tell the agent it missed events so it can resync (list/bootstrap).
+                        // Do not count this notice as events_forwarded — that counter is
+                        // upstream-originated deliveries only.
                         state.metrics.events_lagged.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!(n,"agent event receiver lagged");
+                        seq += 1;
+                        let notice = json!({
+                            "type":"event",
+                            "seq":seq,
+                            "payload":{"gateway":{"notice":"events_lagged","skipped":n}}
+                        });
+                        if sink.send(Message::Text(notice.to_string())).await.is_err() { break; }
+                        // A lag notice is still useful agent traffic: refresh application idle.
+                        last_activity = std::time::Instant::now();
                         continue
                     },
                     Err(_)=>break
@@ -257,6 +269,8 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                 let framed = json!({"type":"event","seq":seq,"payload":payload});
                 if sink.send(Message::Text(framed.to_string())).await.is_err() { break; }
                 state.metrics.events_forwarded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Forwarded events keep a passive listener alive (application-idle, not pong-idle).
+                last_activity = std::time::Instant::now();
             }
             _=pings.tick()=>if sink.send(Message::Ping(Vec::new())).await.is_err() { break; },
             _=idle.tick()=>if last_activity.elapsed()>=state.options.idle_timeout {
