@@ -11,6 +11,12 @@ pub struct Config {
     pub auth: AuthConfig,
     #[serde(default = "default_probe")]
     pub probe_interval_ms: u64,
+    /// Lifetime of an unused gateway data ticket.
+    #[serde(default = "default_ticket_ttl")]
+    pub ticket_ttl_ms: u64,
+    /// Maximum number of pending (unused) data tickets; the oldest is evicted when full.
+    #[serde(default = "default_ticket_max")]
+    pub ticket_max: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -24,6 +30,8 @@ pub struct TokenConfig { pub token: String, pub allow: Vec<String> }
 
 fn default_listen() -> SocketAddr { "127.0.0.1:7300".parse().unwrap() }
 fn default_probe() -> u64 { 10_000 }
+fn default_ticket_ttl() -> u64 { 30_000 }
+fn default_ticket_max() -> usize { 1024 }
 
 impl Config {
     pub fn load() -> Result<Self> {
@@ -32,10 +40,13 @@ impl Config {
         let mut config: Config = toml::from_str(&text)?;
         if let Ok(listen) = env::var("REX_GATEWAY_LISTEN") { config.listen = listen.parse()?; }
         if let Ok(interval) = env::var("REX_GATEWAY_PROBE_INTERVAL_MS") { config.probe_interval_ms = interval.parse()?; }
+        if let Ok(ttl) = env::var("REX_GATEWAY_TICKET_TTL_MS") { config.ticket_ttl_ms = ttl.parse()?; }
+        if let Ok(max) = env::var("REX_GATEWAY_TICKET_MAX") { config.ticket_max = max.parse()?; }
         if let Ok(url) = env::var("REX_GATEWAY_UPSTREAM_LOCAL_URL") {
             if let Some(upstream) = config.upstreams.iter_mut().find(|u| u.id == "local") { upstream.url = url; }
         }
         if config.upstreams.is_empty() || config.probe_interval_ms == 0 { bail!("at least one upstream and a nonzero probe interval are required"); }
+        if config.ticket_ttl_ms == 0 || config.ticket_max == 0 { bail!("ticket_ttl_ms and ticket_max must be nonzero"); }
         config.auth_map()?;
         Ok(config)
     }
@@ -48,5 +59,20 @@ impl Config {
         }
         if result.is_empty() { bail!("at least one token is required"); }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE: &str = "[[upstreams]]\nid=\"a\"\nurl=\"http://a\"\n[[auth.tokens]]\ntoken=\"t\"\nallow=[\"*\"]\n";
+
+    #[test]
+    fn ticket_settings_have_defaults_and_can_be_set() {
+        let config: Config = toml::from_str(BASE).unwrap();
+        assert_eq!((config.ticket_ttl_ms, config.ticket_max), (30_000, 1024));
+        let config: Config = toml::from_str(&format!("ticket_ttl_ms = 500\nticket_max = 7\n{BASE}")).unwrap();
+        assert_eq!((config.ticket_ttl_ms, config.ticket_max), (500, 7));
     }
 }

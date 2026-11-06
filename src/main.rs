@@ -3,9 +3,11 @@ mod config;
 mod control_client;
 mod data;
 mod inbound;
+mod metrics;
 mod pool;
 mod probe;
 mod protocol;
+mod status;
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 use anyhow::Result;
@@ -27,6 +29,8 @@ async fn main() -> Result<()> {
         clients.insert(item.id.clone(), Arc::new(client));
     }
     probe::spawn(pool.clone(), Arc::new(clients.clone()), Duration::from_millis(config.probe_interval_ms));
-    let tickets = data::TicketMap::new();
-    inbound::serve(config.listen, pool, clients, auth, tickets).await
+    let metrics = metrics::Metrics::new();
+    let tickets = data::TicketMap::new(Duration::from_millis(config.ticket_ttl_ms), config.ticket_max, metrics.clone());
+    tickets.spawn_reaper();
+    inbound::serve(config.listen, pool, clients, auth, tickets, metrics).await
 }

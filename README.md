@@ -13,8 +13,9 @@ REX_GATEWAY_CONFIG=my-gateway.toml RUST_LOG=info cargo run
 The config contains `listen`, `probe_interval_ms`, repeated `[[upstreams]]` entries
 (`id`, `url`) and `[[auth.tokens]]` entries (`token`, `allow = ["*"]` or upstream IDs).
 Environment overrides are `REX_GATEWAY_CONFIG`, `REX_GATEWAY_LISTEN`,
-`REX_GATEWAY_PROBE_INTERVAL_MS`, and `REX_GATEWAY_UPSTREAM_LOCAL_URL` (for the
-upstream id `local`). Tokens and the token map are intentionally TOML-only for now.
+`REX_GATEWAY_PROBE_INTERVAL_MS`, `REX_GATEWAY_TICKET_TTL_MS`, `REX_GATEWAY_TICKET_MAX`, and `REX_GATEWAY_UPSTREAM_LOCAL_URL` (for the
+upstream id `local`). Optional top-level settings `ticket_ttl_ms` (default 30000) and
+`ticket_max` (default 1024) bound unused data tickets (see Data plane). Tokens and the token map are intentionally TOML-only for now.
 
 ## Protocol and routing decisions
 
@@ -43,6 +44,7 @@ cargo build
 cargo test
 cargo run # separately, with the supplied local config
 python3 smoke.py > smoke.out
+curl -s -H 'Authorization: Bearer smoke-secret' http://127.0.0.1:7300/status
 ```
 
 The smoke test checks absent/wrong tokens, hello/welcome, aggregated namespaced list,
@@ -64,13 +66,40 @@ snapshots, terminal output, and agent input are relayed frame-for-frame between 
 sockets. Ping/pong and close frames, including close codes and reasons, are forwarded.
 This is not a terminal protocol parser and does not rewrite bytes inside stream frames.
 
-Tickets are kept in memory. They expire only when consumed or the gateway restarts;
-Unused-ticket expiry/capacity limits are a hardening TODO. Unknown and already-used
-tickets receive REJECT `0x82 0x01`; malformed HELLO receives `0x82 0x05`.
+Tickets are kept in memory, single-use and bound to the bearer token. An unused ticket lives
+at most `ticket_ttl_ms` (default 30000 ms): expiry is enforced when the ticket is consumed and
+by a background reaper that purges expired entries (period = TTL/2, clamped to 50 ms..5 s).
+At most `ticket_max` (default 1024) tickets are pending; when full, the oldest is evicted, so
+memory never grows unbounded. Unknown, expired, evicted, wrong-owner and already-used tickets
+all receive REJECT `0x82 0x01` (indistinguishable to the caller); malformed HELLO receives
+`0x82 0x05`. A wrong-owner attempt does not burn the legitimate owner's live ticket.
+
+## Status endpoint
+
+`GET /status` with `Authorization: Bearer <token>` (401 otherwise) returns JSON:
+
+```json
+{
+  "upstreams": [
+    {"id":"local","url":"http://127.0.0.1:7297","source":"Manual","state":"Online",
+     "latency_ms":3,"consecutive_failures":0,"last_error":null,
+     "last_probe_age_ms":412,"session_count":2}
+  ],
+  "counters": {
+    "pending_tickets":0,"active_control_connections":1,"active_data_streams":0,
+    "tickets_issued":5,"tickets_consumed":4,"tickets_expired":1,"tickets_evicted":0
+  }
+}
+```
+
+`upstreams` lists only upstreams the token's ACL permits (in any state, sorted by id).
+`state` is `Unknown|Online|Degraded|Offline`; `latency_ms` is the last probe's latency
+(null if the last probe failed or none ran); `last_error` is the most recent probe error and is
+cleared by the next successful probe. `counters` are gateway-wide (not ACL-filtered), totals since
+start; `tickets_expired` counts TTL expiries, `tickets_evicted` capacity evictions.
 
 ## Remaining TODOs
 
-- Reaper with bounded unused-ticket TTL/capacity.
 - Multiplexed inbound event forwarding on control connections.
 - Richer recursive response namespacing for ticket-bearing `session.bootstrap` payloads.
 - Preserve fragmented-message boundaries if a future Rex version relies on them (Rex
@@ -86,3 +115,13 @@ python3 smoke_data.py > smoke_data.out
 
 This obtains a ticket through the gateway, asserts data ACCEPT, sends terminal output via
 the real Rex CLI, and checks that `HELLO_FROM_GATEWAY` appears on the gateway data socket.
+
+## Ticket TTL / status verification
+
+Start the gateway with a short TTL, then run the check (it asserts reaper purge, post-TTL
+REJECT, and the `/status` gauges):
+
+```sh
+REX_GATEWAY_TICKET_TTL_MS=2000 ./target/debug/rex-gateway &
+python3 smoke_ttl.py
+```
