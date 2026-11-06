@@ -110,6 +110,48 @@ async fn spawn_fake_rex_create_app_error(error: &str) -> String {
 }
 
 
+/// Fake Rex that answers `method` with an application-level `{"error":…}` payload.
+async fn spawn_fake_rex_method_app_error(method: &str, error: &str) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let method = method.to_owned();
+    let error = error.to_owned();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let method = method.clone();
+            let error = error.clone();
+            tokio::spawn(async move {
+                let callback = |_: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+                    response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(SUBPROTOCOL));
+                    Ok(response)
+                };
+                let Ok(mut socket) = accept_hdr_async(stream, callback).await else { return };
+                while let Some(Ok(frame)) = socket.next().await {
+                    let tungstenite::Message::Text(text) = frame else { continue };
+                    let message: Value = serde_json::from_str(&text).unwrap();
+                    match message["type"].as_str() {
+                        Some("hello") => { let _ = socket.send(tungstenite::Message::Text(json!({"type":"welcome"}).to_string())).await; }
+                        Some("request") => {
+                            let payload = if message["method"] == "session.list" {
+                                json!({"sessions": []})
+                            } else if message["method"].as_str() == Some(method.as_str()) {
+                                json!({"error": error})
+                            } else {
+                                json!({"ok": true})
+                            };
+                            let reply = json!({"type":"response","id":message["id"],"payload":payload});
+                            let _ = socket.send(tungstenite::Message::Text(reply.to_string())).await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+    url
+}
+
 struct Harness { addr: SocketAddr, pool: UpstreamPool, state: AppState }
 
 /// Builds the same wiring as `main` (lazy clients, probe loop) around the given upstreams.
@@ -850,3 +892,59 @@ async fn create_all_transport_failures_aggregate_error() {
     assert!(err.contains("host-b"), "{reply}");
 }
 
+#[tokio::test]
+async fn hostless_failovers_transport_error_to_next_upstream() {
+    // aaa sorts before zzz under pick_default; hung first, then live for server.version.
+    let hung = spawn_fake_rex(vec![], true).await;
+    let live = spawn_fake_rex(vec![], false).await;
+    let h = start_gateway(&[("aaa-hung", &hung), ("zzz-live", &live)], tmo(250), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("aaa-hung", UpstreamState::Online, Some(1), 0).await;
+    h.pool.mark("zzz-live", UpstreamState::Online, Some(1), 0).await;
+    let mut socket = control_agent(h.addr).await;
+    let reply = rpc(&mut socket, "server.version", json!({})).await;
+    assert_eq!(reply["ok"], true, "{reply}");
+    // Hung host should have been marked failed (Degraded after one transport failure).
+    let state = h.pool.get("aaa-hung").await.unwrap().state;
+    assert!(matches!(state, UpstreamState::Degraded | UpstreamState::Offline), "{state:?}");
+}
+
+#[tokio::test]
+async fn hostless_hard_host_pin_does_not_failover() {
+    let hung = spawn_fake_rex(vec![], true).await;
+    let live = spawn_fake_rex(vec![], false).await;
+    let h = start_gateway(&[("hung", &hung), ("live", &live)], tmo(250), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("hung", UpstreamState::Online, Some(1), 0).await;
+    h.pool.mark("live", UpstreamState::Online, Some(1), 0).await;
+    let mut socket = control_agent(h.addr).await;
+    let reply = rpc(&mut socket, "server.version", json!({"host":"hung"})).await;
+    assert!(reply["error"].as_str().unwrap().contains("timeout") || reply["error"].as_str().unwrap().contains("unavailable") || reply["error"].as_str().unwrap().contains("closed"), "{reply}");
+    let reply = rpc(&mut socket, "server.version", json!({"host":"live"})).await;
+    assert_eq!(reply["ok"], true, "{reply}");
+}
+
+#[tokio::test]
+async fn hostless_application_error_does_not_failover() {
+    let err_host = spawn_fake_rex_method_app_error("server.version", "not supported").await;
+    let ok_host = spawn_fake_rex(vec![], false).await;
+    let h = start_gateway(&[("aaa-err", &err_host), ("zzz-ok", &ok_host)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("aaa-err", UpstreamState::Online, Some(1), 0).await;
+    h.pool.mark("zzz-ok", UpstreamState::Online, Some(1), 0).await;
+    let mut socket = control_agent(h.addr).await;
+    let reply = rpc(&mut socket, "server.version", json!({})).await;
+    assert_eq!(reply["error"], "not supported", "{reply}");
+}
+
+#[tokio::test]
+async fn hostless_all_transport_failures_aggregate_error() {
+    let a = spawn_fake_rex(vec![], true).await;
+    let b = spawn_fake_rex(vec![], true).await;
+    let h = start_gateway(&[("host-a", &a), ("host-b", &b)], tmo(200), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("host-a", UpstreamState::Online, Some(1), 0).await;
+    h.pool.mark("host-b", UpstreamState::Online, Some(1), 0).await;
+    let mut socket = control_agent(h.addr).await;
+    let reply = rpc(&mut socket, "server.version", json!({})).await;
+    let err = reply["error"].as_str().unwrap();
+    assert!(err.contains("server.version failed on all candidates"), "{reply}");
+    assert!(err.contains("host-a"), "{reply}");
+    assert!(err.contains("host-b"), "{reply}");
+}

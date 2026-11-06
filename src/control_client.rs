@@ -214,9 +214,5 @@ impl ClientMap {
     pub fn get(&self, id: &str) -> Option<Arc<ControlClient>> { self.inner.lock().expect("clients").get(id).cloned() }
     pub fn remove(&self, id: &str) -> Option<Arc<ControlClient>> { self.inner.lock().expect("clients").remove(id) }
     pub fn contains(&self, id: &str) -> bool { self.inner.lock().expect("clients").contains_key(id) }
-    pub fn keys(&self) -> Vec<String> {
-        let mut keys: Vec<_> = self.inner.lock().expect("clients").keys().cloned().collect();
-        keys.sort(); keys
-    }
     pub fn snapshot(&self) -> HashMap<String, Arc<ControlClient>> { self.inner.lock().expect("clients").clone() }
 }

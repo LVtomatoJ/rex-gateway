@@ -98,8 +98,13 @@ impl UpstreamPool {
     pub async fn get(&self, id: &str) -> Option<Upstream> { self.inner.lock().expect("pool mutex").get(id).cloned() }
     /// Hostless non-create default: Manual Online first, then any routable create-eligible by id.
     pub async fn pick_default(&self, acl: &[String]) -> Option<Upstream> {
+        self.pick_default_excluding(acl, &[]).await
+    }
+    /// Like [`pick_default`], but skips host ids in `exclude` (used for hostless transport failover).
+    pub async fn pick_default_excluding(&self, acl: &[String], exclude: &[String]) -> Option<Upstream> {
         let mut candidates: Vec<Upstream> = self.inner.lock().expect("pool mutex").values()
-            .filter(|u| Authenticator::permits(acl, &u.id) && u.accept_creates && u.state.is_routable())
+            .filter(|u| Authenticator::permits(acl, &u.id) && u.accept_creates && u.state.is_routable()
+                && !exclude.iter().any(|id| id == &u.id))
             .cloned().collect();
         candidates.sort_by_key(|u| (u.source != Source::Manual, u.state != UpstreamState::Online, u.id.clone()));
         candidates.into_iter().next()
@@ -405,6 +410,18 @@ mod tests {
         assert_eq!(p.pick_default(&["*".into()]).await.unwrap().id, "local");
         p.mark("local",UpstreamState::Offline,None,0).await;
         assert_eq!(p.pick_default(&["*".into()]).await.unwrap().id, "z-disc");
+    }
+
+    #[tokio::test]
+    async fn pick_default_excluding_skips_tried_hosts() {
+        let p = UpstreamPool::new();
+        p.upsert("aaa", "http://a", Source::Manual).await;
+        p.upsert("zzz", "http://z", Source::Manual).await;
+        p.mark("aaa", UpstreamState::Online, Some(1), 0).await;
+        p.mark("zzz", UpstreamState::Online, Some(1), 0).await;
+        assert_eq!(p.pick_default(&["*".into()]).await.unwrap().id, "aaa");
+        assert_eq!(p.pick_default_excluding(&["*".into()], &["aaa".into()]).await.unwrap().id, "zzz");
+        assert!(p.pick_default_excluding(&["*".into()], &["aaa".into(), "zzz".into()]).await.is_none());
     }
 
     #[tokio::test]

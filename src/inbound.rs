@@ -140,7 +140,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":14});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":15});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -225,14 +225,9 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
             Some(host) => host,
             None => {
                 if method != "session.create" {
-                    // Legacy single-upstream shortcut, else Manual/Online default (discovery may add many).
-                    let ids = state.clients.keys();
-                    if ids.len() == 1 {
-                        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-                        return dispatch_sole_client(state, acl, &id_refs, method, payload, owner).await;
-                    }
-                    let upstream = state.pool.pick_default(acl).await.ok_or_else(|| "no routable upstream".to_owned())?;
-                    upstream.id
+                    // Hostless non-create (e.g. server.version): Manual/Online default with
+                    // transport-error failover across candidates (same policy as create).
+                    return hostless_with_failover(state, acl, owner, method, payload).await;
                 } else {
                     return create_with_failover(state, acl, owner, prefs, payload).await;
                 }
@@ -343,16 +338,63 @@ async fn create_with_failover(
     }
 }
 
-async fn dispatch_sole_client(state: &AppState, acl: &[String], ids: &[&str], method: &str, payload: Value, owner: &str) -> Result<Value, String> {
-    if let [id] = ids {
-        if !auth::Authenticator::permits(acl, id) { return Err(format!("upstream {id} is not allowed")); }
-        let upstream = state.pool.get(id).await.ok_or_else(|| format!("upstream {id} is unknown"))?;
-        if !upstream.state.is_routable() { return Err(format!("upstream {id} is {}; the owning upstream is unavailable", upstream.state.as_str())); }
-                let mut response = state.clients.get(*id).ok_or("upstream client missing")?.call(method, payload).await.map_err(|e| e.to_string())?;
-        namespace_and_record(&mut response, id, &state.tickets, owner, &state.sessions);
-        return Ok(response);
+/// Hostless non-create RPCs (`server.version`, …): try `pick_default` candidates in order.
+/// Transport failures mark the upstream and retry the next candidate (already-tried ids are
+/// excluded for this request only). Application-level `{"error":…}` responses and hard `host`
+/// pins do not failover (pin stays single-shot in [`handle`]).
+async fn hostless_with_failover(
+    state: &AppState,
+    acl: &[String],
+    owner: &str,
+    method: &str,
+    mut payload: Value,
+) -> Result<Value, String> {
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("host");
+        object.remove("prefer_tags");
+        object.remove("avoid_tags");
+        object.remove("prefer_hosts");
+        object.remove("avoid_hosts");
     }
-    Err("no routable upstream".into())
+    let mut tried: Vec<(String, String)> = Vec::new();
+    loop {
+        let exclude: Vec<String> = tried.iter().map(|(id, _)| id.clone()).collect();
+        let picked = if exclude.is_empty() {
+            state.pool.pick_default(acl).await
+        } else {
+            state.pool.pick_default_excluding(acl, &exclude).await
+        };
+        let Some(upstream) = picked else {
+            if tried.is_empty() {
+                return Err("no routable upstream".into());
+            }
+            let detail = tried
+                .iter()
+                .map(|(id, err)| format!("{id}: {err}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            return Err(format!("{method} failed on all candidates: {detail}"));
+        };
+        let id = upstream.id.clone();
+        let call = match state.clients.get(&id) {
+            Some(client) => client.call(method, payload.clone()).await.map_err(|e| e.to_string()),
+            None => Err("upstream client missing".into()),
+        };
+        match call {
+            Ok(mut response) => {
+                if response.get("error").is_some() {
+                    // Application error: do not failover (parity with session.create).
+                    return Ok(response);
+                }
+                namespace_and_record(&mut response, &id, &state.tickets, owner, &state.sessions);
+                return Ok(response);
+            }
+            Err(err) => {
+                let _ = state.pool.mark_failure(&id, err.clone()).await;
+                tried.push((id, err));
+            }
+        }
+    }
 }
 
 fn string_list(payload: &Value, field: &str) -> Option<Vec<String>> {
