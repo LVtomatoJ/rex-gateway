@@ -24,7 +24,7 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
-  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 14).
+  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 15).
 * `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
   namespaced IDs in sorted upstream-ID order. Upstreams that are not routable (`Online` or
   `Degraded`), or that error or time out, are skipped and reported: the response then also carries
@@ -51,11 +51,15 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
   create errors (`{"error":…}` from Rex) and hard `host` pins do **not** failover. When
   every candidate fails with a transport error the agent sees
   `session.create failed on all candidates: id: reason; …`.
+* Other hostless methods (no `session_id`, no hard `host` — e.g. `server.version`) use the
+  same transport-error failover: candidates are tried in `pick_default` order (Manual Online
+  first, then any routable create-eligible by id). Already-tried ids are excluded for that
+  request only; the failed upstream is marked. Application-level `{"error":…}` and hard
+  `host` pins do **not** failover. Exhaustion surfaces as
+  `{method} failed on all candidates: id: reason; …`.
 * Startup never needs an upstream: control clients connect lazily on their first call (the probe loop
   makes it) and reconnect after socket loss, with exponential backoff after failed connects
-  (200 ms doubling to 5 s; calls fail fast with `retry in N ms` meanwhile). Other hostless
-  upstream methods use the sole client when only one exists; with multiple upstreams
-  they default to a routable Manual host (else first Online create-eligible by id). Upstreams start
+  (200 ms doubling to 5 s; calls fail fast with `retry in N ms` meanwhile). Upstreams start
   `Unknown` and the probe loop (concurrent per upstream) promotes them to `Online` once reachable.
 * Agent requests are read serially; upstream calls use a single actor-owned WebSocket,
   ID to oneshot map, and support concurrent callers; each call is bounded by
@@ -266,7 +270,8 @@ across ticks forever; nonzero exit / bad JSON leave the pool unchanged and log a
 Discovered ids are sanitized from `name`; `addr` keeps its scheme or defaults to `https`.
 `source` becomes `Tailnet` or `Lan` (shown on `/status`). **Manual upstreams are never
 overwritten or deleted** when a discovered name collides. Hostless RPCs / `pick_default`
-still prefer a Manual Online upstream over discovered peers, so command-filled hosts do
+still prefer a Manual Online upstream over discovered peers (and failover across that
+ordered candidate list on transport errors), so command-filled hosts do
 not steal default routing from an explicit Manual entry.
 
 Reconciliation: a discovered host that disappears from the snapshot is **removed when idle**
