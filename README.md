@@ -24,7 +24,7 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
-  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 15).
+  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 16).
 * `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
   namespaced IDs in sorted upstream-ID order. Upstreams that are not routable (`Online` or
   `Degraded`), or that error or time out, are skipped and reported: the response then also carries
@@ -50,13 +50,16 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
   tried (already-tried host ids are excluded for that request only). Application-level
   create errors (`{"error":…}` from Rex) and hard `host` pins do **not** failover. When
   every candidate fails with a transport error the agent sees
-  `session.create failed on all candidates: id: reason; …`.
+  `session.create failed on all candidates: id: reason; …`. Each transport hop and
+  exhaustion are counted on `/status` (`create_transport_failovers` /
+  `create_failover_exhausted`).
 * Other hostless methods (no `session_id`, no hard `host` — e.g. `server.version`) use the
   same transport-error failover: candidates are tried in `pick_default` order (Manual Online
   first, then any routable create-eligible by id). Already-tried ids are excluded for that
   request only; the failed upstream is marked. Application-level `{"error":…}` and hard
   `host` pins do **not** failover. Exhaustion surfaces as
-  `{method} failed on all candidates: id: reason; …`.
+  `{method} failed on all candidates: id: reason; …`. Hops and exhaustion are counted
+  on `/status` (`hostless_transport_failovers` / `hostless_failover_exhausted`).
 * Startup never needs an upstream: control clients connect lazily on their first call (the probe loop
   makes it) and reconnect after socket loss, with exponential backoff after failed connects
   (200 ms doubling to 5 s; calls fail fast with `retry in N ms` meanwhile). Upstreams start
@@ -205,7 +208,9 @@ least-recently-active capacity cleanup, manual deletion, and the data-plane clos
   ],
   "counters": {
     "pending_tickets":0,"active_control_connections":1,"active_data_streams":0,
-    "tickets_issued":5,"tickets_consumed":4,"tickets_expired":1,"tickets_evicted":0
+    "tickets_issued":5,"tickets_consumed":4,"tickets_expired":1,"tickets_evicted":0,
+    "create_transport_failovers":0,"hostless_transport_failovers":0,
+    "create_failover_exhausted":0,"hostless_failover_exhausted":0
   },
   "discovery": {
     "enabled":true,"mode":"command","last_success_age_ms":1234,"last_error":null,
@@ -220,6 +225,12 @@ stripped (and also removed from `last_error` text). `upstreams` lists only upstr
 (null if the last probe failed or none ran); `last_error` is the most recent probe error and is
 cleared by the next successful probe. `counters` are gateway-wide (not ACL-filtered), totals since
 start; `tickets_expired` counts TTL expiries, `tickets_evicted` capacity evictions.
+Hostless transport-failover activity is also counted: `create_transport_failovers` /
+`hostless_transport_failovers` increment once per tried upstream that failed with a
+transport error (each hop / retry trigger); `create_failover_exhausted` /
+`hostless_failover_exhausted` increment when every candidate fails and the agent sees
+the aggregate `… failed on all candidates: …` error. Application-level errors and hard
+`host` pins do not touch these counters.
 `discovery` reports whether pool fill is configured (`enabled`/`mode` = `command`|`file`|`none`),
 ages since last success/error (`null` if never), whether the last refresh applied a snapshot
 (`last_applied`), and `refresh_count` / `error_count` since process start. When discovery is
