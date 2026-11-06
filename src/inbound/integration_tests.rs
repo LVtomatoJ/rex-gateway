@@ -99,7 +99,7 @@ async fn start_gateway_with_limits(upstreams: &[(&str, &str)], call_timeout: Dur
         ]))),
         tickets: TicketMap::new(Duration::from_secs(30), 16, metrics.clone()),
         metrics,
-        options: Options { data_connect_timeout: data_timeout, ping_interval, idle_timeout, max_data_streams, max_data_streams_per_token },
+        options: Options { data_connect_timeout: data_timeout, ping_interval, idle_timeout, max_data_streams, max_data_streams_per_token, create_reservation_ttl: Duration::from_secs(5) },
         data_limiter: DataLimiter::new(),
         events,
     };
@@ -606,4 +606,34 @@ async fn data_plane_unexpected_upstream_drop_closes_agent_1011() {
         }
     };
     assert_eq!((u16::from(close.code), close.reason.as_ref()), (1011, "upstream closed"));
+}
+
+
+#[tokio::test]
+async fn capability_tags_create_routing_bootstrap_and_owner_degradation() {
+    let low=spawn_fake_rex(vec![],false).await;
+    let busy=spawn_fake_rex(vec![json!({"session_id":"session:busy"})],false).await;
+    let h=start_gateway(&[("low",&low),("busy",&busy)],tmo(500),Duration::from_secs(3600),tmo(300)).await;
+    h.pool.upsert_with_metadata("low",&low,Source::Manual,vec!["perf".into()],Some("compile box".into())).await;
+    h.pool.upsert_with_metadata("busy",&busy,Source::Manual,vec!["perf".into(),"prod-svc".into()],None).await;
+    h.pool.mark("low",UpstreamState::Online,Some(5),1).await;
+    h.pool.mark("busy",UpstreamState::Online,Some(1),0).await;
+    let mut socket=control_agent(h.addr).await;
+    let reply=rpc(&mut socket,"session.create",json!({"prefer_tags":["perf"],"avoid_tags":["prod-svc"]})).await;
+    assert_eq!(reply["session_id"],"low:session:created");
+    let reply=rpc(&mut socket,"session.create",json!({"prefer_tags":["macos"]})).await;
+    assert!(reply["error"].as_str().unwrap().contains("change tag requirements"));
+    let reply=rpc(&mut socket,"session.bootstrap",json!({"session_id":"busy:session:busy"})).await;
+    assert_eq!(reply["upstream"]["id"],"busy");
+    assert_eq!(reply["upstreams"][1]["tags"],json!(["perf"]));
+    assert_eq!(reply["upstreams"][1]["description"],"compile box");
+    assert!(reply["upstreams"][1]["session_count"].is_u64());
+    h.pool.mark("busy",UpstreamState::Offline,None,0).await;
+    let reply=rpc(&mut socket,"session.bootstrap",json!({"session_id":"busy:session:busy"})).await;
+    assert!(reply["error"].as_str().unwrap().contains("remove/recreate"));
+    let reply=rpc(&mut socket,"session.list",json!({})).await;
+    assert_eq!(ids(&reply),Vec::<String>::new()); // no sessions on low, old session is not hidden by avoid/tags
+    h.pool.mark("low",UpstreamState::Degraded,Some(5),1).await;
+    let reply=rpc(&mut socket,"session.create",json!({"host":"low","avoid_tags":["perf"],"prefer_tags":["macos"]})).await;
+    assert_eq!(reply["session_id"],"low:session:created", "explicit host pin wins over tag constraints");
 }

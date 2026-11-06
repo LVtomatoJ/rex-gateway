@@ -1,3 +1,4 @@
+#[cfg(test)]
 use std::collections::HashMap;
 use sha2::{Digest, Sha256};
 
@@ -20,19 +21,34 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// Configured tokens are stored only as SHA-256 digests. A presented token is hashed (so the
 /// compared values always have the same length, hiding token length) and compared against
 /// *every* configured digest in constant time, with no early exit on the first match.
-pub struct Authenticator { tokens: Vec<(Digest32, Vec<String>)> }
+#[derive(Clone)]
+pub struct TokenEntry { pub token: String, pub acl: Vec<String>, pub prefer_tags: Vec<String>, pub avoid_tags: Vec<String> }
+#[derive(Clone)]
+pub struct Identity { pub acl: Vec<String>, pub prefer_tags: Vec<String>, pub avoid_tags: Vec<String> }
+pub struct Authenticator { tokens: Vec<(Digest32, Identity)> }
 
 impl Authenticator {
+    #[cfg(test)]
     pub fn new(tokens: HashMap<String, Vec<String>>) -> Self {
-        Self { tokens: tokens.into_iter().map(|(token, acl)| (digest(token.as_bytes()), acl)).collect() }
+        Self::from_entries(tokens.into_iter().map(|(token, acl)| TokenEntry { token, acl, prefer_tags: Vec::new(), avoid_tags: Vec::new() }).collect())
+    }
+    pub fn from_entries(tokens: Vec<TokenEntry>) -> Self {
+        Self { tokens: tokens.into_iter().map(|entry| (digest(entry.token.as_bytes()), Identity { acl: entry.acl, prefer_tags: entry.prefer_tags, avoid_tags: entry.avoid_tags })).collect() }
     }
 
     pub fn acl(&self, bearer: Option<&str>) -> Option<Vec<String>> {
         let presented = digest(bearer?.strip_prefix("Bearer ")?.as_bytes());
         let mut found: Option<&Vec<String>> = None;
-        for (stored, acl) in &self.tokens {
-            if ct_eq(stored, &presented) { found = Some(acl); }
+        for (stored, identity) in &self.tokens {
+            if ct_eq(stored, &presented) { found = Some(&identity.acl); }
         }
+        found.cloned()
+    }
+
+    pub fn identify(&self, bearer: Option<&str>) -> Option<Identity> {
+        let presented = digest(bearer?.strip_prefix("Bearer ")?.as_bytes());
+        let mut found: Option<&Identity> = None;
+        for (stored, identity) in &self.tokens { if ct_eq(stored, &presented) { found = Some(identity); } }
         found.cloned()
     }
 

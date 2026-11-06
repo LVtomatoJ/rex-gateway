@@ -1,4 +1,4 @@
-use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf};
+use std::{env, net::SocketAddr, path::PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
@@ -36,16 +36,29 @@ pub struct Config {
     /// Maximum concurrently bridged data streams for one bearer token.
     #[serde(default = "default_max_data_per_token")]
     pub max_data_streams_per_token: usize,
+    /// Time an upstream selected for session.create carries one extra reservation.
+    #[serde(default = "default_reservation_ttl")]
+    pub create_reservation_ttl_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct UpstreamConfig { pub id: String, pub url: String }
+pub struct UpstreamConfig {
+    pub id: String,
+    pub url: String,
+    #[serde(default)] pub tags: Vec<String>,
+    pub description: Option<String>,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthConfig { pub tokens: Vec<TokenConfig> }
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct TokenConfig { pub token: String, pub allow: Vec<String> }
+pub struct TokenConfig {
+    pub token: String,
+    pub allow: Vec<String>,
+    #[serde(default)] pub prefer_tags: Vec<String>,
+    #[serde(default)] pub avoid_tags: Vec<String>,
+}
 
 fn default_listen() -> SocketAddr { "127.0.0.1:7300".parse().unwrap() }
 fn default_probe() -> u64 { 10_000 }
@@ -57,6 +70,7 @@ fn default_ping_interval() -> u64 { 20_000 }
 fn default_idle_timeout() -> u64 { 120_000 }
 fn default_max_data() -> usize { 128 }
 fn default_max_data_per_token() -> usize { 32 }
+fn default_reservation_ttl() -> u64 { 5_000 }
 
 impl Config {
     pub fn load() -> Result<Self> {
@@ -78,6 +92,18 @@ impl Config {
         if let Some(v) = env("REX_GATEWAY_WS_IDLE_TIMEOUT_MS") { config.ws_idle_timeout_ms = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_MAX_DATA_STREAMS") { config.max_data_streams = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_MAX_DATA_STREAMS_PER_TOKEN") { config.max_data_streams_per_token = v.parse()?; }
+        if let Some(v) = env("REX_GATEWAY_CREATE_RESERVATION_TTL_MS") { config.create_reservation_ttl_ms = v.parse()?; }
+        // Per-upstream environment keys use the exact ID: REX_GATEWAY_UPSTREAM_<ID>_{TAGS,DESCRIPTION}.
+        // Tags are comma-separated; an unset variable leaves TOML unchanged.
+        for (index, token) in config.auth.tokens.iter_mut().enumerate() {
+            if let Some(v) = env(&format!("REX_GATEWAY_AUTH_TOKEN_{index}_PREFER_TAGS")) { token.prefer_tags = parse_list(&v); }
+            if let Some(v) = env(&format!("REX_GATEWAY_AUTH_TOKEN_{index}_AVOID_TAGS")) { token.avoid_tags = parse_list(&v); }
+        }
+        for upstream in &mut config.upstreams {
+            let prefix = format!("REX_GATEWAY_UPSTREAM_{}", upstream.id);
+            if let Some(v) = env(&format!("{prefix}_TAGS")) { upstream.tags = parse_list(&v); }
+            if let Some(v) = env(&format!("{prefix}_DESCRIPTION")) { upstream.description = Some(v); }
+        }
         if let Some(url) = env("REX_GATEWAY_UPSTREAM_LOCAL_URL") {
             if let Some(upstream) = config.upstreams.iter_mut().find(|u| u.id == "local") { upstream.url = url; }
         }
@@ -88,20 +114,27 @@ impl Config {
         if config.upstream_call_timeout_ms == 0 || config.data_connect_timeout_ms == 0 {
             bail!("upstream_call_timeout_ms and data_connect_timeout_ms must be nonzero");
         }
-        config.auth_map()?;
+        config.auth_entries()?;
+        if config.create_reservation_ttl_ms == 0 { bail!("create_reservation_ttl_ms must be nonzero"); }
         Ok(config)
     }
 
-    pub fn auth_map(&self) -> Result<HashMap<String, Vec<String>>> {
-        let mut result = HashMap::new();
+    pub fn auth_entries(&self) -> Result<Vec<crate::auth::TokenEntry>> {
+        let mut result = Vec::new();
         for item in &self.auth.tokens {
             if item.token.is_empty() || item.allow.is_empty() { bail!("tokens and allow lists must be nonempty"); }
-            if result.insert(item.token.clone(), item.allow.clone()).is_some() { bail!("duplicate auth token"); }
+            if result.iter().any(|entry: &crate::auth::TokenEntry| entry.token == item.token) { bail!("duplicate auth token"); }
+            result.push(crate::auth::TokenEntry {
+                token: item.token.clone(), acl: item.allow.clone(),
+                prefer_tags: item.prefer_tags.clone(), avoid_tags: item.avoid_tags.clone(),
+            });
         }
         if result.is_empty() { bail!("at least one token is required"); }
         Ok(result)
     }
 }
+
+fn parse_list(value: &str) -> Vec<String> { value.split(',').map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned).collect() }
 
 #[cfg(test)]
 mod tests {
@@ -182,5 +215,41 @@ mod data_limit_tests {
         assert_eq!((config.max_data_streams, config.max_data_streams_per_token), (4, 2));
         assert!(Config::from_toml(&format!("max_data_streams=0\n{BASE}"), |_| None).is_err());
         assert!(Config::from_toml(BASE, |k| (k == "REX_GATEWAY_MAX_DATA_STREAMS_PER_TOKEN").then(|| "0".into())).is_err());
+    }
+}
+
+
+#[cfg(test)]
+mod routing_tests {
+    use super::*;
+    const BASE: &str = r#"[[upstreams]]
+id="high-mem"
+url="http://a"
+tags=["perf","prod-svc"]
+description="Heavy compile"
+[[auth.tokens]]
+token="t"
+allow=["*"]
+prefer_tags=["perf"]
+avoid_tags=["clash"]
+"#;
+    #[test]
+    fn metadata_preferences_and_env_overrides() {
+        let c=Config::from_toml(BASE, |_| None).unwrap();
+        assert_eq!(c.upstreams[0].tags, ["perf","prod-svc"]);
+        assert_eq!(c.upstreams[0].description.as_deref(),Some("Heavy compile"));
+        let auth=c.auth_entries().unwrap();
+        assert_eq!(auth[0].prefer_tags,["perf"]); assert_eq!(auth[0].avoid_tags,["clash"]);
+        assert_eq!(c.create_reservation_ttl_ms,5_000);
+        let env=|k:&str| match k {
+            "REX_GATEWAY_UPSTREAM_high-mem_TAGS"=>Some("macos, perf".into()),
+            "REX_GATEWAY_UPSTREAM_high-mem_DESCRIPTION"=>Some("Mac build host".into()),
+            "REX_GATEWAY_CREATE_RESERVATION_TTL_MS"=>Some("250".into()), _=>None
+        };
+        let c=Config::from_toml(BASE,env).unwrap();
+        assert_eq!(c.upstreams[0].tags,["macos","perf"]);
+        assert_eq!(c.upstreams[0].description.as_deref(),Some("Mac build host"));
+        assert_eq!(c.create_reservation_ttl_ms,250);
+        assert!(Config::from_toml("create_reservation_ttl_ms=0\n".to_owned().as_str(), |_| None).is_err());
     }
 }

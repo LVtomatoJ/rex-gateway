@@ -22,7 +22,7 @@ use tokio_tungstenite::{
 
 use crate::{
     auth::{self, Authenticator},
-    pool::UpstreamState,
+    pool::{UpstreamState, TagPreferences},
     control_client::{ControlClient, UpstreamEvent},
     data::{decode_hello, TicketMap},
     metrics::{DataLimiter, Gauge, Metrics},
@@ -55,6 +55,7 @@ pub struct Options {
     pub idle_timeout: Duration,
     pub max_data_streams: usize,
     pub max_data_streams_per_token: usize,
+    pub create_reservation_ttl: Duration,
 }
 
 pub async fn serve(
@@ -101,7 +102,8 @@ fn authenticate(headers: &HeaderMap, state: &AppState, protocol: &str) -> Result
         .map(|v| v.split(',').any(|p| p.trim() == protocol)) == Some(true);
     if !selected { return Err(StatusCode::BAD_REQUEST); }
     let bearer = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or(StatusCode::UNAUTHORIZED)?;
-    let acl = state.auth.acl(Some(bearer)).ok_or(StatusCode::UNAUTHORIZED)?;
+    let identity = state.auth.identify(Some(bearer)).ok_or(StatusCode::UNAUTHORIZED)?;
+    let acl = identity.acl;
     Ok((acl, bearer.to_owned()))
 }
 
@@ -179,11 +181,23 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
 
 async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut payload: Value) -> Result<Value, String> {
     if method == "session.list" { return list_sessions(state, acl).await; }
+    let defaults = state.auth.identify(Some(owner)).unwrap_or(crate::auth::Identity { acl: acl.to_vec(), prefer_tags: Vec::new(), avoid_tags: Vec::new() });
+    let prefs = if method == "session.create" {
+        TagPreferences { prefer: string_list(&payload, "prefer_tags").unwrap_or(defaults.prefer_tags), avoid: string_list(&payload, "avoid_tags").unwrap_or(defaults.avoid_tags) }
+    } else { TagPreferences::default() };
+    let mut reservation = None;
     let owner_upstream = match payload.get("session_id").and_then(Value::as_str).and_then(crate::protocol::unwrap_session_id) {
         Some((upstream, _)) => upstream.to_owned(),
         None => match payload.get("host").and_then(Value::as_str).map(str::to_owned) {
             Some(host) => host,
-            None => state.pool.pick_for_create(acl).await.map(|u| u.id).ok_or("no allowed routable upstream")?,
+            None => {
+                if method != "session.create" {
+                    let ids: Vec<&str> = state.clients.keys().map(String::as_str).collect();
+                    return dispatch_sole_client(state, acl, &ids, method, payload, owner).await;
+                }
+                let (upstream, reserved) = state.pool.reserve_for_create(acl, &prefs, state.options.create_reservation_ttl).await?;
+                reservation = Some(reserved); upstream.id
+            }
         },
     };
     if !auth::Authenticator::permits(acl, &owner_upstream) {
@@ -193,14 +207,22 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
         return Err(format!("upstream {owner_upstream} is unknown"));
     };
     if !upstream.state.is_routable() {
-        return Err(format!("upstream {owner_upstream} is {}", upstream.state.as_str()));
+        return Err(format!("upstream {owner_upstream} is {}; the owning upstream is unavailable, remove/recreate this session", upstream.state.as_str()));
     }
     if payload.get("session_id").is_some() && !translate_session_id(&mut payload, &owner_upstream, false) {
         return Err("invalid or mismatched namespaced session_id".into());
     }
-    if let Some(object) = payload.as_object_mut() { object.remove("host"); }
+    if let Some(object) = payload.as_object_mut() { object.remove("host"); object.remove("prefer_tags"); object.remove("avoid_tags"); }
     let mut response = state.clients.get(&owner_upstream).ok_or("upstream client missing")?
         .call(method, payload).await.map_err(|e| e.to_string())?;
+    if method == "session.create" {
+        if response.get("error").is_some() { return Ok(response); }
+        if let Some(reserved) = reservation.take() { reserved.finish(); }
+    }
+    if method == "session.bootstrap" {
+        response["upstream"] = json!({"id":upstream.id,"tags":upstream.tags,"description":upstream.description,"state":upstream.state.as_str(),"latency_ms":upstream.latency_ms,"session_count":upstream.session_count});
+        response["upstreams"] = Value::Array(state.pool.list_allowed(acl).await.into_iter().map(|u| json!({"id":u.id,"tags":u.tags,"description":u.description,"state":u.state.as_str(),"latency_ms":u.latency_ms,"session_count":u.session_count,"reserved_session_count":u.reserved_sessions,"effective_session_count":u.session_count+u.reserved_sessions})).collect::<Vec<_>>());
+    }
     if method == "data.connect" && response.get("ticket").and_then(Value::as_str).is_none() {
         return Err("upstream data.connect omitted ticket".into());
     }
@@ -212,6 +234,22 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
 /// call timeout). Upstreams that are not Online or that fail are skipped and reported through the
 /// additive `partial` / `failed_upstreams` / `upstream_errors` fields; if every allowed upstream
 /// fails, the request fails.
+async fn dispatch_sole_client(state: &AppState, acl: &[String], ids: &[&str], method: &str, payload: Value, owner: &str) -> Result<Value, String> {
+    if let [id] = ids {
+        if !auth::Authenticator::permits(acl, id) { return Err(format!("upstream {id} is not allowed")); }
+        let upstream = state.pool.get(id).await.ok_or_else(|| format!("upstream {id} is unknown"))?;
+        if !upstream.state.is_routable() { return Err(format!("upstream {id} is {}; the owning upstream is unavailable", upstream.state.as_str())); }
+                let mut response = state.clients.get(*id).ok_or("upstream client missing")?.call(method, payload).await.map_err(|e| e.to_string())?;
+        namespace_response(&mut response, id, &state.tickets, owner);
+        return Ok(response);
+    }
+    Err("no routable upstream".into())
+}
+
+fn string_list(payload: &Value, field: &str) -> Option<Vec<String>> {
+    payload.get(field).and_then(Value::as_array).map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+}
+
 async fn list_sessions(state: &AppState, acl: &[String]) -> Result<Value, String> {
     let allowed = state.pool.list_allowed(acl).await;
     let results = futures_util::future::join_all(allowed.iter().map(|upstream| async move {
@@ -421,7 +459,7 @@ mod tests {
             ("onlyb".to_owned(), vec!["b".to_owned()]),
         ])));
         let tickets = TicketMap::new(Duration::from_secs(30), 16, metrics.clone());
-        let state = AppState { pool, clients: Arc::new(HashMap::new()), auth, tickets, metrics, data_limiter: DataLimiter::new(), options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120), max_data_streams: 128, max_data_streams_per_token: 32 }, events: broadcast::channel(8).0 };
+        let state = AppState { pool, clients: Arc::new(HashMap::new()), auth, tickets, metrics, data_limiter: DataLimiter::new(), options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120), max_data_streams: 128, max_data_streams_per_token: 32, create_reservation_ttl: Duration::from_secs(5) }, events: broadcast::channel(8).0 };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router(state.clone());

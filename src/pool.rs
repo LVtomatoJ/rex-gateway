@@ -1,109 +1,132 @@
-use std::{cmp::Ordering, collections::HashMap, sync::Arc, time::Instant};
-use tokio::sync::RwLock;
+use std::{collections::HashMap, sync::{Arc,Mutex}, time::{Duration, Instant}};
+
 use crate::auth::Authenticator;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamState { Unknown, Online, Degraded, Offline }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Tailnet and Lan are reserved for discovery, not static configuration.
+#[allow(dead_code)] // Reserved for rex-discover discovery.
 pub enum Source { Manual, Tailnet, Lan }
 #[derive(Debug, Clone)]
 pub struct Upstream {
     pub id: String, pub url: String, pub source: Source, pub state: UpstreamState,
     pub latency_ms: Option<u64>, pub session_count: usize, pub last_probe: Option<Instant>,
     pub consecutive_failures: u32, pub last_error: Option<String>,
+    pub tags: Vec<String>, pub description: Option<String>,
+    /// Number of recent selects whose create has not completed (or whose TTL has not expired).
+    pub reserved_sessions: usize,
+    #[doc(hidden)] pub reservations: Vec<Instant>,
 }
-impl UpstreamState {
-    pub fn as_str(self) -> &'static str {
-        match self { Self::Unknown => "Unknown", Self::Online => "Online", Self::Degraded => "Degraded", Self::Offline => "Offline" }
-    }
-    /// Online and Degraded are eligible for create / default routing (Degraded is lower priority).
-    pub fn is_routable(self) -> bool {
-        matches!(self, Self::Online | Self::Degraded)
-    }
-}
-impl Source {
-    pub fn as_str(self) -> &'static str {
-        match self { Self::Manual => "Manual", Self::Tailnet => "Tailnet", Self::Lan => "Lan" }
-    }
-}
-pub const OFFLINE_AFTER: u32 = 2;
-#[derive(Clone)]
-pub struct UpstreamPool { inner: Arc<RwLock<HashMap<String, Upstream>>> }
 
-/// Least sessions, then lowest known latency (`None` after `Some`), then id ascending.
-fn cmp_create_preference(a: &Upstream, b: &Upstream) -> Ordering {
-    a.session_count.cmp(&b.session_count)
-        .then_with(|| match (a.latency_ms, b.latency_ms) {
-            (Some(x), Some(y)) => x.cmp(&y),
-            (Some(_), None) => Ordering::Less,
-            (None, Some(_)) => Ordering::Greater,
-            (None, None) => Ordering::Equal,
-        })
-        .then_with(|| a.id.cmp(&b.id))
+#[derive(Debug, Clone, Default)]
+pub struct TagPreferences { pub prefer: Vec<String>, pub avoid: Vec<String> }
+#[cfg_attr(test, derive(Debug))]
+pub struct Reservation { pool: UpstreamPool, id: String, expires: Instant, active: bool }
+impl Reservation {
+    /// Confirm immediately after create returns. The normal probe observes the real session.
+    pub fn finish(mut self) { if self.active { self.pool.release_expired_sync(&self.id, self.expires); self.active = false; } }
 }
+impl Drop for Reservation { fn drop(&mut self) { if self.active { self.pool.release_expired_sync(&self.id, self.expires); self.active = false; } } }
+
+impl UpstreamState {
+    pub fn as_str(self) -> &'static str { match self { Self::Unknown => "Unknown", Self::Online => "Online", Self::Degraded => "Degraded", Self::Offline => "Offline" } }
+    pub fn is_routable(self) -> bool { matches!(self, Self::Online | Self::Degraded) }
+}
+impl Source { pub fn as_str(self) -> &'static str { match self { Self::Manual => "Manual", Self::Tailnet => "Tailnet", Self::Lan => "Lan" } } }
+pub const OFFLINE_AFTER: u32 = 2;
+#[derive(Debug, Clone)]
+pub struct UpstreamPool { inner: Arc<Mutex<HashMap<String, Upstream>>> }
+
+fn effective_load(u: &Upstream) -> usize { u.session_count.saturating_add(u.reserved_sessions) }
+fn latency_key(u: &Upstream) -> u64 { u.latency_ms.unwrap_or(u64::MAX) }
+fn score(u: &Upstream, prefs: &TagPreferences) -> i64 {
+    let matched = prefs.prefer.iter().filter(|tag| u.tags.contains(tag)).count() as i64;
+    let health = if u.state == UpstreamState::Online { 1_000_000 } else { 0 };
+    health + matched * 10_000 - effective_load(u) as i64
+}
+
 
 impl UpstreamPool {
-    pub fn new() -> Self { Self { inner: Arc::new(RwLock::new(HashMap::new())) } }
-    pub async fn upsert(&self, id: &str, url: &str, source: Source) {
-        self.inner.write().await.entry(id.to_owned()).and_modify(|u| { u.url = url.to_owned(); u.source = source; }).or_insert_with(|| Upstream {
+    pub fn new() -> Self { Self { inner: Arc::new(Mutex::new(HashMap::new())) } }
+    pub async fn upsert_with_metadata(&self, id: &str, url: &str, source: Source, tags: Vec<String>, description: Option<String>) {
+        let mut guard = self.inner.lock().expect("pool mutex");
+        let entry = guard.entry(id.to_owned()).or_insert_with(|| Upstream {
             id: id.to_owned(), url: url.to_owned(), source, state: UpstreamState::Unknown,
-            latency_ms: None, session_count: 0, last_probe: None,
-            consecutive_failures: 0, last_error: None,
+            latency_ms: None, session_count: 0, last_probe: None, consecutive_failures: 0,
+            last_error: None, tags: Vec::new(), description: None, reserved_sessions: 0, reservations: Vec::new(),
         });
+        entry.url = url.to_owned(); entry.source = source;
+        entry.tags = tags; entry.description = description;
     }
-    pub async fn get(&self, id: &str) -> Option<Upstream> { self.inner.read().await.get(id).cloned() }
-/// Allowed Online|Degraded upstreams, Online group first then Degraded, each sorted by create preference.
-    pub async fn list_allowed_routable(&self, acl: &[String]) -> Vec<Upstream> {
-        let mut online = Vec::new();
-        let mut degraded = Vec::new();
-        for upstream in self.inner.read().await.values() {
-            if !Authenticator::permits(acl, &upstream.id) { continue; }
-            match upstream.state {
-                UpstreamState::Online => online.push(upstream.clone()),
-                UpstreamState::Degraded => degraded.push(upstream.clone()),
-                _ => {}
-            }
+    pub async fn get(&self, id: &str) -> Option<Upstream> { self.inner.lock().expect("pool mutex").get(id).cloned() }
+    pub async fn reserve_for_create(&self, acl: &[String], prefs: &TagPreferences, ttl: Duration) -> Result<(Upstream, Reservation), String> {
+        let now = Instant::now();
+        let mut guard = self.inner.lock().expect("pool mutex");
+        let allowed: Vec<&Upstream> = guard.values().filter(|u| Authenticator::permits(acl, &u.id)).collect();
+        if allowed.is_empty() { return Err("no allowed upstream".into()); }
+        if !allowed.iter().any(|u| u.state.is_routable()) { return Err("no routable upstream: all allowed upstreams are Offline or Unknown".into()); }
+        if !prefs.prefer.is_empty() && !allowed.iter().any(|u| u.state.is_routable() && prefs.prefer.iter().all(|tag| u.tags.contains(tag))) {
+            return Err(format!("no upstream matches required tags [{}]; change tag requirements or wait for a matching upstream", prefs.prefer.join(",")));
         }
-        online.sort_by(cmp_create_preference);
-        degraded.sort_by(cmp_create_preference);
-        online.extend(degraded);
-        online
+        let mut candidates: Vec<Upstream> = allowed.into_iter().filter(|u| u.state.is_routable()
+            && prefs.prefer.iter().all(|tag| u.tags.contains(tag))
+            && !prefs.avoid.iter().any(|tag| u.tags.contains(tag))).cloned().collect();
+        if candidates.is_empty() { return Err("no upstream matches tags: all matching candidates are excluded by avoid_tags".into()); }
+        for u in &mut candidates { u.reservations.retain(|at| *at > now); u.reserved_sessions = u.reservations.len(); }
+        candidates.sort_by(|a,b| score(b,prefs).cmp(&score(a,prefs)).then_with(|| latency_key(a).cmp(&latency_key(b))).then_with(|| a.id.cmp(&b.id)));
+        let selected = candidates.remove(0);
+        let expires = now + ttl;
+        let upstream = guard.get_mut(&selected.id).expect("selected while locked");
+        upstream.reservations.retain(|at| *at > now);
+        upstream.reservations.push(expires); upstream.reserved_sessions = upstream.reservations.len();
+        drop(guard);
+        let reservation = Reservation { pool: self.clone(), id: selected.id.clone(), expires, active: true };
+        Ok((selected, reservation))
     }
-    /// Pick an upstream for `session.create` / hostless default routing:
-    /// prefer allowed Online (least `session_count`, then lowest `latency_ms`, then `id`);
-    /// if none, the same order among allowed Degraded.
-    pub async fn pick_for_create(&self, acl: &[String]) -> Option<Upstream> {
-        self.list_allowed_routable(acl).await.into_iter().next()
+    fn release_expired_sync(&self, id: &str, expires: Instant) {
+        let mut guard = self.inner.lock().expect("pool mutex");
+        if let Some(u) = guard.get_mut(id) {
+            if let Some(at) = u.reservations.iter().position(|at| *at == expires) { u.reservations.remove(at); }
+            u.reserved_sessions = u.reservations.len();
+        }
     }
-    /// All upstreams the ACL permits, in any state, sorted by id (for `/status`).
+    /// Fallback expiry (also ensures a contended Drop cannot leak a reservation).
+    pub async fn reap_reservations(&self) {
+        let now = Instant::now();
+        for u in self.inner.lock().expect("pool mutex").values_mut() { u.reservations.retain(|at| *at > now); u.reserved_sessions = u.reservations.len(); }
+    }
     pub async fn list_allowed(&self, acl: &[String]) -> Vec<Upstream> {
-        let mut result: Vec<_> = self.inner.read().await.values().filter(|u| Authenticator::permits(acl, &u.id)).cloned().collect();
+        self.reap_reservations().await;
+        let mut result: Vec<_> = self.inner.lock().expect("pool mutex").values().filter(|u| Authenticator::permits(acl, &u.id)).cloned().collect();
         result.sort_by(|a,b| a.id.cmp(&b.id)); result
     }
-    /// Records a completed probe that reached the upstream. Resets the failure streak and
-    /// stores `error` only for soft problems (e.g. a malformed reply) that still count as reachable.
-    #[cfg(test)]
-    pub async fn mark(&self, id: &str, state: UpstreamState, latency: Option<u64>, count: usize) {
-        self.mark_with_error(id, state, latency, count, None).await
-    }
+
+
     pub async fn mark_with_error(&self, id: &str, state: UpstreamState, latency: Option<u64>, count: usize, error: Option<String>) {
-        if let Some(upstream) = self.inner.write().await.get_mut(id) {
-            upstream.state = state; upstream.latency_ms = latency; upstream.session_count = count; upstream.last_probe = Some(Instant::now());
-            upstream.consecutive_failures = 0; upstream.last_error = error;
+        if let Some(upstream) = self.inner.lock().expect("pool mutex").get_mut(id) {
+            upstream.state=state; upstream.latency_ms=latency; upstream.session_count=count; upstream.last_probe=Some(Instant::now());
+            upstream.consecutive_failures=0; upstream.last_error=error;
         }
     }
-    /// Records a failed probe: bumps the failure streak and stores the error. First failure =
-    /// Degraded, `OFFLINE_AFTER` consecutive failures = Offline. Returns the new streak.
     pub async fn mark_failure(&self, id: &str, error: String) -> u32 {
-        let mut guard = self.inner.write().await;
-        let Some(upstream) = guard.get_mut(id) else { return 0 };
-        upstream.consecutive_failures += 1;
-        upstream.state = if upstream.consecutive_failures >= OFFLINE_AFTER { UpstreamState::Offline } else { UpstreamState::Degraded };
-        upstream.latency_ms = None; upstream.session_count = 0; upstream.last_probe = Some(Instant::now());
-        upstream.last_error = Some(error);
+        let mut guard=self.inner.lock().expect("pool mutex");
+        let Some(upstream)=guard.get_mut(id) else { return 0 };
+        upstream.consecutive_failures+=1;
+        upstream.state=if upstream.consecutive_failures>=OFFLINE_AFTER { UpstreamState::Offline } else { UpstreamState::Degraded };
+        upstream.latency_ms=None; upstream.session_count=0; upstream.last_probe=Some(Instant::now()); upstream.last_error=Some(error);
         upstream.consecutive_failures
     }
+}
+
+#[cfg(test)]
+impl UpstreamPool {
+    pub async fn upsert(&self,id:&str,url:&str,source:Source){self.upsert_with_metadata(id,url,source,Vec::new(),None).await;}
+    pub async fn list_allowed_routable(&self, acl:&[String])->Vec<Upstream>{
+        let mut result:Vec<_>=self.inner.lock().expect("pool mutex").values().filter(|u|Authenticator::permits(acl,&u.id)&&u.state.is_routable()).cloned().collect();
+        result.sort_by_key(|u|(u.state!=UpstreamState::Online,u.id.clone()));result
+    }
+    pub async fn pick_for_create(&self,acl:&[String])->Option<Upstream>{self.reserve_for_create(acl,&TagPreferences::default(),Duration::from_secs(5)).await.ok().map(|(u,_)|u)}
+    pub async fn mark(&self,id:&str,state:UpstreamState,latency:Option<u64>,count:usize){self.mark_with_error(id,state,latency,count,None).await;}
 }
 
 #[cfg(test)]
@@ -113,10 +136,10 @@ mod tests {
     async fn state_transitions_and_acl() {
         let pool = UpstreamPool::new(); pool.upsert("a", "http://a", Source::Manual).await;
         pool.upsert("b", "http://b", Source::Lan).await;
-        assert_eq!(pool.inner.read().await["a"].state, UpstreamState::Unknown);
+        assert_eq!(pool.inner.lock().expect("pool mutex")["a"].state, UpstreamState::Unknown);
         for (state, latency, count) in [(UpstreamState::Degraded,Some(600),0),(UpstreamState::Online,Some(10),2),(UpstreamState::Offline,None,0)] {
             pool.mark("a",state,latency,count).await;
-            let u=pool.inner.read().await["a"].clone();
+            let u=pool.inner.lock().expect("pool mutex")["a"].clone();
             assert_eq!(u.state,state); assert_eq!(u.latency_ms,latency); assert_eq!(u.session_count,count); assert!(u.last_probe.is_some());
         }
         pool.mark("a", UpstreamState::Online, Some(10),2).await; pool.mark("b", UpstreamState::Online,Some(20),1).await;
@@ -207,5 +230,57 @@ mod tests {
         pool.mark("x", UpstreamState::Offline, None, 0).await;
         let ids: Vec<_> = pool.list_allowed_routable(&["*".into()]).await.into_iter().map(|u| u.id).collect();
         assert_eq!(ids, ["o", "d"]);
+    }
+
+    async fn tagged_pool() -> UpstreamPool {
+        let pool=UpstreamPool::new();
+        pool.upsert_with_metadata("perf-a","http://a",Source::Manual,vec!["perf".into()],Some("fast a".into())).await;
+        pool.upsert_with_metadata("perf-b","http://b",Source::Manual,vec!["perf".into(),"prod-svc".into()],None).await;
+        pool.upsert_with_metadata("mac","http://c",Source::Manual,vec!["macos".into()],None).await;
+        pool.upsert_with_metadata("plain","http://d",Source::Manual,Vec::new(),None).await;
+        pool
+    }
+    #[tokio::test]
+    async fn tags_match_exclude_and_never_downgrade() {
+        let p=tagged_pool().await;
+        for id in ["perf-a","perf-b","mac","plain"] { p.mark(id,UpstreamState::Online,Some(1),0).await; }
+        let (u,r)=p.reserve_for_create(&["*".into()],&TagPreferences { prefer:vec!["perf".into()],avoid:vec!["prod-svc".into()] },Duration::from_secs(1)).await.unwrap();
+        assert_eq!(u.id,"perf-a"); r.finish();
+        let e=p.reserve_for_create(&["*".into()],&TagPreferences { prefer:vec!["nonexistent".into()],avoid:vec![] },Duration::from_secs(1)).await.unwrap_err();
+        assert!(e.contains("change tag requirements"),"{e}");
+        p.mark("mac",UpstreamState::Offline,None,0).await;
+        let e=p.reserve_for_create(&["*".into()],&TagPreferences { prefer:vec!["macos".into()],avoid:vec![] },Duration::from_secs(1)).await.unwrap_err();
+        assert!(e.contains("required tags"),"{e}");
+    }
+    #[tokio::test]
+    async fn all_avoided_and_all_unavailable_fail_clearly() {
+        let p=tagged_pool().await;
+        for id in ["perf-a","perf-b","mac","plain"] { p.mark(id,UpstreamState::Online,Some(1),0).await; }
+        let e=p.reserve_for_create(&["*".into()],&TagPreferences { prefer:vec![],avoid:vec!["perf".into(),"macos".into()] },Duration::from_secs(1)).await;
+        assert_eq!(e.unwrap().0.id,"plain");
+        let e=p.reserve_for_create(&["perf-a".into(),"perf-b".into()],&TagPreferences { prefer:vec![],avoid:vec!["perf".into()] },Duration::from_secs(1)).await.unwrap_err();
+        assert!(e.contains("avoid_tags"),"{e}");
+        p.mark("plain",UpstreamState::Unknown,None,0).await;
+        let e=p.reserve_for_create(&["plain".into()],&TagPreferences::default(),Duration::from_secs(1)).await.unwrap_err();
+        assert!(e.contains("no routable upstream"),"{e}");
+    }
+    #[tokio::test]
+    async fn concurrent_reservations_never_stick_to_one_idle_host() {
+        let p=UpstreamPool::new();
+        p.upsert("a","http://a",Source::Manual).await;p.upsert("b","http://b",Source::Manual).await;
+        p.mark("a",UpstreamState::Online,Some(1),0).await;p.mark("b",UpstreamState::Online,Some(1),0).await;
+        let mut held=Vec::new();
+        for _ in 0..64 { held.push(p.reserve_for_create(&["*".into()],&TagPreferences::default(),Duration::from_secs(2)).await.unwrap()); }
+        assert_eq!(p.get("a").await.unwrap().reserved_sessions,32);
+        assert_eq!(p.get("b").await.unwrap().reserved_sessions,32);
+        drop(held);
+        assert_eq!(p.get("a").await.unwrap().reserved_sessions,0);
+        let (_u,held)=p.reserve_for_create(&["*".into()],&TagPreferences::default(),Duration::from_millis(5)).await.unwrap();
+        drop(held); // finish releases early
+        assert_eq!(p.get("a").await.unwrap().reserved_sessions,0);
+        let (_u, _reservation)=p.reserve_for_create(&["*".into()],&TagPreferences::default(),Duration::from_millis(2)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        p.reap_reservations().await; // TTL reaps a reservation whose guard was leaked
+        assert_eq!(p.get("a").await.unwrap().reserved_sessions,0);
     }
 }

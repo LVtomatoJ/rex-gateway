@@ -30,6 +30,10 @@ pub fn build(upstreams: &[Upstream], pending_tickets: usize, counters: MetricsSn
             "last_error": u.last_error.as_ref().map(|e| e.replace(&u.url, &redact_url(&u.url))),
             "last_probe_age_ms": u.last_probe.map(|t| now.saturating_duration_since(t).as_millis() as u64),
             "session_count": u.session_count,
+            "reserved_session_count": u.reserved_sessions,
+            "effective_session_count": u.session_count + u.reserved_sessions,
+            "tags": u.tags,
+            "description": u.description,
         })).collect::<Vec<_>>(),
         "counters": {
             "pending_tickets": pending_tickets,
