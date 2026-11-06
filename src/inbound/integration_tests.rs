@@ -318,7 +318,12 @@ async fn data_bridges_send_pings_and_propagate_upstream_close() {
     tokio::spawn(async move {
         let (stream,_)=listener.accept().await.unwrap();
         let mut upstream=accept_hdr_async(stream,|_:&Request,mut response:Response| { response.headers_mut().insert("sec-websocket-protocol",HeaderValue::from_static(DATA_SUBPROTOCOL)); Ok(response) }).await.unwrap();
-        let _hello=upstream.next().await;
+        loop {
+            match tokio::time::timeout(Duration::from_secs(1),upstream.next()).await.unwrap().unwrap().unwrap() {
+                tungstenite::Message::Binary(hello) if hello.len()==17 && hello[0]==1 => break,
+                _=>continue,
+            }
+        }
         upstream.send(tungstenite::Message::Binary(vec![0x81].into())).await.unwrap();
         while let Some(Ok(frame))=tokio::time::timeout(Duration::from_secs(1),upstream.next()).await.unwrap() {
             match frame {
@@ -353,16 +358,75 @@ async fn data_bridges_send_pings_and_propagate_upstream_close() {
 }
 
 #[tokio::test]
-async fn pong_responsive_control_agent_stays_connected() {
+async fn idle_control_connections_ping_then_close_1001() {
     let good=spawn_fake_rex(vec![],false).await;
-    let h=start_gateway_with_keepalive(&[("good",&good)],tmo(300),Duration::from_secs(3600),tmo(300),tmo(20),tmo(100)).await;
+    // Application-idle (not pong-idle): keepalive pings still flow, but with no RPC the agent is closed.
+    let h=start_gateway_with_keepalive(&[("good",&good)],tmo(300),Duration::from_secs(3600),tmo(300),tmo(30),tmo(120)).await;
     let mut socket=control_agent(h.addr).await;
-    while let Some(Ok(frame))=tokio::time::timeout(tmo(300),socket.next()).await.unwrap() {
-        match frame {
-            tungstenite::Message::Ping(_)=>{},
-            tungstenite::Message::Close(frame)=>{ let frame=frame.unwrap(); panic!("responsive agent closed: {frame:?}"); },
-            other=>panic!("unexpected {other:?}"),
+    let mut saw_ping=false;
+    let deadline=tokio::time::Instant::now()+Duration::from_secs(2);
+    loop {
+        let left=deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left,socket.next()).await {
+            Err(_)=>panic!("idle agent was not closed"),
+            Ok(None)|Ok(Some(Err(_)))=>panic!("agent dropped without close frame"),
+            Ok(Some(Ok(tungstenite::Message::Ping(_))))=>{ saw_ping=true; }
+            Ok(Some(Ok(tungstenite::Message::Pong(_))))=>{}
+            Ok(Some(Ok(tungstenite::Message::Close(frame))))=> {
+                let frame=frame.expect("close frame");
+                assert_eq!((u16::from(frame.code),frame.reason.as_ref()),(1001,"idle timeout"));
+                assert!(saw_ping, "expected keepalive ping before idle close");
+                return;
+            }
+            Ok(Some(Ok(other)))=>panic!("unexpected {other:?}"),
         }
     }
-    return;
+}
+
+#[tokio::test]
+async fn idle_data_bridges_send_pings_then_close_both_sides() {
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url=format!("http://{}",listener.local_addr().unwrap());
+    let (closed_tx,closed_rx)=tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (stream,_)=listener.accept().await.unwrap();
+        let mut upstream=accept_hdr_async(stream,|_:&Request,mut response:Response| { response.headers_mut().insert("sec-websocket-protocol",HeaderValue::from_static(DATA_SUBPROTOCOL)); Ok(response) }).await.unwrap();
+        upstream.next().await;
+        upstream.send(tungstenite::Message::Binary(vec![0x81].into())).await.unwrap();
+        let mut saw_ping=false;
+        while let Some(Ok(frame))=tokio::time::timeout(Duration::from_secs(2),upstream.next()).await.unwrap_or(None) {
+            match frame {
+                tungstenite::Message::Ping(_)=>saw_ping=true,
+                tungstenite::Message::Close(frame)=>{ let _=closed_tx.send((saw_ping,u16::from(frame.unwrap().code))); return; },
+                _=>{}
+            }
+        }
+    });
+    let h=start_gateway_with_keepalive(&[("local",&url)],tmo(300),Duration::from_secs(3600),tmo(300),tmo(30),tmo(120)).await;
+    let external=h.state.tickets.insert("local","AAAAAAAAAAAAAAAAAAAAAA",SECRET);
+    let raw=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,external).unwrap();
+    let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..],&raw].concat().into())).await.unwrap();
+    assert!(!next_binary(&mut socket).await.is_empty());
+    let mut saw_ping=false;
+    let deadline=tokio::time::Instant::now()+Duration::from_secs(2);
+    loop {
+        let left=deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left,socket.next()).await {
+            Err(_)=>panic!("idle data agent was not closed"),
+            Ok(None)|Ok(Some(Err(_)))=>{
+                assert!(saw_ping);
+                break;
+            },
+            Ok(Some(Ok(tungstenite::Message::Ping(_))))=>{ saw_ping=true; }
+            Ok(Some(Ok(tungstenite::Message::Pong(_))))=>{}
+            Ok(Some(Ok(tungstenite::Message::Close(frame))))=> {
+                assert_eq!(u16::from(frame.unwrap().code),1001);
+                break;
+            }
+            Ok(Some(Ok(other)))=>panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(saw_ping);
+    assert_eq!(closed_rx.await.unwrap(),(true,1001));
 }
