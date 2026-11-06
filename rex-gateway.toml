@@ -1,0 +1,10 @@
+listen = "127.0.0.1:7300"
+probe_interval_ms = 1000
+
+[[upstreams]]
+id = "local"
+url = "http://127.0.0.1:7297"
+
+[[auth.tokens]]
+token = "smoke-secret"
+allow = ["*"]
