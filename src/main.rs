@@ -44,9 +44,11 @@ async fn main() -> Result<()> {
     if let Some(ref store) = config.discovery.store_path {
         discovery::load_store_if_present(store, &pool, &clients, Some(&sessions), client_options, events.clone()).await;
     }
-    if config.discovery.enabled() {
+    let discovery_health = if config.discovery.enabled() {
         let command = config.discovery.command.clone().filter(|c| !c.is_empty());
         let file = config.discovery.file.clone().filter(|p| !p.as_os_str().is_empty());
+        let mode = if command.is_some() { "command" } else { "file" };
+        let health = discovery::DiscoveryHealth::enabled(mode);
         discovery::spawn(
             command,
             file,
@@ -57,8 +59,12 @@ async fn main() -> Result<()> {
             sessions.clone(),
             client_options,
             events.clone(),
+            health.clone(),
         );
-    }
+        health
+    } else {
+        discovery::DiscoveryHealth::disabled()
+    };
     probe::spawn(pool.clone(), clients.clone(), Duration::from_millis(config.probe_interval_ms));
     let metrics = metrics::Metrics::new();
     let tickets = data::TicketMap::new(Duration::from_millis(config.ticket_ttl_ms), config.ticket_max, metrics.clone());
@@ -72,5 +78,5 @@ async fn main() -> Result<()> {
         max_data_streams_per_token: config.max_data_streams_per_token,
         create_reservation_ttl: Duration::from_millis(config.create_reservation_ttl_ms),
     };
-    inbound::serve(config.listen, pool, clients, auth, tickets, sessions, metrics, options, events).await
+    inbound::serve(config.listen, pool, clients, auth, tickets, sessions, metrics, options, events, discovery_health).await
 }

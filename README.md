@@ -24,7 +24,7 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
-  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 12).
+  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 13).
 * `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
   namespaced IDs in sorted upstream-ID order. Upstreams that are not `Online`, or that error or time
   out, are skipped and reported: the response then also carries `"partial":true`,
@@ -42,6 +42,13 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
   lists. `host` is a gateway routing hint stripped before forwarding. Namespaced session
   calls stay sticky to their owner; Offline/Unknown owners return a clear
   `upstream {id} is Offline|Unknown` error (ACL denial stays `not allowed`).
+* Hostless `session.create` **failovers on transport errors** (timeout, connect failure,
+  missing client, socket closed, "retry in …"): the reservation is dropped, the failed
+  upstream is marked, and the next-best candidate under the same tag/host preferences is
+  tried (already-tried host ids are excluded for that request only). Application-level
+  create errors (`{"error":…}` from Rex) and hard `host` pins do **not** failover. When
+  every candidate fails with a transport error the agent sees
+  `session.create failed on all candidates: id: reason; …`.
 * Startup never needs an upstream: control clients connect lazily on their first call (the probe loop
   makes it) and reconnect after socket loss, with exponential backoff after failed connects
   (200 ms doubling to 5 s; calls fail fast with `retry in N ms` meanwhile). Other hostless
@@ -192,6 +199,10 @@ least-recently-active capacity cleanup, manual deletion, and the data-plane clos
   "counters": {
     "pending_tickets":0,"active_control_connections":1,"active_data_streams":0,
     "tickets_issued":5,"tickets_consumed":4,"tickets_expired":1,"tickets_evicted":0
+  },
+  "discovery": {
+    "enabled":true,"mode":"command","last_success_age_ms":1234,"last_error":null,
+    "last_error_age_ms":null,"last_applied":true,"refresh_count":5,"error_count":1
   }
 }
 ```
@@ -202,6 +213,10 @@ stripped (and also removed from `last_error` text). `upstreams` lists only upstr
 (null if the last probe failed or none ran); `last_error` is the most recent probe error and is
 cleared by the next successful probe. `counters` are gateway-wide (not ACL-filtered), totals since
 start; `tickets_expired` counts TTL expiries, `tickets_evicted` capacity evictions.
+`discovery` reports whether pool fill is configured (`enabled`/`mode` = `command`|`file`|`none`),
+ages since last success/error (`null` if never), whether the last refresh applied a snapshot
+(`last_applied`), and `refresh_count` / `error_count` since process start. When discovery is
+disabled the object is still present with `enabled:false`, `mode:"none"`, null ages and zero counts.
 
 ## Authentication
 
@@ -257,7 +272,8 @@ attach/list/RPC keep working, but create eligibility is cleared so new `session.
 will not pick it. On a successful apply the optional `store_path` is written atomically
 (temp + rename); the store is loaded at startup after Manual upserts so a restart can
 route before the next live refresh. Each discovered id also gets a lazy control client so
-probes and RPCs work the same as Manual upstreams.
+probes and RPCs work the same as Manual upstreams. Live refresh outcomes update the
+`discovery` object on `/status` (success/error ages, applied flag, counters).
 
 ## Remaining TODOs
 

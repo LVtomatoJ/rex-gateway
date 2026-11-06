@@ -15,8 +15,8 @@ use std::{
     io::Write,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
-    time::Duration,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use serde::Deserialize;
@@ -44,6 +44,100 @@ pub struct ParsedUpstream {
     pub id: String,
     pub url: String,
     pub source: Source,
+}
+
+
+/// Live discovery refresh health exposed on `GET /status`.
+#[derive(Debug, Clone)]
+pub struct DiscoveryHealth {
+    inner: Arc<Mutex<DiscoveryHealthInner>>,
+}
+
+#[derive(Debug)]
+struct DiscoveryHealthInner {
+    enabled: bool,
+    mode: String,
+    last_success: Option<Instant>,
+    last_error: Option<String>,
+    last_error_at: Option<Instant>,
+    last_applied: bool,
+    refresh_count: u64,
+    error_count: u64,
+}
+
+/// Snapshot consumed by `status::build`.
+#[derive(Debug, Clone)]
+pub struct DiscoverySnapshot {
+    pub enabled: bool,
+    pub mode: String,
+    pub last_success_age_ms: Option<u64>,
+    pub last_error: Option<String>,
+    pub last_error_age_ms: Option<u64>,
+    pub last_applied: bool,
+    pub refresh_count: u64,
+    pub error_count: u64,
+}
+
+impl DiscoveryHealth {
+    pub fn disabled() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(DiscoveryHealthInner {
+                enabled: false,
+                mode: "none".into(),
+                last_success: None,
+                last_error: None,
+                last_error_at: None,
+                last_applied: false,
+                refresh_count: 0,
+                error_count: 0,
+            })),
+        }
+    }
+
+    /// `mode` is `"command"` or `"file"`.
+    pub fn enabled(mode: &str) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(DiscoveryHealthInner {
+                enabled: true,
+                mode: mode.to_owned(),
+                last_success: None,
+                last_error: None,
+                last_error_at: None,
+                last_applied: false,
+                refresh_count: 0,
+                error_count: 0,
+            })),
+        }
+    }
+
+    pub fn record_ok(&self, applied: bool) {
+        let mut g = self.inner.lock().expect("discovery health mutex");
+        g.refresh_count = g.refresh_count.saturating_add(1);
+        g.last_success = Some(Instant::now());
+        g.last_applied = applied;
+    }
+
+    pub fn record_err(&self, error: String) {
+        let mut g = self.inner.lock().expect("discovery health mutex");
+        g.error_count = g.error_count.saturating_add(1);
+        g.last_error = Some(error);
+        g.last_error_at = Some(Instant::now());
+        g.last_applied = false;
+    }
+
+    pub fn snapshot(&self, now: Instant) -> DiscoverySnapshot {
+        let g = self.inner.lock().expect("discovery health mutex");
+        DiscoverySnapshot {
+            enabled: g.enabled,
+            mode: g.mode.clone(),
+            last_success_age_ms: g.last_success.map(|t| now.saturating_duration_since(t).as_millis() as u64),
+            last_error: g.last_error.clone(),
+            last_error_age_ms: g.last_error_at.map(|t| now.saturating_duration_since(t).as_millis() as u64),
+            last_applied: g.last_applied,
+            refresh_count: g.refresh_count,
+            error_count: g.error_count,
+        }
+    }
 }
 
 /// Sanitize a discover `name` into a stable upstream id (filesystem / id safe).
@@ -271,6 +365,7 @@ pub fn spawn(
     sessions: SessionStore,
     client_options: Options,
     events: broadcast::Sender<UpstreamEvent>,
+    health: DiscoveryHealth,
 ) {
     let command_timeout = interval.max(COMMAND_TIMEOUT_FLOOR);
     tokio::spawn(async move {
@@ -289,8 +384,11 @@ pub fn spawn(
                 client_options,
                 events.clone(),
             ).await {
-                Ok(_) => {}
-                Err(e) => tracing::warn!(%e, "discovery refresh failed"),
+                Ok(applied) => health.record_ok(applied),
+                Err(e) => {
+                    health.record_err(e.clone());
+                    tracing::warn!(%e, "discovery refresh failed");
+                }
             }
         }
     });
@@ -475,4 +573,33 @@ mod tests {
         assert!(pool.get("from-cmd").await.is_some());
         assert!(pool.get("from-file").await.is_none());
     }
+
+    #[test]
+    fn discovery_health_disabled_and_recording() {
+        let disabled = DiscoveryHealth::disabled();
+        let snap = disabled.snapshot(Instant::now());
+        assert!(!snap.enabled);
+        assert_eq!(snap.mode, "none");
+        assert!(snap.last_success_age_ms.is_none());
+        assert!(snap.last_error.is_none());
+        assert!(snap.last_error_age_ms.is_none());
+        assert!(!snap.last_applied);
+        assert_eq!(snap.refresh_count, 0);
+        assert_eq!(snap.error_count, 0);
+
+        let health = DiscoveryHealth::enabled("command");
+        health.record_ok(true);
+        health.record_err("boom".into());
+        health.record_ok(false);
+        let snap = health.snapshot(Instant::now());
+        assert!(snap.enabled);
+        assert_eq!(snap.mode, "command");
+        assert!(snap.last_success_age_ms.is_some());
+        assert_eq!(snap.last_error.as_deref(), Some("boom"));
+        assert!(snap.last_error_age_ms.is_some());
+        assert!(!snap.last_applied);
+        assert_eq!(snap.refresh_count, 2);
+        assert_eq!(snap.error_count, 1);
+    }
+
 }

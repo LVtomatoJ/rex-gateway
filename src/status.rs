@@ -1,6 +1,6 @@
 use std::time::Instant;
 use serde_json::{json, Value};
-use crate::{metrics::MetricsSnapshot, pool::Upstream};
+use crate::{discovery::DiscoverySnapshot, metrics::MetricsSnapshot, pool::Upstream};
 
 /// Strips credentials from an upstream URL before it is displayed: userinfo (`user:pass@`),
 /// query string and fragment are removed; scheme, host, port and path are kept.
@@ -16,8 +16,8 @@ pub fn redact_url(url: &str) -> String {
 }
 
 /// Builds the `/status` JSON. `upstreams` must already be filtered by the caller's ACL
-/// (see `UpstreamPool::list_allowed`). Counters are gateway-wide.
-pub fn build(upstreams: &[Upstream], pending_tickets: usize, counters: MetricsSnapshot, now: Instant) -> Value {
+/// (see `UpstreamPool::list_allowed`). Counters and discovery health are gateway-wide.
+pub fn build(upstreams: &[Upstream], pending_tickets: usize, counters: MetricsSnapshot, discovery: DiscoverySnapshot, now: Instant) -> Value {
     json!({
         "upstreams": upstreams.iter().map(|u| json!({
             "id": u.id,
@@ -44,13 +44,28 @@ pub fn build(upstreams: &[Upstream], pending_tickets: usize, counters: MetricsSn
             "tickets_expired": counters.tickets_expired,
             "tickets_evicted": counters.tickets_evicted,
         },
+        "discovery": {
+            "enabled": discovery.enabled,
+            "mode": discovery.mode,
+            "last_success_age_ms": discovery.last_success_age_ms,
+            "last_error": discovery.last_error,
+            "last_error_age_ms": discovery.last_error_age_ms,
+            "last_applied": discovery.last_applied,
+            "refresh_count": discovery.refresh_count,
+            "error_count": discovery.error_count,
+        },
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::DiscoveryHealth;
     use crate::pool::{Source, UpstreamPool, UpstreamState};
+
+    fn disc() -> crate::discovery::DiscoverySnapshot {
+        DiscoveryHealth::disabled().snapshot(Instant::now())
+    }
 
     #[test]
     fn redacts_userinfo_query_and_fragment() {
@@ -71,7 +86,7 @@ mod tests {
         let url = "https://bob:hunter2@h.example:9/rex?key=SECRETKEY";
         pool.upsert("x", url, Source::Manual).await;
         pool.mark_failure("x", format!("connect to {url} failed")).await;
-        let body = build(&pool.list_allowed(&["*".into()]).await, 0, MetricsSnapshot::default(), Instant::now()).to_string();
+        let body = build(&pool.list_allowed(&["*".into()]).await, 0, MetricsSnapshot::default(), disc(), Instant::now()).to_string();
         for leaked in ["bob", "hunter2", "SECRETKEY", "key="] { assert!(!body.contains(leaked), "{leaked} leaked in {body}"); }
         assert!(body.contains("https://h.example:9/rex"));
     }
@@ -86,7 +101,7 @@ mod tests {
         pool.mark_failure("b", "connection refused".into()).await;
         let counters = MetricsSnapshot { tickets_issued: 5, tickets_consumed: 3, tickets_expired: 1, tickets_evicted: 1, active_control: 2, active_data: 1 };
 
-        let all = build(&pool.list_allowed(&["*".into()]).await, 4, counters, Instant::now());
+        let all = build(&pool.list_allowed(&["*".into()]).await, 4, counters, disc(), Instant::now());
         let ups = all["upstreams"].as_array().unwrap();
         assert_eq!(ups.iter().map(|u| u["id"].as_str().unwrap()).collect::<Vec<_>>(), ["a", "b", "c"]);
         assert_eq!(ups[0]["state"], "Online");
@@ -108,11 +123,33 @@ mod tests {
             "pending_tickets": 4, "active_control_connections": 2, "active_data_streams": 1,
             "tickets_issued": 5, "tickets_consumed": 3, "tickets_expired": 1, "tickets_evicted": 1,
         }));
+        assert_eq!(all["discovery"], json!({
+            "enabled": false, "mode": "none", "last_success_age_ms": null, "last_error": null,
+            "last_error_age_ms": null, "last_applied": false, "refresh_count": 0, "error_count": 0,
+        }));
 
-        let some = build(&pool.list_allowed(&["b".into(), "nonexistent".into()]).await, 0, counters, Instant::now());
+        let some = build(&pool.list_allowed(&["b".into(), "nonexistent".into()]).await, 0, counters, disc(), Instant::now());
         assert_eq!(some["upstreams"].as_array().unwrap().len(), 1);
         assert_eq!(some["upstreams"][0]["id"], "b");
-        let none = build(&pool.list_allowed(&[]).await, 0, counters, Instant::now());
+        let none = build(&pool.list_allowed(&[]).await, 0, counters, disc(), Instant::now());
         assert!(none["upstreams"].as_array().unwrap().is_empty());
     }
+
+    #[test]
+    fn discovery_object_reflects_health_snapshot() {
+        let health = DiscoveryHealth::enabled("file");
+        health.record_ok(true);
+        health.record_err("bad json".into());
+        let snap = health.snapshot(Instant::now());
+        let body = build(&[], 0, MetricsSnapshot::default(), snap, Instant::now());
+        assert_eq!(body["discovery"]["enabled"], true);
+        assert_eq!(body["discovery"]["mode"], "file");
+        assert_eq!(body["discovery"]["last_error"], "bad json");
+        assert_eq!(body["discovery"]["last_applied"], false);
+        assert_eq!(body["discovery"]["refresh_count"], 1);
+        assert_eq!(body["discovery"]["error_count"], 1);
+        assert!(body["discovery"]["last_success_age_ms"].is_u64());
+        assert!(body["discovery"]["last_error_age_ms"].is_u64());
+    }
+
 }
