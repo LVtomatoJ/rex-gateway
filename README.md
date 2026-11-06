@@ -36,14 +36,16 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 * `session.create` (and other hostless non-list methods) targets payload `host` when
   supplied; otherwise the gateway picks an ACL-allowed upstream by policy: prefer
   `Online`, then fall back to `Degraded`, choosing the least `session_count`, then lowest
-  `latency_ms` (`None` after `Some`), then `id` ascending. Explicit `host` must still be
+  `latency_ms` (`None` after `Some`), then `id` ascending, including transient reservations in
+  the effective load. Explicit `host` must still be
   ACL-allowed and `Online|Degraded` (not `Offline`/`Unknown`). `host` is a gateway routing
   hint stripped before forwarding. Namespaced session calls stay sticky to their owner;
   Offline/Unknown owners return a clear `upstream {id} is Offline|Unknown` error (ACL
   denial stays `not allowed`).
 * Startup never needs an upstream: control clients connect lazily on their first call (the probe loop
   makes it) and reconnect after socket loss, with exponential backoff after failed connects
-  (200 ms doubling to 5 s; calls fail fast with `retry in N ms` meanwhile). Upstreams start
+  (200 ms doubling to 5 s; calls fail fast with `retry in N ms` meanwhile). Other hostless
+  upstream methods retain the legacy single-upstream default route. Upstreams start
   `Unknown` and the probe loop (concurrent per upstream) promotes them to `Online` once reachable.
 * Agent requests are read serially; upstream calls use a single actor-owned WebSocket,
   ID to oneshot map, and support concurrent callers; each call is bounded by
@@ -57,7 +59,28 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 * Default create/hostless routing prefers Online and may fall back to Degraded; Offline
   and Unknown are never selected. No upstream discovery or persistence yet.
 
-## Verify
+## Capability tags and reservations
+
+Each upstream accepts `tags = ["perf", "macos"]` and optional `description = "..."`.
+Token entries accept `prefer_tags = ["perf"]` and `avoid_tags = ["prod-svc", "clash"]`.
+`REX_GATEWAY_UPSTREAM_<exact-id>_TAGS` is comma-separated and `_DESCRIPTION` overrides metadata;
+`REX_GATEWAY_AUTH_TOKEN_<zero-based-token-index>_PREFER_TAGS` / `_AVOID_TAGS` override defaults.
+`create_reservation_ttl_ms` (default 5000, env `REX_GATEWAY_CREATE_RESERVATION_TTL_MS`) is nonzero.
+
+A routed create may override defaults with `prefer_tags` / `avoid_tags` string arrays. All preferred
+tags are required so a request for `macos` never falls back to a Linux host. Any avoided tag excludes
+an upstream exclusively for create; this never hides existing sessions. Scoring rewards matching tags,
+keeps Online above Degraded, and subtracts `session_count + reserved_session_count`; highest score,
+then lowest latency, then ID wins. An explicit, allowed and routable `host` wins over both tag lists.
+Unsatisfiable tags and exclusion of every candidate are returned as explicit errors, never downgraded.
+
+Reservation and selection happen under one mutex, so simultaneous clients observe each other's effective
+load. Completion or failure releases the guard; forced expiry is reaped at selection/status time. `/status`
+reports real sessions, outstanding reserves and their sum (`effective_session_count`), alongside
+`tags`, `description`, `latency_ms`, and `state`. `session.bootstrap` adds the owning `upstream` and an
+ACL-filtered `upstreams` array with the same capability/load fields. Unavailable owners cause bootstrap
+to error with remove/recreate guidance; the data plane still closes 1011 on unexpected stream loss.
+CPU is not gathered by Rex probes, so session count is the current load signal.
 
 ```sh
 cargo build
@@ -114,7 +137,8 @@ time (or fails), the agent socket is closed with `1011 "upstream connect timeout
   "upstreams": [
     {"id":"local","url":"http://127.0.0.1:7297","source":"Manual","state":"Online",
      "latency_ms":3,"consecutive_failures":0,"last_error":null,
-     "last_probe_age_ms":412,"session_count":2}
+     "last_probe_age_ms":412,"session_count":2,"reserved_session_count":0,
+     "effective_session_count":2,"tags":["perf"],"description":"heavy compile host"}
   ],
   "counters": {
     "pending_tickets":0,"active_control_connections":1,"active_data_streams":0,

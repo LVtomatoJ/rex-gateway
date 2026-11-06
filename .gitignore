@@ -1,3 +1,5 @@
 /target
 *.log
 *.out
+
+*-latest.out

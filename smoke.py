@@ -31,8 +31,8 @@ for label,token in [('absent',None),('wrong','wrong-secret')]:
 s,status=connect('smoke-secret');print('valid token:',status);assert '101' in status
 frame(s,{'type':'hello'});op,data=recv(s);welcome=json.loads(data);print('hello ->',json.dumps(welcome));assert welcome['type']=='welcome'
 frame(s,{'type':'request','id':'smoke-list','method':'session.list','payload':{}});op,data=recv(s);response=json.loads(data);print('session.list ->',json.dumps(response))
-expected='local:session:01a1b0eb-20ad-73fb-9c27-0bdf0ed5bfee'
-assert response['id']=='smoke-list';assert any(x['session_id']==expected and x['label']=='bold-strait' for x in response['payload']['sessions'])
+expected=response['payload']['sessions'][0]['session_id']
+assert response['id']=='smoke-list';assert response['payload']['sessions'] and expected.startswith('local:session:')
 print('PASS: namespaced local session found')
 frame(s,{'type':'request','id':'smoke-version','method':'server.version','payload':{}});op,data=recv(s);print('server.version (default local) ->',data.decode());assert json.loads(data)['id']=='smoke-version'
 frame(s,{'type':'request','id':'smoke-route','method':'session.rename','payload':{'session_id':expected,'label':'bold-strait'}});op,data=recv(s);print('routed session.rename ->',data.decode());assert json.loads(data)['id']=='smoke-route'

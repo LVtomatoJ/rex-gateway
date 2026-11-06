@@ -62,7 +62,11 @@ control = WS('/api/control', 'rex.control.v1')
 assert '101' in control.status
 control.send(json.dumps({'type':'hello'}))
 print('welcome:', control.recv()[1].decode())
-control.request('attach', 'session.attach', {'session_id': EXTERNAL_SID})
+listed=control.request('list','session.list',{})['payload']['sessions']
+assert listed
+EXTERNAL_SID=listed[0]['session_id']
+attachment=control.request('attach', 'session.attach', {'session_id': EXTERNAL_SID})
+BLOCK=attachment['payload']['view']['windows'][0]['focused_block_id']
 response = control.request('connect', 'data.connect', {'session_id':EXTERNAL_SID,
     'block_id':BLOCK, 'data_ref_id':'terminal', 'subprotocol':'rex.data.terminal.v1'})
 ticket = response['payload']['ticket']
@@ -80,7 +84,7 @@ op, snapshot = data.recv()
 assert op == 2 and snapshot.startswith(b'GHOSTSNP')
 print('PASS: full-screen snapshot preserved:', len(snapshot), 'bytes')
 
-subprocess.run(['rex', '-S', 'http://127.0.0.1:7297', 'send', '-b', BLOCK,
+subprocess.run([os.environ.get('REX_BIN','rex'), '-S', 'http://127.0.0.1:7297', 'send', '-b', BLOCK,
     'echo HELLO_FROM_GATEWAY\n'], check=True)
 found = False
 for _ in range(10):
