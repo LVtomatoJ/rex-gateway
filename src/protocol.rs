@@ -5,7 +5,15 @@ use crate::{data::TicketMap, sessions::SessionStore};
 pub const SUBPROTOCOL: &str = "rex.control.v1";
 
 /// Stateless session namespace: `<upstream>:<real session:...>`.
-pub fn wrap_session_id(upstream: &str, session_id: &str) -> String { format!("{upstream}:{session_id}") }
+/// Already-namespaced ids (any owner) are left unchanged so a second wrap cannot
+/// produce `local:local:session:…` and break recording / routing.
+pub fn wrap_session_id(upstream: &str, session_id: &str) -> String {
+    if unwrap_session_id(session_id).is_some() {
+        // Owner already present; never nest another prefix.
+        return session_id.to_owned();
+    }
+    format!("{upstream}:{session_id}")
+}
 
 pub fn unwrap_session_id(id: &str) -> Option<(&str, &str)> {
     let (upstream, session_id) = id.split_once(':')?;
@@ -149,39 +157,31 @@ mod tests {
     }
 
     #[test]
-    fn double_wrap_prevents_session_recording() {
-        // The event path must not call namespace_* twice: a second wrap yields
-        // `local:local:session:…`, which unwrap_session_id rejects, so record is a no-op
-        // and a second ticket rewrite orphans capacity.
+    fn wrap_session_id_is_idempotent() {
+        let once = wrap_session_id("local", "session:e");
+        assert_eq!(once, "local:session:e");
+        assert_eq!(wrap_session_id("local", &once), once);
+        assert_eq!(wrap_session_id("other", &once), once, "never nest a foreign prefix either");
+        assert_eq!(unwrap_session_id(&once), Some(("local", "session:e")));
+    }
+
+    #[test]
+    fn double_namespace_still_reissues_tickets() {
+        // Session ids stay stable under a second wrap, but tickets are rewritten again
+        // (gateway tickets are indistinguishable from upstream ones). Production must
+        // still call namespace_* exactly once per payload.
         let map = tickets();
         let dir = tempfile::tempdir().unwrap();
         let store = SessionStore::open(dir.path().join("s.json"), std::time::Duration::from_secs(60), 16).unwrap();
         let mut value = json!({"session_id":"session:e","ticket":"up-a"});
-        namespace_response(&mut value, "local", &map, "bearer");
+        namespace_and_record(&mut value, "local", &map, "bearer", &store);
         assert_eq!(value["session_id"], "local:session:e");
         assert_eq!(map.pending(), 1);
+        assert!(store.contains("local:session:e"));
+        let first_ticket = value["ticket"].as_str().unwrap().to_owned();
         namespace_response(&mut value, "local", &map, "bearer");
-        assert_eq!(value["session_id"], "local:local:session:e");
-        assert_eq!(map.pending(), 2, "second wrap re-issues an orphan ticket");
-        assert!(unwrap_session_id(value["session_id"].as_str().unwrap()).is_none());
-        // Mimic the buggy walk: only well-formed namespaced ids get recorded.
-        fn walk(value: &Value, upstream: &str, sessions: &SessionStore) {
-            match value {
-                Value::Array(items) => for item in items { walk(item, upstream, sessions) },
-                Value::Object(object) => for (key, item) in object {
-                    if key == "session_id" {
-                        if let Some(id) = item.as_str() {
-                            if let Some((owner, real)) = unwrap_session_id(id) {
-                                if owner == upstream { sessions.record(owner, real); }
-                            }
-                        }
-                    } else { walk(item, upstream, sessions) }
-                },
-                _ => {}
-            }
-        }
-        walk(&value, "local", &store);
-        assert!(!store.contains("local:session:e"));
-        assert!(!store.contains("local:local:session:e"));
+        assert_eq!(value["session_id"], "local:session:e", "session wrap is idempotent");
+        assert_eq!(map.pending(), 2, "second ticket rewrite still orphans capacity");
+        assert_ne!(value["ticket"].as_str().unwrap(), first_ticket);
     }
 }

@@ -505,6 +505,29 @@ async fn session_list_includes_degraded_and_skips_offline() {
 }
 
 #[tokio::test]
+async fn session_list_recursively_rewrites_nested_tickets() {
+    let live = spawn_fake_rex(vec![json!({
+        "session_id":"session:root",
+        "label":"nested",
+        "view":{"session_id":"session:view","ticket":"list-ticket"}
+    })], false).await;
+    let h = start_gateway(&[("live", &live)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    wait_state(&h.pool, "live", UpstreamState::Online).await;
+    let mut socket = control_agent(h.addr).await;
+    let reply = rpc(&mut socket, "session.list", json!({})).await;
+    let sessions = reply["sessions"].as_array().unwrap();
+    assert_eq!(sessions.len(), 1, "{reply}");
+    assert_eq!(sessions[0]["session_id"], "live:session:root");
+    assert_eq!(sessions[0]["view"]["session_id"], "live:session:view");
+    let ticket = sessions[0]["view"]["ticket"].as_str().unwrap();
+    assert_ne!(ticket, "list-ticket");
+    let mapped = h.state.tickets.take(ticket, SECRET).unwrap();
+    assert_eq!(mapped.upstream_ticket, "list-ticket");
+    assert!(h.state.sessions.contains("live:session:root"));
+    assert!(h.state.sessions.contains("live:session:view"));
+}
+
+#[tokio::test]
 async fn data_bridges_send_pings_and_propagate_upstream_close() {
     let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url=format!("http://{}",listener.local_addr().unwrap());
@@ -640,6 +663,47 @@ async fn idle_data_bridges_send_pings_then_close_both_sides() {
     let (upstream_ping, code)=closed_rx.await.expect("upstream should observe idle close");
     assert!(upstream_ping && code==1001, "upstream saw ping={upstream_ping} code={code}");
     let _ = saw_close; // Close frame is best-effort; upstream 1001 is authoritative
+}
+
+#[tokio::test]
+async fn agent_abrupt_disconnect_closes_upstream_data_socket() {
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url=format!("http://{}",listener.local_addr().unwrap());
+    let (closed_tx,closed_rx)=tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream,_))=listener.accept().await else { return };
+            let Ok(mut upstream)=accept_hdr_async(stream,|req:&Request,mut response:Response| {
+                if !req.uri().path().ends_with("/api/data") { return Err(ErrorResponse::new(None)); }
+                response.headers_mut().insert("sec-websocket-protocol",HeaderValue::from_static(DATA_SUBPROTOCOL)); Ok(response)
+            }).await else { continue };
+            let Some(Ok(tungstenite::Message::Binary(hello)))=upstream.next().await else { continue };
+            if hello.first()!=Some(&1) { continue; }
+            if upstream.send(tungstenite::Message::Binary(vec![0x81])).await.is_err() { continue; }
+            while let Some(Ok(frame))=tokio::time::timeout(Duration::from_secs(2),upstream.next()).await.unwrap_or(None) {
+                match frame {
+                    tungstenite::Message::Close(frame)=>{
+                        let frame=frame.expect("close frame");
+                        let _=closed_tx.send((u16::from(frame.code), frame.reason.to_string()));
+                        return;
+                    }
+                    _=>{}
+                }
+            }
+        }
+    });
+    let h=start_gateway(&[("local",&url)],tmo(300),Duration::from_secs(3600),tmo(300)).await;
+    let external=h.state.tickets.insert("local","AAAAAAAAAAAAAAAAAAAAAA",SECRET);
+    let raw=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,external).unwrap();
+    let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..],&raw].concat())).await.unwrap();
+    assert!(!next_binary(&mut socket).await.is_empty());
+    // Drop the TCP without a WebSocket Close frame.
+    drop(socket);
+    let (code, reason)=tokio::time::timeout(Duration::from_secs(2), closed_rx).await
+        .expect("upstream should observe peer-closed close")
+        .expect("oneshot");
+    assert_eq!((code, reason.as_str()), (1001, "peer closed"));
 }
 
 #[tokio::test]

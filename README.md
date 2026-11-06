@@ -24,9 +24,10 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
-  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 17).
+  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 18).
 * `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
-  namespaced IDs in sorted upstream-ID order. Upstreams that are not routable (`Online` or
+  namespaced IDs (recursively wrapping nested `session_id` / `ticket` fields the same way as
+  other responses) in sorted upstream-ID order. Upstreams that are not routable (`Online` or
   `Degraded`), or that error or time out, are skipped and reported: the response then also carries
   `"partial":true`, `"failed_upstreams":["id",...]` and `"upstream_errors":{"id":"reason"}`. A
   complete list has none of these fields. If every allowed upstream fails, the request returns an
@@ -35,6 +36,7 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
   surfaces its sessions.
 * Namespaced session calls are routed to their owner, with the prefix stripped upstream.
   Top-level returned session IDs, and session data nested beneath `view`, are wrapped.
+  `wrap_session_id` is idempotent: an already-namespaced id is never double-prefixed.
 * `session.create` (and other hostless non-list methods) targets payload `host` when
   supplied; otherwise the gateway picks an ACL-allowed upstream by policy: prefer
   `Online`, then fall back to `Degraded`, scoring by capability tags, soft preferred host
@@ -145,7 +147,8 @@ snapshots, terminal output, and agent input are relayed frame-for-frame between 
 sockets. Ping/pong and close frames, including close codes and reasons, are forwarded.
 If the upstream data socket ends mid-bridge without a Close frame, the agent is closed with
 `1011 "upstream closed"` (or `"upstream offline"` when the pool already marks that upstream
-Offline). The gateway also originates keepalive pings on both legs and idle-closes both sides with
+Offline). If the agent drops mid-bridge without a Close frame, the upstream is closed with
+`1001 "peer closed"` so Rex can release the terminal attach promptly. The gateway also originates keepalive pings on both legs and idle-closes both sides with
 `1001 "idle timeout"` when no application (binary/text) traffic arrives for
 `ws_idle_timeout_ms`. Concurrent bridges are bounded by `max_data_streams` /
 `max_data_streams_per_token` (close `1013` on overflow, ticket preserved). This is not a
@@ -180,7 +183,8 @@ compatibility (the upstream validates whether the session exists).
   returns `{"forgotten":true,"session_id":"..."}`. ACLs are enforced; repeating forget is safe.
 
 A background reaper removes idle references after TTL, then the least-recently-active references
-when over the cap. It never kills the Rex session itself. Session RPCs, listing, attach, data.connect,
+when over the cap. Removals are written to the store immediately so a restart cannot resurrect
+forgotten references. It never kills the Rex session itself. Session RPCs, listing, attach, data.connect,
 and binary terminal traffic refresh activity; fetching the full session list refreshes all listed
 references by design. After TTL/capacity cleanup or `session.forget`, list/send/read/bootstrap/
 attach/data.connect receive the clear control error **`session reference expired/forgotten`**.
@@ -261,6 +265,9 @@ agent and upstream sides. Incoming application frames and pong frames keep a con
 close 1001 / `idle timeout`; data idle closes both bridge endpoints. The idle timeout must be
 greater than the ping interval and both must be nonzero. An agent control initial HELLO/welcome
 is completed before the keepalive loop; data HELLO/setup timeouts remain separate as above.
+Control upgrades set WebSocket `max_message_size` to the advertised `limits.max_message_bytes`
+(1 MiB), matching Rex; the data plane keeps the library default so large terminal snapshots
+are not truncated.
 ## Upstream discovery
 
 Optional `[discovery]` fills the upstream pool from a `rex-discover --json` snapshot —

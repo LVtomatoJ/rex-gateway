@@ -34,6 +34,8 @@ use crate::{
 };
 
 const DATA_SUBPROTOCOL: &str = "rex.data.terminal.v1";
+/// Matches the control-plane welcome `limits.max_message_bytes` (and Rex itself).
+const MAX_MESSAGE_BYTES: usize = 1_048_576;
 
 /// What the agent control response frame carries after a successful `handle`.
 /// Gateway-originated failures stay `Err(String)` → `payload: {"error":…}` for
@@ -142,7 +144,7 @@ async fn control_upgrade(
     State(state): State<AppState>,
 ) -> Result<Response, StatusCode> {
     let (acl, owner) = authenticate(&headers, &state, SUBPROTOCOL)?;
-    Ok(ws.protocols([SUBPROTOCOL]).on_upgrade(move |socket| serve_agent(socket, state, acl, owner)))
+    Ok(ws.protocols([SUBPROTOCOL]).max_message_size(MAX_MESSAGE_BYTES).on_upgrade(move |socket| serve_agent(socket, state, acl, owner)))
 }
 
 async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, owner: String) {
@@ -157,7 +159,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":17});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":18});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -218,7 +220,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
 
 async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut payload: Value) -> Result<AgentReply, String> {
     let external_session=payload.get("session_id").and_then(Value::as_str).map(str::to_owned);
-    if method == "session.list" { return list_sessions(state, acl, &state.sessions).await.map(AgentReply::Payload); }
+    if method == "session.list" { return list_sessions(state, acl, owner, &state.sessions).await.map(AgentReply::Payload); }
     if method == "session.forget" {
         let external=payload.get("session_id").and_then(Value::as_str).ok_or("session.forget requires session_id")?;
         let (upstream,_)=crate::protocol::unwrap_session_id(external).ok_or("invalid namespaced session_id")?;
@@ -432,7 +434,7 @@ fn string_list(payload: &Value, field: &str) -> Option<Vec<String>> {
     payload.get(field).and_then(Value::as_array).map(|values| values.iter().filter_map(Value::as_str).map(str::to_owned).collect())
 }
 
-async fn list_sessions(state: &AppState, acl: &[String], store: &SessionStore) -> Result<Value, String> {
+async fn list_sessions(state: &AppState, acl: &[String], owner: &str, store: &SessionStore) -> Result<Value, String> {
     let allowed = state.pool.list_allowed(acl).await;
     let results = futures_util::future::join_all(allowed.iter().map(|upstream| async move {
         if !upstream.state.is_routable() {
@@ -459,12 +461,12 @@ async fn list_sessions(state: &AppState, acl: &[String], store: &SessionStore) -
     for (id, result) in results {
         match result {
             Ok(items) => for mut session in items {
-                if translate_session_id(&mut session, id, true) {
-                    if let Some(external)=session.get("session_id").and_then(Value::as_str){
-                        if let Some((owner,real))=crate::protocol::unwrap_session_id(external){store.record(owner,real);}
-                    }
-                    sessions.push(session);
-                }
+                // Require a bare upstream session_id; then recursively wrap nested
+                // session/ticket fields the same way responses and events do.
+                let Some(raw) = session.get("session_id").and_then(Value::as_str) else { continue };
+                if !raw.starts_with("session:") { continue; }
+                namespace_and_record(&mut session, id, &state.tickets, owner, store);
+                sessions.push(session);
             },
             Err(error) => { tracing::warn!(upstream = id, %error, "session.list skipped upstream"); errors.insert(id.to_owned(), Value::String(error)); }
         }
@@ -588,7 +590,16 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
                     let _ = upstream_sink.send(tungstenite::Message::Close(frame.map(to_upstream_close))).await;
                     break;
                 }
-                Some(Err(_)) | None => break,
+                Some(Err(_)) | None => {
+                    // Agent dropped without a Close frame: tell the upstream so Rex can
+                    // release the terminal attach instead of waiting for idle timeout.
+                    let _ = upstream_sink.send(tungstenite::Message::Close(Some(tungstenite::protocol::CloseFrame {
+                        code: 1001.into(),
+                        reason: "peer closed".into(),
+                    }))).await;
+                    let _ = upstream_sink.close().await;
+                    break;
+                }
             },
             outgoing = upstream_stream.next() => match outgoing {
                 Some(Ok(tungstenite::Message::Binary(bytes))) => {
