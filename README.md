@@ -57,7 +57,7 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
   Degraded; two consecutive failed probes = Offline. First failure is Degraded, initial
   state Unknown. Socket reconnection and a fresh hello happen on the next call.
 * Default create/hostless routing prefers Online and may fall back to Degraded; Offline
-  and Unknown are never selected. No upstream discovery or persistence yet.
+  and Unknown are never selected. Upstream discovery remains outside the gateway.
 
 ## Capability tags and reservations
 
@@ -127,6 +127,47 @@ all receive REJECT `0x82 0x01` (indistinguishable to the caller); malformed HELL
 `0x82 0x05` and a close `1008 "HELLO timeout"`; if the upstream data socket cannot be opened in that
 time (or fails), the agent socket is closed with `1011 "upstream connect timeout"` /
 `"upstream connection failed"`. A wrong-owner attempt does not burn the legitimate owner's live ticket.
+
+## Durable session references and cleanup
+
+Every session learned from `session.list`, `session.create`, a session RPC response or an event is
+stored as the stable external reference `upstream:session:<uuid>` together with its owning upstream
+and real upstream ID. `rex-gateway-sessions.json` is atomically replaced (temporary file + rename)
+on update, and loaded at startup. An agent can retain the external reference, disconnect, and attach
+or open a new data stream after a **gateway restart** without recreating the Rex session. The Rex
+upstream must still own the live session. Unlisted but well-formed references retain normal routing
+compatibility (the upstream validates whether the session exists).
+
+* `session_store_path` (default `rex-gateway-sessions.json`), env `REX_GATEWAY_SESSION_STORE_PATH`.
+* `session_ttl_ms` (default `86400000`, one day), env `REX_GATEWAY_SESSION_TTL_MS`.
+* `session_max` (default `16384`), env `REX_GATEWAY_SESSION_MAX`. All three are validated; both
+  lifetime and capacity must be nonzero.
+* `session.forget` with `{"session_id":"local:session:<uuid>"}` manually deletes one mapping and
+  returns `{"forgotten":true,"session_id":"..."}`. ACLs are enforced; repeating forget is safe.
+
+A background reaper removes idle references after TTL, then the least-recently-active references
+when over the cap. It never kills the Rex session itself. Session RPCs, listing, attach, data.connect,
+and binary terminal traffic refresh activity; fetching the full session list refreshes all listed
+references by design. After TTL/capacity cleanup or `session.forget`, list/send/read/bootstrap/
+attach/data.connect receive the clear control error **`session reference expired/forgotten`**.
+If a data ticket was already issued, attach closes with WebSocket **1008** and the same reason.
+
+### Live verification
+
+With Rex on 127.0.0.1:7297, a terminal-bearing session, and the supplied gateway on :7300:
+
+```sh
+REX_GATEWAY_SESSION_STORE_PATH=/tmp/rex-session-test.json cargo run
+python3 smoke_sessions.py
+# Stop and restart the gateway using the same store path, then:
+python3 smoke_sessions.py --expect-ref local:session:<uuid> --check-gc
+REX_GATEWAY_SESSION_STORE_PATH=/tmp/rex-session-test.json \
+REX_GATEWAY_SESSION_TTL_MS=250 cargo run
+python3 smoke_sessions.py --after-ttl 1
+```
+
+The script does not log data tickets. Tests also cover on-disk restart loading, TTL cleanup,
+least-recently-active capacity cleanup, manual deletion, and the data-plane close behavior.
 
 ## Status endpoint
 
