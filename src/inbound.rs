@@ -1,4 +1,4 @@
-use std::{borrow::Cow, collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
+use std::{borrow::Cow, net::SocketAddr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -23,7 +23,7 @@ use tokio_tungstenite::{
 use crate::{
     auth::{self, Authenticator},
     pool::{UpstreamState, TagPreferences},
-    control_client::{ControlClient, UpstreamEvent},
+    control_client::{ClientMap, UpstreamEvent},
     data::{decode_hello, TicketMap},
     metrics::{DataLimiter, Gauge, Metrics},
     pool::UpstreamPool,
@@ -33,12 +33,11 @@ use crate::{
 };
 
 const DATA_SUBPROTOCOL: &str = "rex.data.terminal.v1";
-type Clients = Arc<HashMap<String, Arc<ControlClient>>>;
 
 #[derive(Clone)]
 struct AppState {
     pool: UpstreamPool,
-    clients: Clients,
+    clients: ClientMap,
     auth: Arc<Authenticator>,
     tickets: TicketMap,
     sessions: SessionStore,
@@ -63,7 +62,7 @@ pub struct Options {
 pub async fn serve(
     listen: SocketAddr,
     pool: UpstreamPool,
-    clients: HashMap<String, Arc<ControlClient>>,
+    clients: ClientMap,
     auth: Arc<Authenticator>,
     tickets: TicketMap,
     sessions: SessionStore,
@@ -71,7 +70,7 @@ pub async fn serve(
     options: Options,
     events: broadcast::Sender<UpstreamEvent>,
 ) -> Result<()> {
-    let state = AppState { pool, clients: Arc::new(clients), auth, tickets, sessions, metrics, data_limiter: DataLimiter::new(), options, events };
+    let state = AppState { pool, clients, auth, tickets, sessions, metrics, data_limiter: DataLimiter::new(), options, events };
     let router = router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "gateway listening");
@@ -197,9 +196,16 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
     if let Some(external)=payload.get("session_id").and_then(Value::as_str) {
         if crate::protocol::unwrap_session_id(external).is_some(){state.sessions.resolve(external)?;state.sessions.touch(external);}
     }
-    let defaults = state.auth.identify(Some(owner)).unwrap_or(crate::auth::Identity { acl: acl.to_vec(), prefer_tags: Vec::new(), avoid_tags: Vec::new() });
+    let defaults = state.auth.identify(Some(owner)).unwrap_or(crate::auth::Identity {
+        acl: acl.to_vec(), prefer_tags: Vec::new(), avoid_tags: Vec::new(), prefer_hosts: Vec::new(), avoid_hosts: Vec::new(),
+    });
     let prefs = if method == "session.create" {
-        TagPreferences { prefer: string_list(&payload, "prefer_tags").unwrap_or(defaults.prefer_tags), avoid: string_list(&payload, "avoid_tags").unwrap_or(defaults.avoid_tags) }
+        TagPreferences {
+            prefer: string_list(&payload, "prefer_tags").unwrap_or(defaults.prefer_tags),
+            avoid: string_list(&payload, "avoid_tags").unwrap_or(defaults.avoid_tags),
+            prefer_hosts: string_list(&payload, "prefer_hosts").unwrap_or(defaults.prefer_hosts),
+            avoid_hosts: string_list(&payload, "avoid_hosts").unwrap_or(defaults.avoid_hosts),
+        }
     } else { TagPreferences::default() };
     let mut reservation = None;
     let owner_upstream = match payload.get("session_id").and_then(Value::as_str).and_then(crate::protocol::unwrap_session_id) {
@@ -208,8 +214,9 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
             Some(host) => host,
             None => {
                 if method != "session.create" {
-                    let ids: Vec<&str> = state.clients.keys().map(String::as_str).collect();
-                    return dispatch_sole_client(state, acl, &ids, method, payload, owner).await;
+                    let ids = state.clients.keys();
+                    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+                    return dispatch_sole_client(state, acl, &id_refs, method, payload, owner).await;
                 }
                 let (upstream, reserved) = state.pool.reserve_for_create(acl, &prefs, state.options.create_reservation_ttl).await?;
                 reservation = Some(reserved); upstream.id
@@ -228,7 +235,10 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
     if payload.get("session_id").is_some() && !translate_session_id(&mut payload, &owner_upstream, false) {
         return Err("invalid or mismatched namespaced session_id".into());
     }
-    if let Some(object) = payload.as_object_mut() { object.remove("host"); object.remove("prefer_tags"); object.remove("avoid_tags"); }
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("host"); object.remove("prefer_tags"); object.remove("avoid_tags");
+        object.remove("prefer_hosts"); object.remove("avoid_hosts");
+    }
     let mut response = state.clients.get(&owner_upstream).ok_or("upstream client missing")?
         .call(method, payload).await.map_err(|e| e.to_string())?;
     if method == "session.create" {
@@ -473,6 +483,7 @@ mod integration_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use crate::pool::{Source, UpstreamState};
     use serde_json::Value;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -489,7 +500,7 @@ mod tests {
             ("onlyb".to_owned(), vec!["b".to_owned()]),
         ])));
         let tickets = TicketMap::new(Duration::from_secs(30), 16, metrics.clone());
-        let state = AppState { pool, clients: Arc::new(HashMap::new()), auth, tickets, sessions: SessionStore::open(tempfile::tempdir().unwrap().path().join("sessions.json"),Duration::from_secs(86400),16384).unwrap(), metrics, data_limiter: DataLimiter::new(), options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120), max_data_streams: 128, max_data_streams_per_token: 32, create_reservation_ttl: Duration::from_secs(5) }, events: broadcast::channel(8).0 };
+        let state = AppState { pool, clients: ClientMap::new(), auth, tickets, sessions: SessionStore::open(tempfile::tempdir().unwrap().path().join("sessions.json"),Duration::from_secs(86400),16384).unwrap(), metrics, data_limiter: DataLimiter::new(), options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120), max_data_streams: 128, max_data_streams_per_token: 32, create_reservation_ttl: Duration::from_secs(5) }, events: broadcast::channel(8).0 };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router(state.clone());

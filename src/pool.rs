@@ -5,7 +5,6 @@ use crate::auth::Authenticator;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpstreamState { Unknown, Online, Degraded, Offline }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Reserved for rex-discover discovery.
 pub enum Source { Manual, Tailnet, Lan }
 #[derive(Debug, Clone)]
 pub struct Upstream {
@@ -16,10 +15,17 @@ pub struct Upstream {
     /// Number of recent selects whose create has not completed (or whose TTL has not expired).
     pub reserved_sessions: usize,
     #[doc(hidden)] pub reservations: Vec<Instant>,
+    /// When false, kept only for sticky session ownership (discovery withdrew the host).
+    pub accept_creates: bool,
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct TagPreferences { pub prefer: Vec<String>, pub avoid: Vec<String> }
+pub struct TagPreferences {
+    pub prefer: Vec<String>,
+    pub avoid: Vec<String>,
+    pub prefer_hosts: Vec<String>,
+    pub avoid_hosts: Vec<String>,
+}
 #[cfg_attr(test, derive(Debug))]
 pub struct Reservation { pool: UpstreamPool, id: String, expires: Instant, active: bool }
 impl Reservation {
@@ -41,8 +47,9 @@ fn effective_load(u: &Upstream) -> usize { u.session_count.saturating_add(u.rese
 fn latency_key(u: &Upstream) -> u64 { u.latency_ms.unwrap_or(u64::MAX) }
 fn score(u: &Upstream, prefs: &TagPreferences) -> i64 {
     let matched = prefs.prefer.iter().filter(|tag| u.tags.contains(tag)).count() as i64;
+    let host_bonus = if prefs.prefer_hosts.iter().any(|h| h == &u.id) { 50_000 } else { 0 };
     let health = if u.state == UpstreamState::Online { 1_000_000 } else { 0 };
-    health + matched * 10_000 - effective_load(u) as i64
+    health + matched * 10_000 + host_bonus - effective_load(u) as i64
 }
 
 
@@ -50,13 +57,43 @@ impl UpstreamPool {
     pub fn new() -> Self { Self { inner: Arc::new(Mutex::new(HashMap::new())) } }
     pub async fn upsert_with_metadata(&self, id: &str, url: &str, source: Source, tags: Vec<String>, description: Option<String>) {
         let mut guard = self.inner.lock().expect("pool mutex");
+        if let Some(existing) = guard.get(id) {
+            // Never overwrite or delete Manual upstreams via discovery upserts.
+            if existing.source == Source::Manual && source != Source::Manual {
+                return;
+            }
+        }
         let entry = guard.entry(id.to_owned()).or_insert_with(|| Upstream {
             id: id.to_owned(), url: url.to_owned(), source, state: UpstreamState::Unknown,
             latency_ms: None, session_count: 0, last_probe: None, consecutive_failures: 0,
             last_error: None, tags: Vec::new(), description: None, reserved_sessions: 0, reservations: Vec::new(),
+            accept_creates: true,
         });
         entry.url = url.to_owned(); entry.source = source;
         entry.tags = tags; entry.description = description;
+        entry.accept_creates = true;
+    }
+    /// Returns true when the id exists and is Manual (discovery must not touch it).
+    pub async fn is_manual(&self, id: &str) -> bool {
+        self.inner.lock().expect("pool mutex").get(id).map(|u| u.source == Source::Manual).unwrap_or(false)
+    }
+    pub async fn set_accept_creates(&self, id: &str, accept: bool) {
+        if let Some(u) = self.inner.lock().expect("pool mutex").get_mut(id) {
+            if u.source != Source::Manual { u.accept_creates = accept; }
+        }
+    }
+    /// Removes a non-Manual upstream. Manual ids are left untouched. Returns whether removed.
+    pub async fn remove_discovered(&self, id: &str) -> bool {
+        let mut guard = self.inner.lock().expect("pool mutex");
+        match guard.get(id) {
+            Some(u) if u.source != Source::Manual => { guard.remove(id); true }
+            _ => false,
+        }
+    }
+    pub async fn discovered_ids(&self) -> Vec<String> {
+        let mut ids: Vec<_> = self.inner.lock().expect("pool mutex").values()
+            .filter(|u| u.source != Source::Manual).map(|u| u.id.clone()).collect();
+        ids.sort(); ids
     }
     pub async fn get(&self, id: &str) -> Option<Upstream> { self.inner.lock().expect("pool mutex").get(id).cloned() }
     pub async fn reserve_for_create(&self, acl: &[String], prefs: &TagPreferences, ttl: Duration) -> Result<(Upstream, Reservation), String> {
@@ -65,13 +102,18 @@ impl UpstreamPool {
         let allowed: Vec<&Upstream> = guard.values().filter(|u| Authenticator::permits(acl, &u.id)).collect();
         if allowed.is_empty() { return Err("no allowed upstream".into()); }
         if !allowed.iter().any(|u| u.state.is_routable()) { return Err("no routable upstream: all allowed upstreams are Offline or Unknown".into()); }
-        if !prefs.prefer.is_empty() && !allowed.iter().any(|u| u.state.is_routable() && prefs.prefer.iter().all(|tag| u.tags.contains(tag))) {
+        // Prefer_hosts are soft (score bonus only). Prefer_tags remain hard / all-required.
+        let creatable: Vec<&Upstream> = allowed.iter().copied().filter(|u| u.accept_creates).collect();
+        if creatable.is_empty() { return Err("no allowed upstream accepts creates".into()); }
+        if !creatable.iter().any(|u| u.state.is_routable()) { return Err("no routable upstream: all allowed upstreams are Offline or Unknown".into()); }
+        if !prefs.prefer.is_empty() && !creatable.iter().any(|u| u.state.is_routable() && prefs.prefer.iter().all(|tag| u.tags.contains(tag))) {
             return Err(format!("no upstream matches required tags [{}]; change tag requirements or wait for a matching upstream", prefs.prefer.join(",")));
         }
-        let mut candidates: Vec<Upstream> = allowed.into_iter().filter(|u| u.state.is_routable()
+        let mut candidates: Vec<Upstream> = creatable.into_iter().filter(|u| u.state.is_routable()
             && prefs.prefer.iter().all(|tag| u.tags.contains(tag))
-            && !prefs.avoid.iter().any(|tag| u.tags.contains(tag))).cloned().collect();
-        if candidates.is_empty() { return Err("no upstream matches tags: all matching candidates are excluded by avoid_tags".into()); }
+            && !prefs.avoid.iter().any(|tag| u.tags.contains(tag))
+            && !prefs.avoid_hosts.iter().any(|h| h == &u.id)).cloned().collect();
+        if candidates.is_empty() { return Err("no upstream matches: all matching candidates are excluded by avoid_tags or avoid_hosts".into()); }
         for u in &mut candidates { u.reservations.retain(|at| *at > now); u.reserved_sessions = u.reservations.len(); }
         candidates.sort_by(|a,b| score(b,prefs).cmp(&score(a,prefs)).then_with(|| latency_key(a).cmp(&latency_key(b))).then_with(|| a.id.cmp(&b.id)));
         let selected = candidates.remove(0);
@@ -244,21 +286,21 @@ mod tests {
     async fn tags_match_exclude_and_never_downgrade() {
         let p=tagged_pool().await;
         for id in ["perf-a","perf-b","mac","plain"] { p.mark(id,UpstreamState::Online,Some(1),0).await; }
-        let (u,r)=p.reserve_for_create(&["*".into()],&TagPreferences { prefer:vec!["perf".into()],avoid:vec!["prod-svc".into()] },Duration::from_secs(1)).await.unwrap();
+        let (u,r)=p.reserve_for_create(&["*".into()],&TagPreferences { prefer:vec!["perf".into()],avoid:vec!["prod-svc".into()] , ..Default::default() },Duration::from_secs(1)).await.unwrap();
         assert_eq!(u.id,"perf-a"); r.finish();
-        let e=p.reserve_for_create(&["*".into()],&TagPreferences { prefer:vec!["nonexistent".into()],avoid:vec![] },Duration::from_secs(1)).await.unwrap_err();
+        let e=p.reserve_for_create(&["*".into()],&TagPreferences { prefer:vec!["nonexistent".into()],avoid:vec![] , ..Default::default() },Duration::from_secs(1)).await.unwrap_err();
         assert!(e.contains("change tag requirements"),"{e}");
         p.mark("mac",UpstreamState::Offline,None,0).await;
-        let e=p.reserve_for_create(&["*".into()],&TagPreferences { prefer:vec!["macos".into()],avoid:vec![] },Duration::from_secs(1)).await.unwrap_err();
+        let e=p.reserve_for_create(&["*".into()],&TagPreferences { prefer:vec!["macos".into()],avoid:vec![] , ..Default::default() },Duration::from_secs(1)).await.unwrap_err();
         assert!(e.contains("required tags"),"{e}");
     }
     #[tokio::test]
     async fn all_avoided_and_all_unavailable_fail_clearly() {
         let p=tagged_pool().await;
         for id in ["perf-a","perf-b","mac","plain"] { p.mark(id,UpstreamState::Online,Some(1),0).await; }
-        let e=p.reserve_for_create(&["*".into()],&TagPreferences { prefer:vec![],avoid:vec!["perf".into(),"macos".into()] },Duration::from_secs(1)).await;
+        let e=p.reserve_for_create(&["*".into()],&TagPreferences { prefer:vec![],avoid:vec!["perf".into(),"macos".into()] , ..Default::default() },Duration::from_secs(1)).await;
         assert_eq!(e.unwrap().0.id,"plain");
-        let e=p.reserve_for_create(&["perf-a".into(),"perf-b".into()],&TagPreferences { prefer:vec![],avoid:vec!["perf".into()] },Duration::from_secs(1)).await.unwrap_err();
+        let e=p.reserve_for_create(&["perf-a".into(),"perf-b".into()],&TagPreferences { prefer:vec![],avoid:vec!["perf".into()] , ..Default::default() },Duration::from_secs(1)).await.unwrap_err();
         assert!(e.contains("avoid_tags"),"{e}");
         p.mark("plain",UpstreamState::Unknown,None,0).await;
         let e=p.reserve_for_create(&["plain".into()],&TagPreferences::default(),Duration::from_secs(1)).await.unwrap_err();
@@ -282,5 +324,46 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
         p.reap_reservations().await; // TTL reaps a reservation whose guard was leaked
         assert_eq!(p.get("a").await.unwrap().reserved_sessions,0);
+    }
+
+    #[tokio::test]
+    async fn prefer_hosts_boost_avoid_excludes_and_pin_overrides() {
+        let p=UpstreamPool::new();
+        p.upsert("alpha","http://a",Source::Manual).await;
+        p.upsert("beta","http://b",Source::Manual).await;
+        p.upsert("gamma","http://c",Source::Manual).await;
+        for id in ["alpha","beta","gamma"] { p.mark(id,UpstreamState::Online,Some(1),0).await; }
+        // Equal load: prefer_hosts boosts beta
+        let (u,r)=p.reserve_for_create(&["*".into()],&TagPreferences { prefer_hosts:vec!["beta".into()], ..Default::default() },Duration::from_secs(1)).await.unwrap();
+        assert_eq!(u.id,"beta"); r.finish();
+        // Missing preferred host falls through (soft) rather than hard-erroring
+        let (u,r)=p.reserve_for_create(&["*".into()],&TagPreferences { prefer_hosts:vec!["missing".into()], ..Default::default() },Duration::from_secs(1)).await.unwrap();
+        assert!(["alpha","beta","gamma"].contains(&u.id.as_str())); r.finish();
+        // avoid_hosts excludes
+        let (u,r)=p.reserve_for_create(&["*".into()],&TagPreferences { avoid_hosts:vec!["alpha".into(),"beta".into()], ..Default::default() },Duration::from_secs(1)).await.unwrap();
+        assert_eq!(u.id,"gamma"); r.finish();
+        let e=p.reserve_for_create(&["*".into()],&TagPreferences { avoid_hosts:vec!["alpha".into(),"beta".into(),"gamma".into()], ..Default::default() },Duration::from_secs(1)).await.unwrap_err();
+        assert!(e.contains("avoid_hosts"),"{e}");
+        // list_allowed still shows avoided hosts (avoid only affects create)
+        let ids:Vec<_>=p.list_allowed(&["*".into()]).await.into_iter().map(|u|u.id).collect();
+        assert_eq!(ids,["alpha","beta","gamma"]);
+    }
+
+    #[tokio::test]
+    async fn discovery_never_overwrites_manual_and_stale_blocks_create() {
+        let p=UpstreamPool::new();
+        p.upsert_with_metadata("local","http://manual",Source::Manual,vec![],None).await;
+        p.upsert_with_metadata("local","http://discovered",Source::Tailnet,vec![],None).await;
+        assert_eq!(p.get("local").await.unwrap().url,"http://manual");
+        assert_eq!(p.get("local").await.unwrap().source,Source::Manual);
+        p.upsert_with_metadata("ts-box","http://ts",Source::Tailnet,vec![],None).await;
+        p.mark("ts-box",UpstreamState::Online,Some(1),0).await;
+        p.mark("local",UpstreamState::Online,Some(1),0).await;
+        assert!(p.remove_discovered("local").await == false);
+        p.set_accept_creates("ts-box", false).await;
+        let (u,r)=p.reserve_for_create(&["*".into()],&TagPreferences::default(),Duration::from_secs(1)).await.unwrap();
+        assert_eq!(u.id,"local", "stale discovered host is skipped for create"); r.finish();
+        assert!(p.remove_discovered("ts-box").await);
+        assert!(p.get("ts-box").await.is_none());
     }
 }

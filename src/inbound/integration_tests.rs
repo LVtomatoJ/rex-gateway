@@ -1,8 +1,9 @@
 //! End-to-end tests: fake Rex control servers <-> real `ControlClient`/pool/probe <-> the real
 //! gateway router <-> a real WebSocket agent client, all over loopback sockets.
 use super::*;
+use std::collections::HashMap;
 use crate::{
-    control_client::ControlClient,
+    control_client::{ClientMap, ControlClient},
     pool::{Source, UpstreamState},
     probe,
 };
@@ -84,13 +85,12 @@ async fn start_gateway_with_limits(upstreams: &[(&str, &str)], call_timeout: Dur
 }
 async fn start_gateway_with_store(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration, ping_interval: Duration, idle_timeout: Duration, max_data_streams: usize, max_data_streams_per_token: usize, store: Option<crate::sessions::SessionStore>) -> Harness {
     let pool = UpstreamPool::new();
-    let mut clients = HashMap::new();
+    let clients = ClientMap::new();
     let (events, _) = broadcast::channel(32);
     for (id, url) in upstreams {
         pool.upsert(id, url, Source::Manual).await;
         clients.insert((*id).to_owned(), Arc::new(ControlClient::new((*id).to_owned(), (*url).to_owned(), crate::control_client::Options { call_timeout, ping_interval, idle_timeout }, events.clone())));
     }
-    let clients = Arc::new(clients);
     probe::spawn(pool.clone(), clients.clone(), probe_every);
     let metrics = Metrics::new();
     let state = AppState {
@@ -696,4 +696,30 @@ async fn persist_harness_restart_ttl_and_capacity_route_or_error() {
     h.state.sessions.reap_at(3);
     assert_eq!(rpc(&mut socket,"session.rename",json!({"session_id":"a:session:old"})).await["error"],crate::sessions::FORGOTTEN_ERROR);
     assert_eq!(rpc(&mut socket,"session.rename",json!({"session_id":"a:session:new"})).await,json!({"ok":true}));
+}
+
+#[tokio::test]
+async fn prefer_avoid_hosts_create_routing_and_list_visibility() {
+    let a=spawn_fake_rex(vec![json!({"session_id":"session:on-a"})],false).await;
+    let b=spawn_fake_rex(vec![json!({"session_id":"session:on-b"})],false).await;
+    let h=start_gateway(&[("host-a",&a),("host-b",&b)],tmo(500),Duration::from_secs(3600),tmo(300)).await;
+    h.pool.mark("host-a",UpstreamState::Online,Some(1),0).await;
+    h.pool.mark("host-b",UpstreamState::Online,Some(1),0).await;
+    let mut socket=control_agent(h.addr).await;
+    // prefer_hosts boosts host-b
+    let reply=rpc(&mut socket,"session.create",json!({"prefer_hosts":["host-b"]})).await;
+    assert_eq!(reply["session_id"],"host-b:session:created");
+    // avoid_hosts excludes host-b
+    let reply=rpc(&mut socket,"session.create",json!({"avoid_hosts":["host-b"]})).await;
+    assert_eq!(reply["session_id"],"host-a:session:created");
+    // hard host pin overrides avoid
+    let reply=rpc(&mut socket,"session.create",json!({"host":"host-b","avoid_hosts":["host-b"]})).await;
+    assert_eq!(reply["session_id"],"host-b:session:created", "explicit host pin wins over avoid_hosts");
+    // list still shows sessions on avoided hosts
+    let reply=rpc(&mut socket,"session.list",json!({})).await;
+    let listed=ids(&reply);
+    assert!(listed.iter().any(|id| id.starts_with("host-b:")), "avoid must not hide list: {listed:?}");
+    // all avoided → clear error
+    let reply=rpc(&mut socket,"session.create",json!({"avoid_hosts":["host-a","host-b"]})).await;
+    assert!(reply["error"].as_str().unwrap().contains("avoid_hosts"), "{reply}");
 }

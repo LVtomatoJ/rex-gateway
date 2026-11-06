@@ -22,18 +22,29 @@ pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
 /// compared values always have the same length, hiding token length) and compared against
 /// *every* configured digest in constant time, with no early exit on the first match.
 #[derive(Clone)]
-pub struct TokenEntry { pub token: String, pub acl: Vec<String>, pub prefer_tags: Vec<String>, pub avoid_tags: Vec<String> }
+pub struct TokenEntry {
+    pub token: String, pub acl: Vec<String>,
+    pub prefer_tags: Vec<String>, pub avoid_tags: Vec<String>,
+    pub prefer_hosts: Vec<String>, pub avoid_hosts: Vec<String>,
+}
 #[derive(Clone)]
-pub struct Identity { pub acl: Vec<String>, pub prefer_tags: Vec<String>, pub avoid_tags: Vec<String> }
+pub struct Identity {
+    pub acl: Vec<String>,
+    pub prefer_tags: Vec<String>, pub avoid_tags: Vec<String>,
+    pub prefer_hosts: Vec<String>, pub avoid_hosts: Vec<String>,
+}
 pub struct Authenticator { tokens: Vec<(Digest32, Identity)> }
 
 impl Authenticator {
     #[cfg(test)]
     pub fn new(tokens: HashMap<String, Vec<String>>) -> Self {
-        Self::from_entries(tokens.into_iter().map(|(token, acl)| TokenEntry { token, acl, prefer_tags: Vec::new(), avoid_tags: Vec::new() }).collect())
+        Self::from_entries(tokens.into_iter().map(|(token, acl)| TokenEntry { token, acl, prefer_tags: Vec::new(), avoid_tags: Vec::new(), prefer_hosts: Vec::new(), avoid_hosts: Vec::new() }).collect())
     }
     pub fn from_entries(tokens: Vec<TokenEntry>) -> Self {
-        Self { tokens: tokens.into_iter().map(|entry| (digest(entry.token.as_bytes()), Identity { acl: entry.acl, prefer_tags: entry.prefer_tags, avoid_tags: entry.avoid_tags })).collect() }
+        Self { tokens: tokens.into_iter().map(|entry| (digest(entry.token.as_bytes()), Identity {
+            acl: entry.acl, prefer_tags: entry.prefer_tags, avoid_tags: entry.avoid_tags,
+            prefer_hosts: entry.prefer_hosts, avoid_hosts: entry.avoid_hosts,
+        })).collect() }
     }
 
     pub fn acl(&self, bearer: Option<&str>) -> Option<Vec<String>> {

@@ -1,11 +1,12 @@
-use std::{collections::HashMap,sync::Arc,time::{Duration,Instant}};
+use std::time::{Duration,Instant};
 use serde_json::json;
-use crate::{control_client::ControlClient,pool::{UpstreamPool,UpstreamState}};
+use crate::{control_client::{ClientMap, ControlClient},pool::{UpstreamPool,UpstreamState}};
 
 /// Probes every upstream once. Upstreams are probed concurrently so one hung upstream cannot
 /// delay the health of the others.
-pub async fn probe_all(pool:&UpstreamPool,clients:&HashMap<String,Arc<ControlClient>>) {
-    futures_util::future::join_all(clients.iter().map(|(id,client)|probe_one(pool,id,client))).await;
+pub async fn probe_all(pool:&UpstreamPool,clients:&ClientMap) {
+    let snapshot = clients.snapshot();
+    futures_util::future::join_all(snapshot.iter().map(|(id,client)|probe_one(pool,id,client))).await;
 }
 
 async fn probe_one(pool:&UpstreamPool,id:&str,client:&ControlClient) {
@@ -23,7 +24,7 @@ async fn probe_one(pool:&UpstreamPool,id:&str,client:&ControlClient) {
     }
 }
 
-pub fn spawn(pool:UpstreamPool,clients:Arc<HashMap<String,Arc<ControlClient>>>,interval:Duration) {
+pub fn spawn(pool:UpstreamPool,clients:ClientMap,interval:Duration) {
     tokio::spawn(async move {
         let mut ticker=tokio::time::interval(interval);ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {

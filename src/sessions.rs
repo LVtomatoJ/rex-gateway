@@ -94,7 +94,12 @@ impl SessionStore {
         tokio::spawn(async move{let mut tick=tokio::time::interval(period);tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);loop{tick.tick().await;store.reap();}})
     }
     #[cfg(test)] pub fn len(&self)->usize{self.lock().disk.entries.len()}
+    /// True when any remembered reference is owned by `upstream` (sticky discovery check).
+    pub fn has_upstream(&self, upstream: &str) -> bool {
+        self.lock().disk.entries.values().any(|e| e.upstream == upstream)
+    }
 }
+
 
 #[cfg(test)]mod tests{
  use super::*;

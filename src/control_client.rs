@@ -1,4 +1,4 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::{Arc, Mutex}, time::Duration};
 use tokio::time::Instant;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -201,4 +201,22 @@ mod tests {
         assert_eq!(backoff_delay(u32::MAX), BACKOFF_MAX);
         assert_eq!(backoff_delay(0), BACKOFF_BASE);
     }
+}
+
+
+/// Shared, mutable registry of lazy upstream control clients (Manual + discovered).
+#[derive(Clone, Default)]
+pub struct ClientMap { inner: Arc<Mutex<HashMap<String, Arc<ControlClient>>>> }
+
+impl ClientMap {
+    pub fn new() -> Self { Self::default() }
+    pub fn insert(&self, id: String, client: Arc<ControlClient>) { self.inner.lock().expect("clients").insert(id, client); }
+    pub fn get(&self, id: &str) -> Option<Arc<ControlClient>> { self.inner.lock().expect("clients").get(id).cloned() }
+    pub fn remove(&self, id: &str) -> Option<Arc<ControlClient>> { self.inner.lock().expect("clients").remove(id) }
+    pub fn contains(&self, id: &str) -> bool { self.inner.lock().expect("clients").contains_key(id) }
+    pub fn keys(&self) -> Vec<String> {
+        let mut keys: Vec<_> = self.inner.lock().expect("clients").keys().cloned().collect();
+        keys.sort(); keys
+    }
+    pub fn snapshot(&self) -> HashMap<String, Arc<ControlClient>> { self.inner.lock().expect("clients").clone() }
 }

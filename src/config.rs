@@ -48,6 +48,9 @@ pub struct Config {
     /// Maximum remembered sessions; the least-recently active are forgotten first.
     #[serde(default = "default_session_max")]
     pub session_max: usize,
+    /// Optional rex-discover JSON file watcher that fills the upstream pool.
+    #[serde(default)]
+    pub discovery: DiscoveryConfig,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -67,6 +70,25 @@ pub struct TokenConfig {
     pub allow: Vec<String>,
     #[serde(default)] pub prefer_tags: Vec<String>,
     #[serde(default)] pub avoid_tags: Vec<String>,
+    #[serde(default)] pub prefer_hosts: Vec<String>,
+    #[serde(default)] pub avoid_hosts: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscoveryConfig {
+    /// Path to a JSON file in `rex-discover --json` format; re-read on interval when set.
+    pub file: Option<PathBuf>,
+    /// How often to re-read `file` (ignored when `file` is unset).
+    #[serde(default = "default_discovery_interval")]
+    pub interval_ms: u64,
+    /// Optional path to persist the last successfully applied discovery snapshot.
+    pub store_path: Option<PathBuf>,
+}
+
+impl Default for DiscoveryConfig {
+    fn default() -> Self {
+        Self { file: None, interval_ms: default_discovery_interval(), store_path: None }
+    }
 }
 
 fn default_listen() -> SocketAddr { "127.0.0.1:7300".parse().unwrap() }
@@ -83,6 +105,7 @@ fn default_reservation_ttl() -> u64 { 5_000 }
 fn default_session_store() -> PathBuf { PathBuf::from("rex-gateway-sessions.json") }
 fn default_session_ttl() -> u64 { 86_400_000 }
 fn default_session_max() -> usize { 16_384 }
+fn default_discovery_interval() -> u64 { 30_000 }
 
 impl Config {
     pub fn load() -> Result<Self> {
@@ -108,11 +131,16 @@ impl Config {
         if let Some(v) = env("REX_GATEWAY_SESSION_STORE_PATH") { config.session_store_path = v.into(); }
         if let Some(v) = env("REX_GATEWAY_SESSION_TTL_MS") { config.session_ttl_ms = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_SESSION_MAX") { config.session_max = v.parse()?; }
+        if let Some(v) = env("REX_GATEWAY_DISCOVERY_FILE") { config.discovery.file = Some(v.into()); }
+        if let Some(v) = env("REX_GATEWAY_DISCOVERY_INTERVAL_MS") { config.discovery.interval_ms = v.parse()?; }
+        if let Some(v) = env("REX_GATEWAY_DISCOVERY_STORE_PATH") { config.discovery.store_path = Some(v.into()); }
         // Per-upstream environment keys use the exact ID: REX_GATEWAY_UPSTREAM_<ID>_{TAGS,DESCRIPTION}.
         // Tags are comma-separated; an unset variable leaves TOML unchanged.
         for (index, token) in config.auth.tokens.iter_mut().enumerate() {
             if let Some(v) = env(&format!("REX_GATEWAY_AUTH_TOKEN_{index}_PREFER_TAGS")) { token.prefer_tags = parse_list(&v); }
             if let Some(v) = env(&format!("REX_GATEWAY_AUTH_TOKEN_{index}_AVOID_TAGS")) { token.avoid_tags = parse_list(&v); }
+            if let Some(v) = env(&format!("REX_GATEWAY_AUTH_TOKEN_{index}_PREFER_HOSTS")) { token.prefer_hosts = parse_list(&v); }
+            if let Some(v) = env(&format!("REX_GATEWAY_AUTH_TOKEN_{index}_AVOID_HOSTS")) { token.avoid_hosts = parse_list(&v); }
         }
         for upstream in &mut config.upstreams {
             let prefix = format!("REX_GATEWAY_UPSTREAM_{}", upstream.id);
@@ -122,7 +150,10 @@ impl Config {
         if let Some(url) = env("REX_GATEWAY_UPSTREAM_LOCAL_URL") {
             if let Some(upstream) = config.upstreams.iter_mut().find(|u| u.id == "local") { upstream.url = url; }
         }
-        if config.upstreams.is_empty() || config.probe_interval_ms == 0 { bail!("at least one upstream and a nonzero probe interval are required"); }
+        let discovery_enabled = config.discovery.file.as_ref().is_some_and(|p| !p.as_os_str().is_empty());
+        if config.upstreams.is_empty() && !discovery_enabled { bail!("at least one upstream is required (or set discovery.file)"); }
+        if config.probe_interval_ms == 0 { bail!("a nonzero probe interval is required"); }
+        if discovery_enabled && config.discovery.interval_ms == 0 { bail!("discovery.interval_ms must be nonzero when discovery.file is set"); }
         if config.ticket_ttl_ms == 0 || config.ticket_max == 0 || config.ws_ping_interval_ms == 0 || config.ws_idle_timeout_ms == 0 { bail!("ticket_ttl_ms, ticket_max, ws_ping_interval_ms and ws_idle_timeout_ms must be nonzero"); }
         if config.max_data_streams == 0 || config.max_data_streams_per_token == 0 { bail!("max_data_streams and max_data_streams_per_token must be nonzero"); }
         if config.ws_idle_timeout_ms <= config.ws_ping_interval_ms { bail!("ws_idle_timeout_ms must exceed ws_ping_interval_ms"); }
@@ -144,6 +175,7 @@ impl Config {
             result.push(crate::auth::TokenEntry {
                 token: item.token.clone(), acl: item.allow.clone(),
                 prefer_tags: item.prefer_tags.clone(), avoid_tags: item.avoid_tags.clone(),
+                prefer_hosts: item.prefer_hosts.clone(), avoid_hosts: item.avoid_hosts.clone(),
             });
         }
         if result.is_empty() { bail!("at least one token is required"); }
@@ -287,5 +319,51 @@ avoid_tags=["clash"]
         assert_eq!(c.upstreams[0].description.as_deref(),Some("Mac build host"));
         assert_eq!(c.create_reservation_ttl_ms,250);
         assert!(Config::from_toml("create_reservation_ttl_ms=0\n".to_owned().as_str(), |_| None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod host_and_discovery_tests {
+    use super::*;
+    const BASE: &str = r#"[[upstreams]]
+id="high-mem"
+url="http://a"
+[[auth.tokens]]
+token="t"
+allow=["*"]
+prefer_hosts=["high-mem"]
+avoid_hosts=["clash-box"]
+"#;
+    #[test]
+    fn prefer_avoid_hosts_and_discovery_config() {
+        let c=Config::from_toml(BASE, |_| None).unwrap();
+        let auth=c.auth_entries().unwrap();
+        assert_eq!(auth[0].prefer_hosts,["high-mem"]);
+        assert_eq!(auth[0].avoid_hosts,["clash-box"]);
+        assert!(c.discovery.file.is_none());
+        assert_eq!(c.discovery.interval_ms,30_000);
+        let toml = format!("[discovery]\nfile=\"discovered.json\"\ninterval_ms=1000\nstore_path=\"snap.json\"\n{BASE}");
+        let c=Config::from_toml(&toml, |_| None).unwrap();
+        assert_eq!(c.discovery.file.as_deref(), Some(std::path::Path::new("discovered.json")));
+        assert_eq!(c.discovery.interval_ms,1000);
+        assert_eq!(c.discovery.store_path.as_deref(), Some(std::path::Path::new("snap.json")));
+        let env=|k:&str| match k {
+            "REX_GATEWAY_AUTH_TOKEN_0_PREFER_HOSTS"=>Some("a, b".into()),
+            "REX_GATEWAY_AUTH_TOKEN_0_AVOID_HOSTS"=>Some("c".into()),
+            "REX_GATEWAY_DISCOVERY_FILE"=>Some("env.json".into()),
+            "REX_GATEWAY_DISCOVERY_INTERVAL_MS"=>Some("500".into()),
+            "REX_GATEWAY_DISCOVERY_STORE_PATH"=>Some("env-store.json".into()),
+            _=>None
+        };
+        let c=Config::from_toml(BASE,env).unwrap();
+        assert_eq!(c.auth_entries().unwrap()[0].prefer_hosts,["a","b"]);
+        assert_eq!(c.auth_entries().unwrap()[0].avoid_hosts,["c"]);
+        assert_eq!(c.discovery.file.as_deref(), Some(std::path::Path::new("env.json")));
+        assert_eq!(c.discovery.interval_ms,500);
+        assert_eq!(c.discovery.store_path.as_deref(), Some(std::path::Path::new("env-store.json")));
+        let c=Config::from_toml("[[auth.tokens]]\ntoken=\"t\"\nallow=[\"*\"]\n[discovery]\nfile=\"d.json\"\n", |_| None).unwrap();
+        assert!(c.upstreams.is_empty());
+        assert!(Config::from_toml("[[auth.tokens]]\ntoken=\"t\"\nallow=[\"*\"]\n", |_| None).is_err());
+        assert!(Config::from_toml(&format!("[discovery]\nfile=\"d.json\"\ninterval_ms=0\n{BASE}"), |_| None).is_err());
     }
 }
