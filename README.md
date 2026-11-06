@@ -81,7 +81,10 @@ When the agent sends binary `0x01 || ticket`, the gateway consumes that ticket o
 connects to the owning upstream, and sends the real binary HELLO. ACCEPT/REJECT, terminal
 snapshots, terminal output, and agent input are relayed frame-for-frame between the data
 sockets. Ping/pong and close frames, including close codes and reasons, are forwarded.
-This is not a terminal protocol parser and does not rewrite bytes inside stream frames.
+The gateway also originates keepalive pings on both legs and idle-closes both sides with
+`1001 "idle timeout"` when no application (binary/text) traffic arrives for
+`ws_idle_timeout_ms`. This is not a terminal protocol parser and does not rewrite bytes
+inside stream frames.
 
 Tickets are kept in memory, single-use and bound to the bearer token. An unused ticket lives
 at most `ticket_ttl_ms` (default 30000 ms): expiry is enforced when the ticket is consumed and

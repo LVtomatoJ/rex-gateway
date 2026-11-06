@@ -167,6 +167,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             _=pings.tick()=>if sink.send(Message::Ping(Vec::new())).await.is_err() { break; },
             _=idle.tick()=>if last_activity.elapsed()>=state.options.idle_timeout {
                 let _=sink.send(Message::Close(Some(CloseFrame { code:1001, reason:Cow::Borrowed("idle timeout") }))).await;
+                let _=sink.close().await;
                 break;
             }
         }
@@ -358,6 +359,8 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
             _=idle.tick()=>if last_activity.elapsed()>=state.options.idle_timeout {
                 let _=agent_sink.send(Message::Close(Some(CloseFrame { code:1001,reason:Cow::Borrowed("idle timeout") }))).await;
                 let _=upstream_sink.send(tungstenite::Message::Close(Some(tungstenite::protocol::CloseFrame { code:1001.into(),reason:"idle timeout".into() }))).await;
+                let _=agent_sink.close().await;
+                let _=upstream_sink.close().await;
                 break;
             }
         }

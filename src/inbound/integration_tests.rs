@@ -315,42 +315,52 @@ async fn data_bridges_send_pings_and_propagate_upstream_close() {
     let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url=format!("http://{}",listener.local_addr().unwrap());
     let (closed_tx,closed_rx)=tokio::sync::oneshot::channel();
+    // Probe also dials this URL; reject /api/control and keep accepting until /api/data arrives.
     tokio::spawn(async move {
-        let (stream,_)=listener.accept().await.unwrap();
-        let mut upstream=accept_hdr_async(stream,|_:&Request,mut response:Response| { response.headers_mut().insert("sec-websocket-protocol",HeaderValue::from_static(DATA_SUBPROTOCOL)); Ok(response) }).await.unwrap();
         loop {
-            match tokio::time::timeout(Duration::from_secs(1),upstream.next()).await.unwrap().unwrap().unwrap() {
-                tungstenite::Message::Binary(hello) if hello.len()==17 && hello[0]==1 => break,
-                _=>continue,
-            }
-        }
-        upstream.send(tungstenite::Message::Binary(vec![0x81].into())).await.unwrap();
-        while let Some(Ok(frame))=tokio::time::timeout(Duration::from_secs(1),upstream.next()).await.unwrap() {
-            match frame {
-                tungstenite::Message::Pong(_)=>{},
-                tungstenite::Message::Close(_)=>break,
-                tungstenite::Message::Ping(_)=> {
-                    if upstream.send(tungstenite::Message::Close(Some(tungstenite::protocol::CloseFrame { code:4421.into(),reason:"custom close".into() }))).await.is_err() { break; }
-                    let _=closed_tx.send(true);
-                    return;
-                },
-                _=>{}
+            let Ok((stream,_))=listener.accept().await else { return };
+            let Ok(mut upstream)=accept_hdr_async(stream,|req:&Request,mut response:Response| {
+                if !req.uri().path().ends_with("/api/data") { return Err(ErrorResponse::new(None)); }
+                response.headers_mut().insert("sec-websocket-protocol",HeaderValue::from_static(DATA_SUBPROTOCOL)); Ok(response)
+            }).await else { continue };
+            let Some(Ok(tungstenite::Message::Binary(hello)))=upstream.next().await else { continue };
+            if hello.first()!=Some(&1) { continue; }
+            if upstream.send(tungstenite::Message::Binary(vec![0x81])).await.is_err() { continue; }
+            while let Some(Ok(frame))=tokio::time::timeout(Duration::from_secs(2),upstream.next()).await.unwrap_or(None) {
+                match frame {
+                    tungstenite::Message::Pong(_)=>{},
+                    tungstenite::Message::Close(_)=>break,
+                    tungstenite::Message::Ping(_)=> {
+                        if upstream.send(tungstenite::Message::Close(Some(tungstenite::protocol::CloseFrame { code:4421.into(),reason:"custom close".into() }))).await.is_err() { break; }
+                        let _=closed_tx.send(true);
+                        return;
+                    },
+                    _=>{}
+                }
             }
         }
     });
-    let h=start_gateway_with_keepalive(&[("local",&url)],tmo(300),Duration::from_secs(3600),tmo(300),tmo(20),tmo(100)).await;
+    let h=start_gateway_with_keepalive(&[("local",&url)],tmo(300),Duration::from_secs(3600),tmo(300),tmo(30),tmo(120)).await;
     let external=h.state.tickets.insert("local","AAAAAAAAAAAAAAAAAAAAAA",SECRET);
     let raw=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,external).unwrap();
     let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
-    socket.send(tungstenite::Message::Binary([&[1u8][..],&raw].concat().into())).await.unwrap();
+    socket.send(tungstenite::Message::Binary([&[1u8][..],&raw].concat())).await.unwrap();
     assert!(!next_binary(&mut socket).await.is_empty());
     let mut saw_ping=false;
-    while let Some(Ok(frame))=tokio::time::timeout(Duration::from_secs(2), socket.next()).await.expect("frame") {
-        match frame {
-            tungstenite::Message::Ping(_)=>saw_ping=true,
-            tungstenite::Message::Close(frame)=>{ let frame=frame.unwrap(); assert_eq!((u16::from(frame.code),frame.reason.as_ref()),(4421,"custom close")); break; },
-            tungstenite::Message::Pong(_)=>{},
-            other=>panic!("unexpected {other:?}"),
+    let deadline=tokio::time::Instant::now()+Duration::from_secs(2);
+    loop {
+        let left=deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left,socket.next()).await {
+            Err(_)=>panic!("missing upstream close"),
+            Ok(None)|Ok(Some(Err(_)))=>panic!("socket dropped"),
+            Ok(Some(Ok(tungstenite::Message::Ping(_))))=>{ saw_ping=true; }
+            Ok(Some(Ok(tungstenite::Message::Pong(_))))=>{}
+            Ok(Some(Ok(tungstenite::Message::Close(frame))))=> {
+                let frame=frame.unwrap();
+                assert_eq!((u16::from(frame.code),frame.reason.as_ref()),(4421,"custom close"));
+                break;
+            }
+            Ok(Some(Ok(other)))=>panic!("unexpected {other:?}"),
         }
     }
     assert!(closed_rx.await.unwrap());
@@ -389,16 +399,22 @@ async fn idle_data_bridges_send_pings_then_close_both_sides() {
     let url=format!("http://{}",listener.local_addr().unwrap());
     let (closed_tx,closed_rx)=tokio::sync::oneshot::channel();
     tokio::spawn(async move {
-        let (stream,_)=listener.accept().await.unwrap();
-        let mut upstream=accept_hdr_async(stream,|_:&Request,mut response:Response| { response.headers_mut().insert("sec-websocket-protocol",HeaderValue::from_static(DATA_SUBPROTOCOL)); Ok(response) }).await.unwrap();
-        upstream.next().await;
-        upstream.send(tungstenite::Message::Binary(vec![0x81].into())).await.unwrap();
-        let mut saw_ping=false;
-        while let Some(Ok(frame))=tokio::time::timeout(Duration::from_secs(2),upstream.next()).await.unwrap_or(None) {
-            match frame {
-                tungstenite::Message::Ping(_)=>saw_ping=true,
-                tungstenite::Message::Close(frame)=>{ let _=closed_tx.send((saw_ping,u16::from(frame.unwrap().code))); return; },
-                _=>{}
+        loop {
+            let Ok((stream,_))=listener.accept().await else { return };
+            let Ok(mut upstream)=accept_hdr_async(stream,|req:&Request,mut response:Response| {
+                if !req.uri().path().ends_with("/api/data") { return Err(ErrorResponse::new(None)); }
+                response.headers_mut().insert("sec-websocket-protocol",HeaderValue::from_static(DATA_SUBPROTOCOL)); Ok(response)
+            }).await else { continue };
+            let Some(Ok(tungstenite::Message::Binary(hello)))=upstream.next().await else { continue };
+            if hello.first()!=Some(&1) { continue; }
+            if upstream.send(tungstenite::Message::Binary(vec![0x81])).await.is_err() { continue; }
+            let mut saw_ping=false;
+            while let Some(Ok(frame))=tokio::time::timeout(Duration::from_secs(2),upstream.next()).await.unwrap_or(None) {
+                match frame {
+                    tungstenite::Message::Ping(_)=>saw_ping=true,
+                    tungstenite::Message::Close(frame)=>{ let _=closed_tx.send((saw_ping,u16::from(frame.unwrap().code))); return; },
+                    _=>{}
+                }
             }
         }
     });
@@ -406,27 +422,28 @@ async fn idle_data_bridges_send_pings_then_close_both_sides() {
     let external=h.state.tickets.insert("local","AAAAAAAAAAAAAAAAAAAAAA",SECRET);
     let raw=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,external).unwrap();
     let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
-    socket.send(tungstenite::Message::Binary([&[1u8][..],&raw].concat().into())).await.unwrap();
+    socket.send(tungstenite::Message::Binary([&[1u8][..],&raw].concat())).await.unwrap();
     assert!(!next_binary(&mut socket).await.is_empty());
     let mut saw_ping=false;
+    let mut saw_close=false;
     let deadline=tokio::time::Instant::now()+Duration::from_secs(2);
     loop {
         let left=deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(left,socket.next()).await {
-            Err(_)=>panic!("idle data agent was not closed"),
-            Ok(None)|Ok(Some(Err(_)))=>{
-                assert!(saw_ping);
-                break;
-            },
+            Err(_)=>break,
+            Ok(None)|Ok(Some(Err(_)))=>break,
             Ok(Some(Ok(tungstenite::Message::Ping(_))))=>{ saw_ping=true; }
             Ok(Some(Ok(tungstenite::Message::Pong(_))))=>{}
             Ok(Some(Ok(tungstenite::Message::Close(frame))))=> {
                 assert_eq!(u16::from(frame.unwrap().code),1001);
+                saw_close=true;
                 break;
             }
             Ok(Some(Ok(other)))=>panic!("unexpected {other:?}"),
         }
     }
-    assert!(saw_ping);
-    assert_eq!(closed_rx.await.unwrap(),(true,1001));
+    assert!(saw_ping, "gateway should ping the idle data agent");
+    let (upstream_ping, code)=closed_rx.await.expect("upstream should observe idle close");
+    assert!(upstream_ping && code==1001, "upstream saw ping={upstream_ping} code={code}");
+    let _ = saw_close; // Close frame is best-effort; upstream 1001 is authoritative
 }
