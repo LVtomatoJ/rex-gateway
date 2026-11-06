@@ -24,7 +24,7 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
-  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 16).
+  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 17).
 * `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
   namespaced IDs in sorted upstream-ID order. Upstreams that are not routable (`Online` or
   `Degraded`), or that error or time out, are skipped and reported: the response then also carries
@@ -71,6 +71,13 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
   and gateway ticket rewrites (events are namespaced once and recorded into the session store;
   they are not re-wrapped). Event and response sequence numbers share one monotonically
   increasing per-agent sequence; request/response IDs retain upstream-independent correlation.
+* Rex frame-level errors (`{"type":"response","id":…,"error":{"code","message","status"}}`,
+  no `payload`) are forwarded to the agent with the same top-level `error` object. The gateway
+  does not collapse them to `payload: null`, does not decorate failed `session.bootstrap` with
+  upstream metadata, and does not replace a real `data.connect` frame error with a synthetic
+  "omitted ticket" message. Payload-level `{"error":…}` replies (if an upstream uses them) still
+  pass through inside `payload`. Gateway-originated failures remain `payload: {"error":"<string>"}`.
+  Frame-level application errors do not trigger hostless transport failover.
 * Probes use `session.list`: success under 1 second = Online, under/over threshold =
   Degraded; two consecutive failed probes = Offline. First failure is Degraded, initial
   state Unknown. Socket reconnection and a fresh hello happen on the next call.
@@ -103,7 +110,9 @@ Reservation and selection happen under one mutex, so simultaneous clients observ
 load. Completion or failure releases the guard; forced expiry is reaped at selection/status time. `/status`
 reports real sessions, outstanding reserves and their sum (`effective_session_count`), alongside
 `tags`, `description`, `latency_ms`, and `state`. `session.bootstrap` adds the owning `upstream` and an
-ACL-filtered `upstreams` array with the same capability/load fields. Unavailable owners cause bootstrap
+ACL-filtered `upstreams` array with the same capability/load fields. Real Rex requires
+`event_scope` of `"session"` or `"all"` on bootstrap (otherwise Rex returns a frame-level
+`bad_request` which the gateway now forwards unchanged). Unavailable owners cause bootstrap
 to error with remove/recreate guidance; the data plane still closes 1011 on unexpected stream loss.
 CPU is not gathered by Rex probes, so session count is the current load signal.
 

@@ -35,5 +35,14 @@ expected=response['payload']['sessions'][0]['session_id']
 assert response['id']=='smoke-list';assert response['payload']['sessions'] and expected.startswith('local:session:')
 print('PASS: namespaced local session found')
 frame(s,{'type':'request','id':'smoke-version','method':'server.version','payload':{}});op,data=recv(s);print('server.version (default local) ->',data.decode());assert json.loads(data)['id']=='smoke-version'
-frame(s,{'type':'request','id':'smoke-route','method':'session.rename','payload':{'session_id':expected,'label':'bold-strait'}});op,data=recv(s);print('routed session.rename ->',data.decode());assert json.loads(data)['id']=='smoke-route'
+# session.attach is the live Rex sticky-session RPC (session.rename is gone on current Rex).
+frame(s,{'type':'request','id':'smoke-route','method':'session.attach','payload':{'session_id':expected,'event_scope':'session'}})
+# Drain any events until the matching response.
+while True:
+    op,data=recv(s); msg=json.loads(data)
+    if msg.get('type')=='response' and msg.get('id')=='smoke-route': break
+print('routed session.attach ->',json.dumps(msg)[:500])
+assert msg['id']=='smoke-route'
+assert 'error' not in msg, msg
+assert msg['payload']['view']['session_id']==expected
 s.close();print('PASS: default method and namespaced session routing')

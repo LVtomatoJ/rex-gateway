@@ -4,6 +4,8 @@ probe_interval_ms = 1000
 [[upstreams]]
 id = "local"
 url = "http://127.0.0.1:7297"
+tags = ["perf", "ci"]
+description = "Local performance compile host"
 
 [[auth.tokens]]
 token = "smoke-secret"

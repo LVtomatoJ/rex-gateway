@@ -7,18 +7,23 @@ s,status=connect('smoke-secret');assert '101' in status
 frame(s,{'type':'hello'});assert json.loads(recv(s)[1])['type']=='welcome'
 def rpc(method,payload):
     frame(s,{'type':'request','id':'tags','method':method,'payload':payload})
-    return json.loads(recv(s)[1])['payload']
+    reply=json.loads(recv(s)[1])
+    # Gateway-originated errors stay in payload.error; Rex frame errors are top-level.
+    if 'error' in reply and 'payload' not in reply:
+        return {'error': reply['error']}
+    return reply['payload']
 sessions=rpc('session.list',{})['sessions']
 assert sessions
 session_id=sessions[0]['session_id']
-bootstrap=rpc('session.bootstrap',{'session_id':session_id})
+# Real Rex requires event_scope on session.bootstrap / attach_all.
+bootstrap=rpc('session.bootstrap',{'session_id':session_id,'event_scope':'session'})
 assert bootstrap['upstream']['id']=='local'
 assert bootstrap['upstream']['tags']==['perf','ci']
 assert bootstrap['upstream']['description']=='Local performance compile host'
 assert isinstance(bootstrap['upstream']['session_count'],int)
 assert bootstrap['upstreams'][0]['effective_session_count'] >= bootstrap['upstreams'][0]['session_count']
 print('PASS bootstrap exposes ACL-scoped tags, description and load')
-preferred=rpc('session.bootstrap',{'session_id':session_id,'prefer_tags':['perf'],'avoid_tags':['prod-svc']})
+preferred=rpc('session.bootstrap',{'session_id':session_id,'event_scope':'session','prefer_tags':['perf'],'avoid_tags':['prod-svc']})
 assert preferred['upstream']['id']=='local'
 print('PASS matching preferences reach the tagged real upstream')
 avoided=rpc('session.create',{'prefer_tags':['perf'],'avoid_tags':['perf']})
