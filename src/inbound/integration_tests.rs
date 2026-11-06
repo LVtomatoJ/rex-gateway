@@ -152,6 +152,62 @@ async fn spawn_fake_rex_method_app_error(method: &str, error: &str) -> String {
     url
 }
 
+
+/// Fake Rex that answers matching methods with a Rex frame-level `response.error` (no payload),
+/// matching real Rex (`method_not_found` / `bad_request` / …).
+async fn spawn_fake_rex_frame_error(method: &str, error: Value) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let method = method.to_owned();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let method = method.clone();
+            let error = error.clone();
+            tokio::spawn(async move {
+                let callback = |_: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+                    response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(SUBPROTOCOL));
+                    Ok(response)
+                };
+                let Ok(mut socket) = accept_hdr_async(stream, callback).await else { return };
+                while let Some(Ok(frame)) = socket.next().await {
+                    let tungstenite::Message::Text(text) = frame else { continue };
+                    let message: Value = serde_json::from_str(&text).unwrap();
+                    match message["type"].as_str() {
+                        Some("hello") => { let _ = socket.send(tungstenite::Message::Text(json!({"type":"welcome"}).to_string())).await; }
+                        Some("request") => {
+                            let reply = if message["method"] == "session.list" {
+                                json!({"type":"response","id":message["id"],"payload":{"sessions":[]}})
+                            } else if message["method"].as_str() == Some(method.as_str()) {
+                                json!({"type":"response","id":message["id"],"error":error})
+                            } else {
+                                json!({"type":"response","id":message["id"],"payload":{"ok":true}})
+                            };
+                            let _ = socket.send(tungstenite::Message::Text(reply.to_string())).await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+    url
+}
+
+async fn rpc_frame(socket: &mut Agent, method: &str, payload: Value) -> Value {
+    socket.send(tungstenite::Message::Text(json!({"type":"request","id":"r1","method":method,"payload":payload}).to_string())).await.unwrap();
+    let raw = loop {
+        match tokio::time::timeout(Duration::from_secs(10), socket.next()).await.expect("gateway must answer").unwrap().unwrap() {
+            tungstenite::Message::Text(text)=>break text,
+            tungstenite::Message::Ping(bytes)=> { socket.send(tungstenite::Message::Pong(bytes)).await.unwrap(); }
+            other=>panic!("expected controlled response, got {other:?}"),
+        }
+    };
+    let reply: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(reply["id"], "r1");
+    reply
+}
+
 struct Harness { addr: SocketAddr, pool: UpstreamPool, state: AppState }
 
 /// Builds the same wiring as `main` (lazy clients, probe loop) around the given upstreams.
@@ -971,4 +1027,51 @@ async fn hostless_all_transport_failures_aggregate_error() {
     let snap = h.state.metrics.snapshot();
     assert_eq!(snap.hostless_transport_failovers, 2, "{snap:?}");
     assert_eq!(snap.hostless_failover_exhausted, 1, "{snap:?}");
+}
+
+
+#[tokio::test]
+async fn forwards_rex_frame_level_errors_without_decorating() {
+    let err = json!({"code":"bad_request","message":"event_scope must be \"all\" or \"session\"","status":400});
+    let live = spawn_fake_rex_frame_error("session.bootstrap", err.clone()).await;
+    let h = start_gateway(&[("local", &live)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    wait_state(&h.pool, "local", UpstreamState::Online).await;
+    let mut socket = control_agent(h.addr).await;
+    let frame = rpc_frame(&mut socket, "session.bootstrap", json!({"session_id":"local:session:x"})).await;
+    assert!(frame.get("payload").is_none() || frame["payload"].is_null(), "must not invent a success payload: {frame}");
+    assert_eq!(frame["error"], err, "{frame}");
+    // Must not have been decorated with gateway upstream metadata.
+    assert!(frame.get("payload").and_then(|p| p.get("upstream")).is_none(), "{frame}");
+}
+
+#[tokio::test]
+async fn frame_level_create_error_does_not_failover() {
+    let err = json!({"code":"conflict","message":"quota exceeded","status":409});
+    // aaa sorts first; frame error must surface without trying zzz-ok.
+    let err_host = spawn_fake_rex_frame_error("session.create", err.clone()).await;
+    let ok_host = spawn_fake_rex(vec![], false).await;
+    let h = start_gateway(&[("aaa-err", &err_host), ("zzz-ok", &ok_host)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("aaa-err", UpstreamState::Online, Some(1), 0).await;
+    h.pool.mark("zzz-ok", UpstreamState::Online, Some(1), 0).await;
+    let mut socket = control_agent(h.addr).await;
+    let frame = rpc_frame(&mut socket, "session.create", json!({})).await;
+    assert_eq!(frame["error"], err, "{frame}");
+    assert!(frame.get("payload").is_none() || frame["payload"].is_null(), "{frame}");
+    let snap = h.state.metrics.snapshot();
+    assert_eq!(snap.create_transport_failovers, 0, "{snap:?}");
+    assert_eq!(snap.create_failover_exhausted, 0, "{snap:?}");
+}
+
+#[tokio::test]
+async fn frame_level_data_connect_error_is_not_masked() {
+    let err = json!({"code":"bad_request","message":"invalid data reference: reference is empty","status":400});
+    let live = spawn_fake_rex_frame_error("data.connect", err.clone()).await;
+    let h = start_gateway(&[("local", &live)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    wait_state(&h.pool, "local", UpstreamState::Online).await;
+    let mut socket = control_agent(h.addr).await;
+    // Record a session so resolve/touch succeed, then data.connect hits the frame error.
+    h.state.sessions.record("local", "session:x");
+    let frame = rpc_frame(&mut socket, "data.connect", json!({"session_id":"local:session:x"})).await;
+    assert_eq!(frame["error"], err, "must forward Rex error, not invent omitted-ticket: {frame}");
+    assert_ne!(frame.pointer("/payload/error").and_then(Value::as_str), Some("upstream data.connect omitted ticket"));
 }

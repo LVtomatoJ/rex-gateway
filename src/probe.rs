@@ -1,5 +1,5 @@
 use std::time::{Duration,Instant};
-use serde_json::json;
+use serde_json::{json, Value};
 use crate::{control_client::{ClientMap, ControlClient},pool::{UpstreamPool,UpstreamState}};
 
 /// Probes every upstream once. Upstreams are probed concurrently so one hung upstream cannot
@@ -12,7 +12,12 @@ pub async fn probe_all(pool:&UpstreamPool,clients:&ClientMap) {
 async fn probe_one(pool:&UpstreamPool,id:&str,client:&ControlClient) {
     let start=Instant::now();
     match tokio::time::timeout(Duration::from_secs(5),client.call_timeout("session.list",json!({}),Duration::from_secs(4))).await {
-        Ok(Ok(value))=>{
+        Ok(Ok(reply)) if reply.is_frame_error() => {
+            let message = reply.error.as_ref().and_then(|e| e.get("message")).and_then(Value::as_str).unwrap_or("upstream frame error");
+            pool.mark_failure(id, format!("session.list frame error: {message}")).await;
+        }
+        Ok(Ok(reply))=>{
+            let value = reply.payload;
             let latency=start.elapsed().as_millis() as u64;
             let sessions=value["sessions"].as_array();
             let count=sessions.map(|v|v.len()).unwrap_or(0);

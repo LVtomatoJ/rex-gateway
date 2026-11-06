@@ -23,7 +23,7 @@ use tokio_tungstenite::{
 use crate::{
     auth::{self, Authenticator},
     pool::{UpstreamState, TagPreferences},
-    control_client::{ClientMap, UpstreamEvent},
+    control_client::{ClientMap, UpstreamEvent, UpstreamReply},
     data::{decode_hello, TicketMap},
     discovery::DiscoveryHealth,
     metrics::{DataLimiter, Gauge, Metrics},
@@ -34,6 +34,23 @@ use crate::{
 };
 
 const DATA_SUBPROTOCOL: &str = "rex.data.terminal.v1";
+
+/// What the agent control response frame carries after a successful `handle`.
+/// Gateway-originated failures stay `Err(String)` → `payload: {"error":…}` for
+/// backward compatibility. Rex frame-level errors (`response.error`) are forwarded
+/// as [`AgentReply::FrameError`] so agents see the same shape as talking to Rex.
+enum AgentReply {
+    Payload(Value),
+    FrameError(Value),
+}
+
+fn reply_from_upstream(reply: UpstreamReply) -> AgentReply {
+    if let Some(error) = reply.error.filter(|e| !e.is_null()) {
+        AgentReply::FrameError(error)
+    } else {
+        AgentReply::Payload(reply.payload)
+    }
+}
 
 #[derive(Clone)]
 struct AppState {
@@ -140,7 +157,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":16});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":17});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -161,9 +178,12 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                         if message["type"] != "request" { continue; }
                         let id = message["id"].clone();
                         let method = message["method"].as_str().unwrap_or_default().to_owned();
-                        let response = handle(&state, &acl, &owner, &method, message["payload"].clone()).await.unwrap_or_else(|e| json!({"error":e.to_string()}));
+                        let response = match handle(&state, &acl, &owner, &method, message["payload"].clone()).await {
+                            Ok(AgentReply::Payload(payload)) => json!({"type":"response","id":id,"seq":seq+1,"payload":payload}),
+                            Ok(AgentReply::FrameError(error)) => json!({"type":"response","id":id,"seq":seq+1,"error":error}),
+                            Err(e) => json!({"type":"response","id":id,"seq":seq+1,"payload":{"error":e.to_string()}}),
+                        };
                         seq += 1;
-                        let response = json!({"type":"response","id":id,"seq":seq,"payload":response});
                         if sink.send(Message::Text(response.to_string())).await.is_err() { break; }
                     }
                     // Keepalive only: axum/tungstenite auto-answer pings. Pong must not
@@ -196,14 +216,14 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
     }
 }
 
-async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut payload: Value) -> Result<Value, String> {
+async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut payload: Value) -> Result<AgentReply, String> {
     let external_session=payload.get("session_id").and_then(Value::as_str).map(str::to_owned);
-    if method == "session.list" { return list_sessions(state, acl, &state.sessions).await; }
+    if method == "session.list" { return list_sessions(state, acl, &state.sessions).await.map(AgentReply::Payload); }
     if method == "session.forget" {
         let external=payload.get("session_id").and_then(Value::as_str).ok_or("session.forget requires session_id")?;
         let (upstream,_)=crate::protocol::unwrap_session_id(external).ok_or("invalid namespaced session_id")?;
         if !auth::Authenticator::permits(acl,upstream){return Err(format!("upstream {upstream} is not allowed"));}
-        return Ok(json!({"forgotten":state.sessions.forget(external)?,"session_id":external}));
+        return Ok(AgentReply::Payload(json!({"forgotten":state.sessions.forget(external)?,"session_id":external})));
     }
     if let Some(external)=payload.get("session_id").and_then(Value::as_str) {
         if crate::protocol::unwrap_session_id(external).is_some(){state.sessions.resolve(external)?;state.sessions.touch(external);}
@@ -250,11 +270,16 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
         object.remove("host"); object.remove("prefer_tags"); object.remove("avoid_tags");
         object.remove("prefer_hosts"); object.remove("avoid_hosts");
     }
-    let mut response = state.clients.get(&owner_upstream).ok_or("upstream client missing")?
+    let reply = state.clients.get(&owner_upstream).ok_or("upstream client missing")?
         .call(method, payload).await.map_err(|e| e.to_string())?;
+    if reply.is_frame_error() {
+        // Do not decorate failed bootstrap / invent "omitted ticket" over a real Rex error.
+        return Ok(reply_from_upstream(reply));
+    }
+    let mut response = reply.payload;
     if method == "session.create" {
         // Hard-pin create (no reservation). Hostless create returns earlier via create_with_failover.
-        if response.get("error").is_some() { return Ok(response); }
+        if response.get("error").is_some() { return Ok(AgentReply::Payload(response)); }
     }
     if method == "session.bootstrap" {
         response["upstream"] = json!({"id":upstream.id,"tags":upstream.tags,"description":upstream.description,"state":upstream.state.as_str(),"latency_ms":upstream.latency_ms,"session_count":upstream.session_count});
@@ -265,7 +290,7 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
     }
     namespace_and_record(&mut response, &owner_upstream, &state.tickets, owner, &state.sessions);
     if method=="data.connect" {if let (Some(ticket),Some(id))=(response.get("ticket").and_then(Value::as_str),external_session.as_deref()){state.tickets.bind_session(ticket,id);}}
-    Ok(response)
+    Ok(AgentReply::Payload(response))
 }
 
 /// Fans `session.list` out to every allowed upstream concurrently (each bounded by the upstream
@@ -286,7 +311,7 @@ async fn create_with_failover(
     owner: &str,
     prefs: TagPreferences,
     mut payload: Value,
-) -> Result<Value, String> {
+) -> Result<AgentReply, String> {
     if let Some(object) = payload.as_object_mut() {
         object.remove("host");
         object.remove("prefer_tags");
@@ -320,15 +345,16 @@ async fn create_with_failover(
             None => Err("upstream client missing".into()),
         };
         match call {
-            Ok(mut response) => {
-                if response.get("error").is_some() {
-                    // Application error: do not failover; drop reservation via Drop.
-                    drop(reserved);
-                    return Ok(response);
-                }
+            Ok(reply) if reply.is_application_error() => {
+                // Application error (frame-level or payload-level): do not failover.
+                drop(reserved);
+                return Ok(reply_from_upstream(reply));
+            }
+            Ok(reply) => {
                 reserved.finish();
+                let mut response = reply.payload;
                 namespace_and_record(&mut response, &id, &state.tickets, owner, &state.sessions);
-                return Ok(response);
+                return Ok(AgentReply::Payload(response));
             }
             Err(err) => {
                 drop(reserved);
@@ -350,7 +376,7 @@ async fn hostless_with_failover(
     owner: &str,
     method: &str,
     mut payload: Value,
-) -> Result<Value, String> {
+) -> Result<AgentReply, String> {
     if let Some(object) = payload.as_object_mut() {
         object.remove("host");
         object.remove("prefer_tags");
@@ -384,13 +410,14 @@ async fn hostless_with_failover(
             None => Err("upstream client missing".into()),
         };
         match call {
-            Ok(mut response) => {
-                if response.get("error").is_some() {
-                    // Application error: do not failover (parity with session.create).
-                    return Ok(response);
-                }
+            Ok(reply) if reply.is_application_error() => {
+                // Application error: do not failover (parity with session.create).
+                return Ok(reply_from_upstream(reply));
+            }
+            Ok(reply) => {
+                let mut response = reply.payload;
                 namespace_and_record(&mut response, &id, &state.tickets, owner, &state.sessions);
-                return Ok(response);
+                return Ok(AgentReply::Payload(response));
             }
             Err(err) => {
                 let _ = state.pool.mark_failure(&id, err.clone()).await;
@@ -412,12 +439,18 @@ async fn list_sessions(state: &AppState, acl: &[String], store: &SessionStore) -
             return (upstream.id.as_str(), Err(format!("upstream is {}", upstream.state.as_str())));
         }
         let Some(client) = state.clients.get(&upstream.id) else { return (upstream.id.as_str(), Err("upstream client missing".to_owned())) };
-        let result = client.call("session.list", json!({})).await.map_err(|e| format!("{e:#}")).and_then(|reply| match reply {
-            Value::Object(mut object) => match object.remove("sessions") {
-                Some(Value::Array(sessions)) => Ok(sessions),
+        let result = client.call("session.list", json!({})).await.map_err(|e| format!("{e:#}")).and_then(|reply| {
+            if let Some(error) = reply.error.as_ref().filter(|e| !e.is_null()) {
+                let message = error.get("message").and_then(Value::as_str).unwrap_or("upstream frame error");
+                return Err(format!("session.list frame error: {message}"));
+            }
+            match reply.payload {
+                Value::Object(mut object) => match object.remove("sessions") {
+                    Some(Value::Array(sessions)) => Ok(sessions),
+                    _ => Err("upstream session.list omitted sessions".to_owned()),
+                },
                 _ => Err("upstream session.list omitted sessions".to_owned()),
-            },
-            _ => Err("upstream session.list omitted sessions".to_owned()),
+            }
         });
         (upstream.id.as_str(), result)
     })).await;
