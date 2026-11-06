@@ -221,36 +221,46 @@ greater than the ping interval and both must be nonzero. An agent control initia
 is completed before the keepalive loop; data HELLO/setup timeouts remain separate as above.
 ## Upstream discovery
 
-Optional `[discovery]` watches a JSON file in `rex-discover --json` shape
-(`[{ "source": "tailnet"|"lan", "name": "...", "addr": "https://...", "mode": "..." }, ...]`)
-and upserts those hosts into the upstream pool:
+Optional `[discovery]` fills the upstream pool from a `rex-discover --json` snapshot —
+either by watching an external JSON file, or by periodically spawning a discover command
+whose stdout is that same JSON array
+(`[{ "source": "tailnet"|"lan", "name": "...", "addr": "https://...", "mode": "..." }, ...]`):
 
 ```toml
 [discovery]
-file = "discovered.json"          # re-read on interval; unset = Manual-only (unchanged)
-interval_ms = 30000               # default 30000; must be nonzero when file is set
+# Live subprocess (preferred when set). argv as a TOML array; first element is the program.
+# Needs `rex` / `tailscale` on PATH the same way a manual `rex-discover` run would.
+command = ["rex-discover", "--json", "--tailnet-only"]
+# file = "discovered.json"        # used only when command is unset; re-read each interval
+interval_ms = 30000               # default 30000; must be nonzero when discovery is enabled
 store_path = "rex-gateway-discovered.json"  # optional atomic restart snapshot
 ```
 
-Env overrides: `REX_GATEWAY_DISCOVERY_FILE`, `REX_GATEWAY_DISCOVERY_INTERVAL_MS`,
-`REX_GATEWAY_DISCOVERY_STORE_PATH`. When `file` is unset the gateway behaves as before
-(Manual `[[upstreams]]` only). Discovered ids are sanitized from `name`; `addr` keeps its
-scheme or defaults to `https`. `source` becomes `Tailnet` or `Lan` (shown on `/status`).
-**Manual upstreams are never overwritten or deleted** when a discovered name collides.
+Env overrides: `REX_GATEWAY_DISCOVERY_FILE`, `REX_GATEWAY_DISCOVERY_COMMAND` (single string
+split on ASCII whitespace into argv; empty/whitespace clears the command),
+`REX_GATEWAY_DISCOVERY_INTERVAL_MS`, `REX_GATEWAY_DISCOVERY_STORE_PATH`. Discovery is enabled
+when `file` **or** `command` is nonempty; empty Manual `[[upstreams]]` is then allowed.
+When both are set, **command wins for each live refresh** (the file is ignored until
+`command` is unset). When neither is set the gateway behaves as before (Manual only).
 
-Reconciliation: a discovered host that disappears from the file is **removed when idle**
+Each command run is bounded by `max(interval_ms, 60s)` so a slow LAN scan cannot hang
+across ticks forever; nonzero exit / bad JSON leave the pool unchanged and log a warning.
+Discovered ids are sanitized from `name`; `addr` keeps its scheme or defaults to `https`.
+`source` becomes `Tailnet` or `Lan` (shown on `/status`). **Manual upstreams are never
+overwritten or deleted** when a discovered name collides. Hostless RPCs / `pick_default`
+still prefer a Manual Online upstream over discovered peers, so command-filled hosts do
+not steal default routing from an explicit Manual entry.
+
+Reconciliation: a discovered host that disappears from the snapshot is **removed when idle**
 (no remembered session references). If sessions still point at it, it stays sticky so
 attach/list/RPC keep working, but create eligibility is cleared so new `session.create`
 will not pick it. On a successful apply the optional `store_path` is written atomically
 (temp + rename); the store is loaded at startup after Manual upserts so a restart can
-route before the live file is refreshed. Each discovered id also gets a lazy control
-client so probes and RPCs work the same as Manual upstreams.
+route before the next live refresh. Each discovered id also gets a lazy control client so
+probes and RPCs work the same as Manual upstreams.
 
 ## Remaining TODOs
 
-- Optional live `rex-discover` subprocess / Tailscale watch instead of an external JSON file.
-- Configurable data-plane concurrent stream limits and fragmented-message preservation if
-  required by a future Rex protocol version.
 - Preserve fragmented-message boundaries if a future Rex version relies on them (Rex
   currently sends complete binary messages; relay preserves each message's bytes/type).
 
