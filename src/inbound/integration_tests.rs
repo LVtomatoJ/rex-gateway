@@ -66,11 +66,16 @@ struct Harness { addr: SocketAddr, pool: UpstreamPool, state: AppState }
 
 /// Builds the same wiring as `main` (lazy clients, probe loop) around the given upstreams.
 async fn start_gateway(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration) -> Harness {
+    start_gateway_with_keepalive(upstreams,call_timeout,probe_every,data_timeout,Duration::from_secs(20),Duration::from_secs(120)).await
+}
+
+async fn start_gateway_with_keepalive(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration, ping_interval:Duration, idle_timeout:Duration) -> Harness {
     let pool = UpstreamPool::new();
     let mut clients = HashMap::new();
+    let (events, _) = broadcast::channel(32);
     for (id, url) in upstreams {
         pool.upsert(id, url, Source::Manual).await;
-        clients.insert((*id).to_owned(), Arc::new(ControlClient::new((*url).to_owned(), call_timeout)));
+        clients.insert((*id).to_owned(), Arc::new(ControlClient::new((*id).to_owned(), (*url).to_owned(), crate::control_client::Options { call_timeout, ping_interval, idle_timeout }, events.clone())));
     }
     let clients = Arc::new(clients);
     probe::spawn(pool.clone(), clients.clone(), probe_every);
@@ -81,7 +86,8 @@ async fn start_gateway(upstreams: &[(&str, &str)], call_timeout: Duration, probe
         auth: Arc::new(Authenticator::new(HashMap::from([("it-secret".to_owned(), vec!["*".to_owned()])]))),
         tickets: TicketMap::new(Duration::from_secs(30), 16, metrics.clone()),
         metrics,
-        options: Options { data_connect_timeout: data_timeout },
+        options: Options { data_connect_timeout: data_timeout, ping_interval, idle_timeout },
+        events,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -97,6 +103,18 @@ async fn agent(addr: SocketAddr, path: &str, protocol: &'static str) -> Agent {
     connect_async(request).await.unwrap().0
 }
 
+
+async fn next_binary(socket: &mut Agent) -> Vec<u8> {
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), socket.next()).await.expect("frame").unwrap().unwrap() {
+            tungstenite::Message::Binary(bytes) => return bytes,
+            tungstenite::Message::Ping(bytes) => { let _ = socket.send(tungstenite::Message::Pong(bytes)).await; }
+            tungstenite::Message::Pong(_) => {}
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+}
+
 async fn control_agent(addr: SocketAddr) -> Agent {
     let mut socket = agent(addr, "/api/control", SUBPROTOCOL).await;
     socket.send(tungstenite::Message::Text(json!({"type":"hello"}).to_string())).await.unwrap();
@@ -107,7 +125,14 @@ async fn control_agent(addr: SocketAddr) -> Agent {
 
 async fn rpc(socket: &mut Agent, method: &str, payload: Value) -> Value {
     socket.send(tungstenite::Message::Text(json!({"type":"request","id":"r1","method":method,"payload":payload}).to_string())).await.unwrap();
-    let reply = tokio::time::timeout(Duration::from_secs(10), socket.next()).await.expect("gateway must answer").unwrap().unwrap().into_text().unwrap();
+    let raw = loop {
+        match tokio::time::timeout(Duration::from_secs(10), socket.next()).await.expect("gateway must answer").unwrap().unwrap() {
+            tungstenite::Message::Text(text)=>break text,
+            tungstenite::Message::Ping(bytes)=> { socket.send(tungstenite::Message::Pong(bytes)).await.unwrap(); }
+            other=>panic!("expected controlled response, got {other:?}"),
+        }
+    };
+    let reply = raw;
     let reply: Value = serde_json::from_str(&reply).unwrap();
     assert_eq!(reply["id"], "r1");
     reply["payload"].clone()
@@ -208,7 +233,7 @@ async fn hung_upstream_times_out_without_hanging_the_agent() {
 
 #[tokio::test]
 async fn client_fails_fast_during_backoff_and_never_fails_construction() {
-    let client = ControlClient::new(dead_url().await, tmo(300));
+    let client = ControlClient::new("dead".into(), dead_url().await, crate::control_client::Options { call_timeout:tmo(300), ping_interval:Duration::from_secs(20), idle_timeout:Duration::from_secs(120) }, broadcast::channel(4).0);
     let first = client.call("session.list", json!({})).await.unwrap_err().to_string();
     let started = tokio::time::Instant::now();
     let second = client.call("session.list", json!({})).await.unwrap_err().to_string();
@@ -259,4 +284,85 @@ async fn wrong_bearer_is_still_rejected_before_upgrade() {
     request.headers_mut().insert("authorization", HeaderValue::from_static("Bearer it-secre"));
     let error = connect_async(request).await.unwrap_err();
     assert!(error.to_string().contains("401"), "{error}");
+}
+
+#[tokio::test]
+async fn events_are_namespaced_forwarded_and_do_not_break_rpc() {
+    let good=spawn_fake_rex(vec![json!({"session_id":"session:a"})],false).await;
+    let h=start_gateway(&[("good",&good)],tmo(500),Duration::from_secs(3600),tmo(300)).await;
+    let mut socket=control_agent(h.addr).await;
+    let sender=h.state.events.clone();
+    sender.send(UpstreamEvent { upstream:"good".into(), event:json!({"type":"event","seq":99,"payload":{"session_id":"session:e","view":{"session_id":"session:v"}}}) }).unwrap();
+    tokio::time::sleep(tmo(30)).await;
+    socket.send(tungstenite::Message::Text(json!({"type":"request","id":"correlate","method":"server.version","payload":{}}).to_string())).await.unwrap();
+    let event=match socket.next().await.unwrap().unwrap() { tungstenite::Message::Text(text)=>serde_json::from_str::<Value>(&text).unwrap(), other=>panic!("unexpected {other:?}") };
+    assert_eq!(event["type"],"event");
+    assert_eq!(event["payload"]["session_id"],"good:session:e");
+    assert_eq!(event["payload"]["view"]["session_id"],"good:session:v");
+    let response=loop {
+        match socket.next().await.unwrap().unwrap() {
+            tungstenite::Message::Text(text)=>break serde_json::from_str::<Value>(&text).unwrap(),
+            tungstenite::Message::Ping(bytes)=>socket.send(tungstenite::Message::Pong(bytes)).await.unwrap(),
+            other=>panic!("unexpected {other:?}"),
+        }
+    };
+    assert_eq!(response["id"],"correlate");
+    assert_eq!(response["payload"],json!({"ok":true}));
+}
+
+#[tokio::test]
+async fn data_bridges_send_pings_and_propagate_upstream_close() {
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url=format!("http://{}",listener.local_addr().unwrap());
+    let (closed_tx,closed_rx)=tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let (stream,_)=listener.accept().await.unwrap();
+        let mut upstream=accept_hdr_async(stream,|_:&Request,mut response:Response| { response.headers_mut().insert("sec-websocket-protocol",HeaderValue::from_static(DATA_SUBPROTOCOL)); Ok(response) }).await.unwrap();
+        let _hello=upstream.next().await;
+        upstream.send(tungstenite::Message::Binary(vec![0x81].into())).await.unwrap();
+        while let Some(Ok(frame))=tokio::time::timeout(Duration::from_secs(1),upstream.next()).await.unwrap() {
+            match frame {
+                tungstenite::Message::Pong(_)=>{},
+                tungstenite::Message::Close(_)=>break,
+                tungstenite::Message::Ping(_)=> {
+                    if upstream.send(tungstenite::Message::Close(Some(tungstenite::protocol::CloseFrame { code:4421.into(),reason:"custom close".into() }))).await.is_err() { break; }
+                    let _=closed_tx.send(true);
+                    return;
+                },
+                _=>{}
+            }
+        }
+    });
+    let h=start_gateway_with_keepalive(&[("local",&url)],tmo(300),Duration::from_secs(3600),tmo(300),tmo(20),tmo(100)).await;
+    let external=h.state.tickets.insert("local","AAAAAAAAAAAAAAAAAAAAAA",SECRET);
+    let raw=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,external).unwrap();
+    let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..],&raw].concat().into())).await.unwrap();
+    assert!(!next_binary(&mut socket).await.is_empty());
+    let mut saw_ping=false;
+    while let Some(Ok(frame))=tokio::time::timeout(Duration::from_secs(2), socket.next()).await.expect("frame") {
+        match frame {
+            tungstenite::Message::Ping(_)=>saw_ping=true,
+            tungstenite::Message::Close(frame)=>{ let frame=frame.unwrap(); assert_eq!((u16::from(frame.code),frame.reason.as_ref()),(4421,"custom close")); break; },
+            tungstenite::Message::Pong(_)=>{},
+            other=>panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(closed_rx.await.unwrap());
+    assert!(saw_ping);
+}
+
+#[tokio::test]
+async fn pong_responsive_control_agent_stays_connected() {
+    let good=spawn_fake_rex(vec![],false).await;
+    let h=start_gateway_with_keepalive(&[("good",&good)],tmo(300),Duration::from_secs(3600),tmo(300),tmo(20),tmo(100)).await;
+    let mut socket=control_agent(h.addr).await;
+    while let Some(Ok(frame))=tokio::time::timeout(tmo(300),socket.next()).await.unwrap() {
+        match frame {
+            tungstenite::Message::Ping(_)=>{},
+            tungstenite::Message::Close(frame)=>{ let frame=frame.unwrap(); panic!("responsive agent closed: {frame:?}"); },
+            other=>panic!("unexpected {other:?}"),
+        }
+    }
+    return;
 }

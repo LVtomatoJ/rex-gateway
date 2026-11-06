@@ -24,6 +24,12 @@ pub struct Config {
     /// Timeout for reading the agent's data-plane HELLO and for connecting to the upstream data socket.
     #[serde(default = "default_data_connect_timeout")]
     pub data_connect_timeout_ms: u64,
+    /// WebSocket keepalive interval for agent and upstream control/data connections.
+    #[serde(default = "default_ping_interval")]
+    pub ws_ping_interval_ms: u64,
+    /// Close a socket when no application traffic arrives for this long (ping/pong do not count).
+    #[serde(default = "default_idle_timeout")]
+    pub ws_idle_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -41,6 +47,8 @@ fn default_ticket_ttl() -> u64 { 30_000 }
 fn default_ticket_max() -> usize { 1024 }
 fn default_call_timeout() -> u64 { 10_000 }
 fn default_data_connect_timeout() -> u64 { 10_000 }
+fn default_ping_interval() -> u64 { 20_000 }
+fn default_idle_timeout() -> u64 { 120_000 }
 
 impl Config {
     pub fn load() -> Result<Self> {
@@ -58,11 +66,14 @@ impl Config {
         if let Some(v) = env("REX_GATEWAY_TICKET_MAX") { config.ticket_max = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_UPSTREAM_CALL_TIMEOUT_MS") { config.upstream_call_timeout_ms = v.parse()?; }
         if let Some(v) = env("REX_GATEWAY_DATA_CONNECT_TIMEOUT_MS") { config.data_connect_timeout_ms = v.parse()?; }
+        if let Some(v) = env("REX_GATEWAY_WS_PING_INTERVAL_MS") { config.ws_ping_interval_ms = v.parse()?; }
+        if let Some(v) = env("REX_GATEWAY_WS_IDLE_TIMEOUT_MS") { config.ws_idle_timeout_ms = v.parse()?; }
         if let Some(url) = env("REX_GATEWAY_UPSTREAM_LOCAL_URL") {
             if let Some(upstream) = config.upstreams.iter_mut().find(|u| u.id == "local") { upstream.url = url; }
         }
         if config.upstreams.is_empty() || config.probe_interval_ms == 0 { bail!("at least one upstream and a nonzero probe interval are required"); }
-        if config.ticket_ttl_ms == 0 || config.ticket_max == 0 { bail!("ticket_ttl_ms and ticket_max must be nonzero"); }
+        if config.ticket_ttl_ms == 0 || config.ticket_max == 0 || config.ws_ping_interval_ms == 0 || config.ws_idle_timeout_ms == 0 { bail!("ticket_ttl_ms, ticket_max, ws_ping_interval_ms and ws_idle_timeout_ms must be nonzero"); }
+        if config.ws_idle_timeout_ms <= config.ws_ping_interval_ms { bail!("ws_idle_timeout_ms must exceed ws_ping_interval_ms"); }
         if config.upstream_call_timeout_ms == 0 || config.data_connect_timeout_ms == 0 {
             bail!("upstream_call_timeout_ms and data_connect_timeout_ms must be nonzero");
         }
@@ -130,5 +141,20 @@ mod more_tests {
         assert!(Config::from_toml(BASE, env).is_err());
         let env = |name: &str| (name == "REX_GATEWAY_DATA_CONNECT_TIMEOUT_MS").then(|| "abc".to_owned());
         assert!(Config::from_toml(BASE, env).is_err(), "non-numeric rejected");
+    }
+}
+
+#[cfg(test)]
+mod keepalive_tests {
+    use super::*;
+    const BASE: &str = "[[upstreams]]\nid=\"a\"\nurl=\"http://a\"\n[[auth.tokens]]\ntoken=\"t\"\nallow=[\"*\"]\n";
+    #[test]
+    fn configurable_keepalive_defaults_and_validation() {
+        let config = Config::from_toml(BASE, |_| None).unwrap();
+        assert_eq!((config.ws_ping_interval_ms, config.ws_idle_timeout_ms), (20_000,120_000));
+        let config = Config::from_toml(&format!("ws_ping_interval_ms=1000\nws_idle_timeout_ms=4000\n{BASE}"), |_| None).unwrap();
+        assert_eq!((config.ws_ping_interval_ms, config.ws_idle_timeout_ms), (1000,4000));
+        assert!(Config::from_toml(&format!("ws_idle_timeout_ms=1000\n{BASE}"), |_| None).is_err());
+        assert!(Config::from_toml(BASE, |key| (key == "REX_GATEWAY_WS_IDLE_TIMEOUT_MS").then(|| "1000".into())).is_err());
     }
 }

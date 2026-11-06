@@ -14,7 +14,8 @@ The config contains `listen`, `probe_interval_ms`, repeated `[[upstreams]]` entr
 (`id`, `url`) and `[[auth.tokens]]` entries (`token`, `allow = ["*"]` or upstream IDs).
 Environment overrides are `REX_GATEWAY_CONFIG`, `REX_GATEWAY_LISTEN`,
 `REX_GATEWAY_PROBE_INTERVAL_MS`, `REX_GATEWAY_TICKET_TTL_MS`, `REX_GATEWAY_TICKET_MAX`,
-`REX_GATEWAY_UPSTREAM_CALL_TIMEOUT_MS`, `REX_GATEWAY_DATA_CONNECT_TIMEOUT_MS`, and `REX_GATEWAY_UPSTREAM_LOCAL_URL` (for the
+`REX_GATEWAY_UPSTREAM_CALL_TIMEOUT_MS`, `REX_GATEWAY_DATA_CONNECT_TIMEOUT_MS`, `REX_GATEWAY_WS_PING_INTERVAL_MS`,
+`REX_GATEWAY_WS_IDLE_TIMEOUT_MS`, and `REX_GATEWAY_UPSTREAM_LOCAL_URL` (for the
 upstream id `local`). Timeouts: `upstream_call_timeout_ms` (default 10000) bounds every call to an
 upstream and each (re)connect of its control socket; `data_connect_timeout_ms` (default 10000) bounds the
 agent's data-plane HELLO read and the connect to the upstream data socket. Zero is rejected for both. Optional top-level settings `ticket_ttl_ms` (default 30000) and
@@ -39,14 +40,17 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
   makes it) and reconnect after socket loss, with exponential backoff after failed connects
   (200 ms doubling to 5 s; calls fail fast with `retry in N ms` meanwhile). Upstreams start
   `Unknown` and the probe loop (concurrent per upstream) promotes them to `Online` once reachable.
-* Agents are read/served serially; upstream calls use a single actor-owned WebSocket,
+* Agent requests are read serially; upstream calls use a single actor-owned WebSocket,
   ID to oneshot map, and support concurrent callers; each call is bounded by
-  `upstream_call_timeout_ms`. Events between responses are ignored.
+  `upstream_call_timeout_ms`. Upstream events are forwarded independently to agent controls
+  whose token can access the owning upstream, with recursively namespaced session references
+  and gateway ticket rewrites. Event and response sequence numbers share one monotonically
+  increasing per-agent sequence; request/response IDs retain upstream-independent correlation.
 * Probes use `session.list`: success under 1 second = Online, under/over threshold =
   Degraded; two consecutive failed probes = Offline. First failure is Degraded, initial
   state Unknown. Socket reconnection and a fresh hello happen on the next call.
 * Routed calls are restricted to Online upstreams (the default router also ignores
-  Degraded). No upstream discovery, persistence, or event forwarding yet.
+  Degraded). No upstream discovery or persistence yet.
 
 ## Verify
 
@@ -69,8 +73,10 @@ A data ticket is additionally bound to that bearer string, so one configured tok
 consume another token's ticket. The control connection itself need not remain open after
 `data.connect`; keep it open if upstream attachment semantics require it.
 
-The gateway rewrites only the ticket returned by `data.connect`. It records the real
-upstream ticket privately and returns a new random 16-byte base64url ticket to the agent.
+The gateway recursively rewrites `session_id` and `ticket` fields in responses, including
+`data.connect`, `session.bootstrap`, `view`, arrays and other nested ticket-bearing structures.
+It records each real upstream ticket privately and returns a new random 16-byte base64url
+ticket to the agent. The same TTL, capacity, single-use and bearer-owner rules apply.
 When the agent sends binary `0x01 || ticket`, the gateway consumes that ticket once,
 connects to the owning upstream, and sends the real binary HELLO. ACCEPT/REJECT, terminal
 snapshots, terminal output, and agent input are relayed frame-for-frame between the data
@@ -121,10 +127,19 @@ configured digest with no early exit, so neither the token contents nor its leng
 timing. Ticket-owner binding uses a constant-time comparison too. Behavior is otherwise unchanged:
 `Authorization: Bearer <token>` (case-sensitive scheme), per-token upstream ACL list.
 
+## WebSocket keepalive and idle handling
+Control and data sockets emit WebSocket pings at `ws_ping_interval_ms` (default 20000) on both
+agent and upstream sides. Incoming application frames and pong frames keep a connection alive
+(WebSocket libraries normally answer pings automatically). If no incoming frame arrives for
+`ws_idle_timeout_ms` (default 120000), the affected connection closes: agent-side idle uses
+close 1001 / `idle timeout`; data idle closes both bridge endpoints. The idle timeout must be
+greater than the ping interval and both must be nonzero. An agent control initial HELLO/welcome
+is completed before the keepalive loop; data HELLO/setup timeouts remain separate as above.
 ## Remaining TODOs
 
-- Multiplexed inbound event forwarding on control connections.
-- Richer recursive response namespacing for ticket-bearing `session.bootstrap` payloads.
+- Upstream discovery / persistent configuration synchronization.
+- Configurable data-plane concurrent stream limits and fragmented-message preservation if
+  required by a future Rex protocol version.
 - Preserve fragmented-message boundaries if a future Rex version relies on them (Rex
   currently sends complete binary messages; relay preserves each message's bytes/type).
 

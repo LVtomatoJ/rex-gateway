@@ -14,7 +14,7 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::Mutex;
+use tokio::sync::broadcast;
 use tokio_tungstenite::{
     connect_async,
     tungstenite::{self, client::IntoClientRequest, http::HeaderValue},
@@ -23,7 +23,7 @@ use tokio_tungstenite::{
 use crate::{
     auth::{self, Authenticator},
     pool::UpstreamState,
-    control_client::ControlClient,
+    control_client::{ControlClient, UpstreamEvent},
     data::{decode_hello, TicketMap},
     metrics::{Gauge, Metrics},
     pool::UpstreamPool,
@@ -42,6 +42,7 @@ struct AppState {
     tickets: TicketMap,
     metrics: Arc<Metrics>,
     options: Options,
+    events: broadcast::Sender<UpstreamEvent>,
 }
 
 /// Tunables of the inbound server.
@@ -49,6 +50,8 @@ struct AppState {
 pub struct Options {
     /// Bounds the agent's data-plane HELLO read and the connect to the upstream data socket.
     pub data_connect_timeout: Duration,
+    pub ping_interval: Duration,
+    pub idle_timeout: Duration,
 }
 
 pub async fn serve(
@@ -59,8 +62,9 @@ pub async fn serve(
     tickets: TicketMap,
     metrics: Arc<Metrics>,
     options: Options,
+    events: broadcast::Sender<UpstreamEvent>,
 ) -> Result<()> {
-    let state = AppState { pool, clients: Arc::new(clients), auth, tickets, metrics, options };
+    let state = AppState { pool, clients: Arc::new(clients), auth, tickets, metrics, options, events };
     let router = router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "gateway listening");
@@ -121,23 +125,51 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
     }
     let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":1048576},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":11});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
-    let socket = Arc::new(Mutex::new(socket));
+    let (mut sink, mut stream) = socket.split();
+    let mut events = state.events.subscribe();
     let mut seq = 0;
+    // Delay the first ping so hello/welcome and early RPCs are not raced by keepalive.
+    let mut pings = tokio::time::interval_at(tokio::time::Instant::now() + state.options.ping_interval, state.options.ping_interval);
+    pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut idle = tokio::time::interval(std::cmp::max(state.options.idle_timeout / 5, Duration::from_millis(1)));
+    idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_activity = std::time::Instant::now();
     loop {
-        let request = {
-            let mut guard = socket.lock().await;
-            let Ok(Some(Ok(Message::Text(text)))) = tokio::time::timeout(Duration::from_secs(60), guard.recv()).await else { break };
-            text
-        };
-        let message: Value = match serde_json::from_str(&request) { Ok(v) => v, Err(_) => continue };
-        let id = message["id"].clone();
-        if message["type"] != "request" { continue; }
-        let method = message["method"].as_str().unwrap_or_default().to_owned();
-        let response = handle(&state, &acl, &owner, &method, message["payload"].clone()).await
-            .unwrap_or_else(|e| json!({"error":e.to_string()}));
-        seq += 1;
-        let response = json!({"type":"response","id":id,"seq":seq,"payload":response});
-        if socket.lock().await.send(Message::Text(response.to_string())).await.is_err() { break; }
+        tokio::select! {
+            incoming=stream.next()=> {
+                match incoming {
+                    Some(Ok(Message::Text(text)))=> {
+                        last_activity=std::time::Instant::now();
+                        let message: Value = match serde_json::from_str(&text) { Ok(v) => v, Err(_) => continue };
+                        if message["type"] != "request" { continue; }
+                        let id = message["id"].clone();
+                        let method = message["method"].as_str().unwrap_or_default().to_owned();
+                        let response = handle(&state, &acl, &owner, &method, message["payload"].clone()).await.unwrap_or_else(|e| json!({"error":e.to_string()}));
+                        seq += 1;
+                        let response = json!({"type":"response","id":id,"seq":seq,"payload":response});
+                        if sink.send(Message::Text(response.to_string())).await.is_err() { break; }
+                    }
+                    // Keepalive only: axum/tungstenite auto-answer pings. Pong must not
+                    // count as application activity or idle agents are never reaped.
+                    Some(Ok(Message::Ping(_)))|Some(Ok(Message::Pong(_)))=> {}
+                    Some(Ok(Message::Close(_)))|Some(Err(_))|None=>break,
+                    _=>{}
+                }
+            }
+            event=events.recv()=> {
+                let event=match event { Ok(event)=>event, Err(broadcast::error::RecvError::Lagged(n))=>{ tracing::warn!(n,"agent event receiver lagged"); continue }, Err(_)=>break };
+                if auth::Authenticator::permits(&acl,&event.upstream) {
+                    if let Some(event)=namespace_event(&event.event,&event.upstream,{ seq+=1; seq },&state.tickets,&owner) {
+                        if sink.send(Message::Text(event.to_string())).await.is_err() { break; }
+                    }
+                }
+            }
+            _=pings.tick()=>if sink.send(Message::Ping(Vec::new())).await.is_err() { break; },
+            _=idle.tick()=>if last_activity.elapsed()>=state.options.idle_timeout {
+                let _=sink.send(Message::Close(Some(CloseFrame { code:1001, reason:Cow::Borrowed("idle timeout") }))).await;
+                break;
+            }
+        }
     }
 }
 
@@ -278,11 +310,22 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
     let _active = state.metrics.track(Gauge::Data);
     let (mut upstream_sink, mut upstream_stream) = upstream_socket.split();
     let (mut agent_sink, mut agent_stream) = agent.split();
+    let mut pings=tokio::time::interval_at(tokio::time::Instant::now() + state.options.ping_interval, state.options.ping_interval);
+    pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut idle=tokio::time::interval(std::cmp::max(state.options.idle_timeout / 5, Duration::from_millis(1)));
+    idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut last_activity=std::time::Instant::now();
     loop {
         tokio::select! {
             incoming = agent_stream.next() => match incoming {
-                Some(Ok(Message::Binary(bytes))) => if upstream_sink.send(tungstenite::Message::Binary(bytes)).await.is_err() { break; },
-                Some(Ok(Message::Text(text))) => if upstream_sink.send(tungstenite::Message::Text(text.as_str().into())).await.is_err() { break; },
+                Some(Ok(Message::Binary(bytes))) => {
+                    last_activity=std::time::Instant::now();
+                    if upstream_sink.send(tungstenite::Message::Binary(bytes)).await.is_err() { break; }
+                }
+                Some(Ok(Message::Text(text))) => {
+                    last_activity=std::time::Instant::now();
+                    if upstream_sink.send(tungstenite::Message::Text(text.as_str().into())).await.is_err() { break; }
+                }
                 Some(Ok(Message::Ping(bytes))) => if upstream_sink.send(tungstenite::Message::Ping(bytes)).await.is_err() { break; },
                 Some(Ok(Message::Pong(bytes))) => if upstream_sink.send(tungstenite::Message::Pong(bytes)).await.is_err() { break; },
                 Some(Ok(Message::Close(frame))) => {
@@ -292,8 +335,14 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
                 Some(Err(_)) | None => break,
             },
             outgoing = upstream_stream.next() => match outgoing {
-                Some(Ok(tungstenite::Message::Binary(bytes))) => if agent_sink.send(Message::Binary(bytes)).await.is_err() { break; },
-                Some(Ok(tungstenite::Message::Text(text))) => if agent_sink.send(Message::Text(text.as_str().into())).await.is_err() { break; },
+                Some(Ok(tungstenite::Message::Binary(bytes))) => {
+                    last_activity=std::time::Instant::now();
+                    if agent_sink.send(Message::Binary(bytes)).await.is_err() { break; }
+                }
+                Some(Ok(tungstenite::Message::Text(text))) => {
+                    last_activity=std::time::Instant::now();
+                    if agent_sink.send(Message::Text(text.as_str().into())).await.is_err() { break; }
+                }
                 Some(Ok(tungstenite::Message::Ping(bytes))) => if agent_sink.send(Message::Ping(bytes)).await.is_err() { break; },
                 Some(Ok(tungstenite::Message::Pong(bytes))) => if agent_sink.send(Message::Pong(bytes)).await.is_err() { break; },
                 Some(Ok(tungstenite::Message::Close(frame))) => {
@@ -302,6 +351,14 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
                 }
                 Some(Ok(tungstenite::Message::Frame(_))) => {}
                 Some(Err(_)) | None => break,
+            },
+            _=pings.tick()=> {
+                if agent_sink.send(Message::Ping(Vec::new())).await.is_err() || upstream_sink.send(tungstenite::Message::Ping(Vec::new())).await.is_err() { break; }
+            }
+            _=idle.tick()=>if last_activity.elapsed()>=state.options.idle_timeout {
+                let _=agent_sink.send(Message::Close(Some(CloseFrame { code:1001,reason:Cow::Borrowed("idle timeout") }))).await;
+                let _=upstream_sink.send(tungstenite::Message::Close(Some(tungstenite::protocol::CloseFrame { code:1001.into(),reason:"idle timeout".into() }))).await;
+                break;
             }
         }
     }
@@ -337,7 +394,7 @@ mod tests {
             ("onlyb".to_owned(), vec!["b".to_owned()]),
         ])));
         let tickets = TicketMap::new(Duration::from_secs(30), 16, metrics.clone());
-        let state = AppState { pool, clients: Arc::new(HashMap::new()), auth, tickets, metrics, options: Options { data_connect_timeout: Duration::from_secs(5) } };
+        let state = AppState { pool, clients: Arc::new(HashMap::new()), auth, tickets, metrics, options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120) }, events: broadcast::channel(8).0 };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router(state.clone());

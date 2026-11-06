@@ -3,9 +3,19 @@ use tokio::time::Instant;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_tungstenite::{connect_async, tungstenite::{client::IntoClientRequest, http::HeaderValue, Message}, MaybeTlsStream, WebSocketStream};
 use crate::protocol::SUBPROTOCOL;
+
+#[derive(Clone, Copy, Debug)]
+pub struct Options {
+    pub call_timeout: Duration,
+    pub ping_interval: Duration,
+    pub idle_timeout: Duration,
+}
+
+#[derive(Clone, Debug)]
+pub struct UpstreamEvent { pub upstream: String, pub event: Value }
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 struct Command { id: String, method: String, payload: Value, reply: oneshot::Sender<Result<Value>> }
@@ -28,9 +38,11 @@ pub struct ControlClient { tx: mpsc::Sender<Command>, call_timeout: Duration }
 
 impl ControlClient {
     /// `call_timeout` bounds every call and each (re)connect attempt of this upstream.
-    pub fn new(url: String, call_timeout: Duration) -> Self {
+    pub fn new(id: String, url: String, options: Options, events: broadcast::Sender<UpstreamEvent>) -> Self {
+        let call_timeout = options.call_timeout;
+        let upstream = id;
         let (tx, rx) = mpsc::channel(64);
-        tokio::spawn(Self::actor(url, call_timeout, rx));
+        tokio::spawn(Self::actor(url, options, events, upstream, rx));
         Self { tx, call_timeout }
     }
     pub async fn call(&self, method: &str, payload: Value) -> Result<Value> {
@@ -44,13 +56,29 @@ impl ControlClient {
         // Errors the actor reports (connect failure, socket closed, ...) pass through unchanged.
         tokio::time::timeout(timeout,rx).await.context("upstream request timeout")?.map_err(|_| anyhow!("upstream response lost"))?
     }
-    async fn actor(url:String, call_timeout:Duration, mut rx:mpsc::Receiver<Command>) {
+    async fn actor(url:String, options:Options, events:broadcast::Sender<UpstreamEvent>, upstream:String, mut rx:mpsc::Receiver<Command>) {
+        let call_timeout = options.call_timeout;
         let mut socket:Option<Socket>=None; let mut pending:HashMap<String,oneshot::Sender<Result<Value>>>=HashMap::new();
         let mut failures=0u32; let mut retry_at:Option<Instant>=None; let mut last_error=String::new();
+        let mut pings=tokio::time::interval_at(Instant::now()+options.ping_interval, options.ping_interval); pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut idle=tokio::time::interval(std::cmp::max(options.idle_timeout / 5, Duration::from_millis(1))); idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut last_activity=Instant::now();
         loop {
             tokio::select! {
+                _=pings.tick(), if socket.is_some()=> {
+                    if let Some(s)=socket.as_mut() {
+                        if s.send(Message::Ping(Vec::new())).await.is_err() { socket=None; }
+                    }
+                }
+                _=idle.tick(), if socket.is_some()=> {
+                    if last_activity.elapsed() < options.idle_timeout { continue; }
+                    let _=socket.as_mut().unwrap().send(Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame { code:1001.into(), reason:"idle timeout".into() }))).await;
+                    socket=None;
+                    for (_,reply) in pending.drain() { let _=reply.send(Err(anyhow!("upstream idle timeout"))); }
+                }
                 command=rx.recv()=> {
                     let Some(cmd)=command else { break };
+                    last_activity=Instant::now();
                     if socket.is_none() {
                         if let Some(at)=retry_at.filter(|at|Instant::now()<*at) {
                             let wait=at.saturating_duration_since(Instant::now()).as_millis();
@@ -62,7 +90,7 @@ impl ControlClient {
                             Err(_)=>Err(anyhow!("upstream connect timed out after {} ms",call_timeout.as_millis())),
                         };
                         match opened {
-                            Ok(opened)=>{ socket=Some(opened); failures=0; retry_at=None; last_error.clear(); }
+                            Ok(opened)=>{ last_activity=Instant::now(); socket=Some(opened); failures=0; retry_at=None; last_error.clear(); }
                             Err(e)=>{
                                 failures=failures.saturating_add(1); retry_at=Some(Instant::now()+backoff_delay(failures)); last_error=format!("{e:#}");
                                 let _=cmd.reply.send(Err(e)); continue;
@@ -85,14 +113,20 @@ impl ControlClient {
                 }
                 incoming=async { socket.as_mut().unwrap().next().await }, if socket.is_some()=> {
                     match incoming {
+                        Some(Ok(Message::Pong(_)))=> { last_activity=Instant::now(); }
                         Some(Ok(Message::Text(text)))=> {
+                            last_activity=Instant::now();
                             let Ok(message)=serde_json::from_str::<Value>(&text) else { continue };
-                            if message["type"]=="response" {
-                                if let Some(reply)=message["id"].as_str().and_then(|id|pending.remove(id)) { let _=reply.send(Ok(message["payload"].clone())); }
+                            match message["type"].as_str() {
+                                Some("response")=> { if let Some(reply)=message["id"].as_str().and_then(|id|pending.remove(id)) { let _=reply.send(Ok(message["payload"].clone())); } }
+                                Some("event")=> { let _=events.send(UpstreamEvent { upstream:upstream.clone(), event:message }); }
+                                _=>{}
                             }
-                            // Events and unmatched responses do not belong to a request oneshot.
                         }
-                        Some(Ok(Message::Ping(bytes)))=> { if let Some(s)=socket.as_mut() { let _=s.send(Message::Pong(bytes)).await; } }
+                        Some(Ok(Message::Ping(_)))=> {
+                            last_activity=Instant::now();
+                            if let Some(s)=socket.as_mut() { let _=s.send(Message::Pong(Vec::new())).await; }
+                        }
                         Some(Ok(Message::Close(_)))|None|Some(Err(_))=> {
                             socket=None;
                             for (_,reply) in pending.drain() { let _=reply.send(Err(anyhow!("upstream socket closed"))); }
@@ -124,6 +158,41 @@ async fn open_socket(url:&str)->Result<Socket> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn mock_upstream(ping_count: tokio::sync::mpsc::Sender<usize>) -> String {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr=listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream,_)=listener.accept().await.unwrap();
+            let mut socket=tokio_tungstenite::accept_hdr_async(stream, |_: &tokio_tungstenite::tungstenite::handshake::server::Request, mut response: tokio_tungstenite::tungstenite::handshake::server::Response| { response.headers_mut().insert("sec-websocket-protocol", SUBPROTOCOL.parse().unwrap()); Ok(response) }).await.unwrap();
+            socket.next().await;
+            socket.send(Message::Text(json!({"type":"welcome"}).to_string())).await.unwrap();
+            let mut pings=0usize;
+            while let Some(Ok(frame))=socket.next().await {
+                match frame {
+                    Message::Text(text)=> { let request:Value=serde_json::from_str(&text).unwrap();
+                        socket.send(Message::Text(json!({"type":"event","seq":4,"payload":{"session_id":"session:test"}}).to_string())).await.unwrap();
+                        socket.send(Message::Text(json!({"type":"response","id":request["id"],"payload":{"ok":true}}).to_string())).await.unwrap();
+                    }
+                    Message::Ping(_)=> { pings+=1; let _=ping_count.send(pings).await; socket.send(Message::Pong(Vec::new())).await.unwrap(); }
+                    _=>{}
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn forwards_events_and_keeps_correlation_separate() {
+        let (tx,_rx)=tokio::sync::mpsc::channel(1);
+        let url=mock_upstream(tx).await;
+        let (events,mut received)=broadcast::channel(4);
+        let client=ControlClient::new("local".into(),url,Options { call_timeout:Duration::from_secs(1), ping_interval:Duration::from_secs(10), idle_timeout:Duration::from_secs(30) },events);
+        assert_eq!(client.call("session.list",json!({})).await.unwrap(),json!({"ok":true}));
+        let event=received.recv().await.unwrap();
+        assert_eq!(event.upstream,"local");
+        assert_eq!(event.event["payload"]["session_id"],"session:test");
+    }
 
     #[test]
     fn backoff_grows_exponentially_and_is_capped() {
