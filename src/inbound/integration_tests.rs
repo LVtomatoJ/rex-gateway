@@ -66,10 +66,14 @@ struct Harness { addr: SocketAddr, pool: UpstreamPool, state: AppState }
 
 /// Builds the same wiring as `main` (lazy clients, probe loop) around the given upstreams.
 async fn start_gateway(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration) -> Harness {
-    start_gateway_with_keepalive(upstreams,call_timeout,probe_every,data_timeout,Duration::from_secs(20),Duration::from_secs(120)).await
+    start_gateway_with_limits(upstreams, call_timeout, probe_every, data_timeout, Duration::from_secs(20), Duration::from_secs(120), 128, 32).await
 }
 
-async fn start_gateway_with_keepalive(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration, ping_interval:Duration, idle_timeout:Duration) -> Harness {
+async fn start_gateway_with_keepalive(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration, ping_interval: Duration, idle_timeout: Duration) -> Harness {
+    start_gateway_with_limits(upstreams, call_timeout, probe_every, data_timeout, ping_interval, idle_timeout, 128, 32).await
+}
+
+async fn start_gateway_with_limits(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration, ping_interval: Duration, idle_timeout: Duration, max_data_streams: usize, max_data_streams_per_token: usize) -> Harness {
     let pool = UpstreamPool::new();
     let mut clients = HashMap::new();
     let (events, _) = broadcast::channel(32);
@@ -86,7 +90,8 @@ async fn start_gateway_with_keepalive(upstreams: &[(&str, &str)], call_timeout: 
         auth: Arc::new(Authenticator::new(HashMap::from([("it-secret".to_owned(), vec!["*".to_owned()])]))),
         tickets: TicketMap::new(Duration::from_secs(30), 16, metrics.clone()),
         metrics,
-        options: Options { data_connect_timeout: data_timeout, ping_interval, idle_timeout },
+        options: Options { data_connect_timeout: data_timeout, ping_interval, idle_timeout, max_data_streams, max_data_streams_per_token },
+        data_limiter: DataLimiter::new(),
         events,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -290,6 +295,7 @@ async fn wrong_bearer_is_still_rejected_before_upgrade() {
 async fn events_are_namespaced_forwarded_and_do_not_break_rpc() {
     let good=spawn_fake_rex(vec![json!({"session_id":"session:a"})],false).await;
     let h=start_gateway(&[("good",&good)],tmo(500),Duration::from_secs(3600),tmo(300)).await;
+    wait_state(&h.pool, "good", UpstreamState::Online).await;
     let mut socket=control_agent(h.addr).await;
     let sender=h.state.events.clone();
     sender.send(UpstreamEvent { upstream:"good".into(), event:json!({"type":"event","seq":99,"payload":{"session_id":"session:e","view":{"session_id":"session:v"}}}) }).unwrap();
@@ -446,4 +452,44 @@ async fn idle_data_bridges_send_pings_then_close_both_sides() {
     let (upstream_ping, code)=closed_rx.await.expect("upstream should observe idle close");
     assert!(upstream_ping && code==1001, "upstream saw ping={upstream_ping} code={code}");
     let _ = saw_close; // Close frame is best-effort; upstream 1001 is authoritative
+}
+
+#[tokio::test]
+async fn data_stream_limit_closes_1013_without_burning_ticket() {
+    let listener=TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url=format!("http://{}",listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream,_))=listener.accept().await else { return };
+            let Ok(mut upstream)=accept_hdr_async(stream,|req:&Request,mut response:Response| {
+                if !req.uri().path().ends_with("/api/data") { return Err(ErrorResponse::new(None)); }
+                response.headers_mut().insert("sec-websocket-protocol",HeaderValue::from_static(DATA_SUBPROTOCOL)); Ok(response)
+            }).await else { continue };
+            let Some(Ok(tungstenite::Message::Binary(_)))=upstream.next().await else { continue };
+            let _=upstream.send(tungstenite::Message::Binary(vec![0x81])).await;
+            // Hold the bridge open until the peer closes.
+            while let Some(Ok(_))=upstream.next().await {}
+        }
+    });
+    let h=start_gateway_with_limits(&[("local",&url)],tmo(300),Duration::from_secs(3600),tmo(300),Duration::from_secs(20),Duration::from_secs(120),1,1).await;
+    let first=h.state.tickets.insert("local","AAAAAAAAAAAAAAAAAAAAAA",SECRET);
+    let second=h.state.tickets.insert("local","BBBBBBBBBBBBBBBBBBBBBB",SECRET);
+    let raw1=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,&first).unwrap();
+    let raw2=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,&second).unwrap();
+    let mut held=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
+    held.send(tungstenite::Message::Binary([&[1u8][..],&raw1].concat())).await.unwrap();
+    assert!(!next_binary(&mut held).await.is_empty());
+    let mut limited=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
+    limited.send(tungstenite::Message::Binary([&[1u8][..],&raw2].concat())).await.unwrap();
+    let close=loop {
+        match tokio::time::timeout(Duration::from_secs(2),limited.next()).await.expect("limit close").unwrap().unwrap() {
+            tungstenite::Message::Close(frame)=>break frame.unwrap(),
+            tungstenite::Message::Ping(_) | tungstenite::Message::Pong(_)=>{}
+            other=>panic!("expected limit close, got {other:?}"),
+        }
+    };
+    assert_eq!((u16::from(close.code), close.reason.as_ref()), (1013, "per-token data stream limit"));
+    // Ticket was not consumed on the capacity miss.
+    let mapped=h.state.tickets.take(&second, SECRET).expect("limited ticket must remain usable");
+    assert_eq!(mapped.upstream_ticket, "BBBBBBBBBBBBBBBBBBBBBB");
 }

@@ -52,8 +52,54 @@ impl Metrics {
         Guard { metrics: self.clone(), gauge }
     }
 
+    /// Atomically reserves a gauge slot if under `max`. Used for data-plane backpressure.
+    pub fn try_track(self: &Arc<Self>, gauge: Gauge, max: usize) -> Option<Guard> {
+        let cell = Self::cell(self, gauge);
+        let max = max as u64;
+        loop {
+            let cur = cell.load(std::sync::atomic::Ordering::Acquire);
+            if cur >= max { return None; }
+            if cell.compare_exchange(cur, cur + 1, std::sync::atomic::Ordering::AcqRel, std::sync::atomic::Ordering::Acquire).is_ok() {
+                return Some(Guard { metrics: self.clone(), gauge });
+            }
+        }
+    }
+
     fn cell(&self, gauge: Gauge) -> &AtomicU64 {
         match gauge { Gauge::Control => &self.active_control, Gauge::Data => &self.active_data }
+    }
+}
+
+/// Per-bearer active data-stream counter. Paired with the gateway-wide data gauge.
+#[derive(Clone, Default)]
+pub struct DataLimiter {
+    by_owner: Arc<std::sync::Mutex<std::collections::HashMap<String, u64>>>,
+}
+
+pub struct OwnerGuard {
+    limiter: DataLimiter,
+    owner: String,
+}
+
+impl DataLimiter {
+    pub fn new() -> Self { Self::default() }
+
+    pub fn try_acquire(&self, owner: &str, max_per_token: usize) -> Option<OwnerGuard> {
+        let mut map = self.by_owner.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = map.entry(owner.to_owned()).or_insert(0);
+        if *entry >= max_per_token as u64 { return None; }
+        *entry += 1;
+        Some(OwnerGuard { limiter: self.clone(), owner: owner.to_owned() })
+    }
+}
+
+impl Drop for OwnerGuard {
+    fn drop(&mut self) {
+        let mut map = self.limiter.by_owner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(entry) = map.get_mut(&self.owner) {
+            *entry = entry.saturating_sub(1);
+            if *entry == 0 { map.remove(&self.owner); }
+        }
     }
 }
 
@@ -76,5 +122,24 @@ mod tests {
         assert_eq!((metrics.snapshot().active_control, metrics.snapshot().active_data), (1, 0));
         drop(b);
         assert_eq!(metrics.snapshot(), MetricsSnapshot::default());
+    }
+
+    #[test]
+    fn try_track_respects_max() {
+        let metrics = Metrics::new();
+        let a = metrics.try_track(Gauge::Data, 1).unwrap();
+        assert!(metrics.try_track(Gauge::Data, 1).is_none());
+        drop(a);
+        assert!(metrics.try_track(Gauge::Data, 1).is_some());
+    }
+
+    #[test]
+    fn data_limiter_caps_per_owner() {
+        let limiter = DataLimiter::new();
+        let a = limiter.try_acquire("Bearer a", 1).unwrap();
+        assert!(limiter.try_acquire("Bearer a", 1).is_none());
+        assert!(limiter.try_acquire("Bearer b", 1).is_some());
+        drop(a);
+        assert!(limiter.try_acquire("Bearer a", 1).is_some());
     }
 }

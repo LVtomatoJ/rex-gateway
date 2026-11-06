@@ -35,6 +35,6 @@ async fn main() -> Result<()> {
     let metrics = metrics::Metrics::new();
     let tickets = data::TicketMap::new(Duration::from_millis(config.ticket_ttl_ms), config.ticket_max, metrics.clone());
     tickets.spawn_reaper();
-    let options = inbound::Options { data_connect_timeout: Duration::from_millis(config.data_connect_timeout_ms), ping_interval: Duration::from_millis(config.ws_ping_interval_ms), idle_timeout: Duration::from_millis(config.ws_idle_timeout_ms) };
+    let options = inbound::Options { data_connect_timeout: Duration::from_millis(config.data_connect_timeout_ms), ping_interval: Duration::from_millis(config.ws_ping_interval_ms), idle_timeout: Duration::from_millis(config.ws_idle_timeout_ms), max_data_streams: config.max_data_streams, max_data_streams_per_token: config.max_data_streams_per_token };
     inbound::serve(config.listen, pool, clients, auth, tickets, metrics, options, events).await
 }

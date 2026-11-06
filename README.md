@@ -83,8 +83,9 @@ snapshots, terminal output, and agent input are relayed frame-for-frame between 
 sockets. Ping/pong and close frames, including close codes and reasons, are forwarded.
 The gateway also originates keepalive pings on both legs and idle-closes both sides with
 `1001 "idle timeout"` when no application (binary/text) traffic arrives for
-`ws_idle_timeout_ms`. This is not a terminal protocol parser and does not rewrite bytes
-inside stream frames.
+`ws_idle_timeout_ms`. Concurrent bridges are bounded by `max_data_streams` /
+`max_data_streams_per_token` (close `1013` on overflow, ticket preserved). This is not a
+terminal protocol parser and does not rewrite bytes inside stream frames.
 
 Tickets are kept in memory, single-use and bound to the bearer token. An unused ticket lives
 at most `ticket_ttl_ms` (default 30000 ms): expiry is enforced when the ticket is consumed and

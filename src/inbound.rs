@@ -25,7 +25,7 @@ use crate::{
     pool::UpstreamState,
     control_client::{ControlClient, UpstreamEvent},
     data::{decode_hello, TicketMap},
-    metrics::{Gauge, Metrics},
+    metrics::{DataLimiter, Gauge, Metrics},
     pool::UpstreamPool,
     status,
     protocol::{namespace_event, namespace_response, translate_session_id, SUBPROTOCOL},
@@ -41,6 +41,7 @@ struct AppState {
     auth: Arc<Authenticator>,
     tickets: TicketMap,
     metrics: Arc<Metrics>,
+    data_limiter: DataLimiter,
     options: Options,
     events: broadcast::Sender<UpstreamEvent>,
 }
@@ -52,6 +53,8 @@ pub struct Options {
     pub data_connect_timeout: Duration,
     pub ping_interval: Duration,
     pub idle_timeout: Duration,
+    pub max_data_streams: usize,
+    pub max_data_streams_per_token: usize,
 }
 
 pub async fn serve(
@@ -64,7 +67,7 @@ pub async fn serve(
     options: Options,
     events: broadcast::Sender<UpstreamEvent>,
 ) -> Result<()> {
-    let state = AppState { pool, clients: Arc::new(clients), auth, tickets, metrics, options, events };
+    let state = AppState { pool, clients: Arc::new(clients), auth, tickets, metrics, data_limiter: DataLimiter::new(), options, events };
     let router = router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "gateway listening");
@@ -271,6 +274,15 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
         let _ = agent.send(Message::Close(Some(CloseFrame { code: 1002, reason: Cow::Borrowed("malformed HELLO") }))).await;
         return;
     };
+    // Reserve stream slots before consuming the ticket so a capacity miss does not burn it.
+    let Some(_owner_slot) = state.data_limiter.try_acquire(&owner, state.options.max_data_streams_per_token) else {
+        let _ = agent.send(Message::Close(Some(CloseFrame { code: 1013, reason: Cow::Borrowed("per-token data stream limit") }))).await;
+        return;
+    };
+    let Some(_global_slot) = state.metrics.try_track(Gauge::Data, state.options.max_data_streams) else {
+        let _ = agent.send(Message::Close(Some(CloseFrame { code: 1013, reason: Cow::Borrowed("gateway data stream limit") }))).await;
+        return;
+    };
     let Some(ticket) = state.tickets.take(&external, &owner) else {
         let _ = agent.send(Message::Binary(vec![0x82, 0x01].into())).await;
         let _ = agent.send(Message::Close(Some(CloseFrame { code: 1008, reason: Cow::Borrowed("bad or used ticket") }))).await;
@@ -308,7 +320,6 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
     });
     if upstream_socket.send(tungstenite::Message::Binary(upstream_hello.into())).await.is_err() { return; }
 
-    let _active = state.metrics.track(Gauge::Data);
     let (mut upstream_sink, mut upstream_stream) = upstream_socket.split();
     let (mut agent_sink, mut agent_stream) = agent.split();
     let mut pings=tokio::time::interval_at(tokio::time::Instant::now() + state.options.ping_interval, state.options.ping_interval);
@@ -397,7 +408,7 @@ mod tests {
             ("onlyb".to_owned(), vec!["b".to_owned()]),
         ])));
         let tickets = TicketMap::new(Duration::from_secs(30), 16, metrics.clone());
-        let state = AppState { pool, clients: Arc::new(HashMap::new()), auth, tickets, metrics, options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120) }, events: broadcast::channel(8).0 };
+        let state = AppState { pool, clients: Arc::new(HashMap::new()), auth, tickets, metrics, data_limiter: DataLimiter::new(), options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120), max_data_streams: 128, max_data_streams_per_token: 32 }, events: broadcast::channel(8).0 };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router(state.clone());
