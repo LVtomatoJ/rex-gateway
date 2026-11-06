@@ -15,8 +15,8 @@ The config contains `listen`, `probe_interval_ms`, repeated `[[upstreams]]` entr
 Environment overrides are `REX_GATEWAY_CONFIG`, `REX_GATEWAY_LISTEN`,
 `REX_GATEWAY_PROBE_INTERVAL_MS`, `REX_GATEWAY_TICKET_TTL_MS`, `REX_GATEWAY_TICKET_MAX`,
 `REX_GATEWAY_UPSTREAM_CALL_TIMEOUT_MS`, `REX_GATEWAY_DATA_CONNECT_TIMEOUT_MS`, `REX_GATEWAY_WS_PING_INTERVAL_MS`,
-`REX_GATEWAY_WS_IDLE_TIMEOUT_MS`, and `REX_GATEWAY_UPSTREAM_LOCAL_URL` (for the
-upstream id `local`). Timeouts: `upstream_call_timeout_ms` (default 10000) bounds every call to an
+`REX_GATEWAY_WS_IDLE_TIMEOUT_MS`, `REX_GATEWAY_UPSTREAM_LOCAL_URL` (for the
+upstream id `local`), and the discovery / session-store envs documented below. Timeouts: `upstream_call_timeout_ms` (default 10000) bounds every call to an
 upstream and each (re)connect of its control socket; `data_connect_timeout_ms` (default 10000) bounds the
 agent's data-plane HELLO read and the connect to the upstream data socket. Zero is rejected for both. Optional top-level settings `ticket_ttl_ms` (default 30000) and
 `ticket_max` (default 1024) bound unused data tickets (see Data plane). Tokens and the token map are intentionally TOML-only for now.
@@ -35,13 +35,13 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
   Top-level returned session IDs, and session data nested beneath `view`, are wrapped.
 * `session.create` (and other hostless non-list methods) targets payload `host` when
   supplied; otherwise the gateway picks an ACL-allowed upstream by policy: prefer
-  `Online`, then fall back to `Degraded`, choosing the least `session_count`, then lowest
-  `latency_ms` (`None` after `Some`), then `id` ascending, including transient reservations in
-  the effective load. Explicit `host` must still be
-  ACL-allowed and `Online|Degraded` (not `Offline`/`Unknown`). `host` is a gateway routing
-  hint stripped before forwarding. Namespaced session calls stay sticky to their owner;
-  Offline/Unknown owners return a clear `upstream {id} is Offline|Unknown` error (ACL
-  denial stays `not allowed`).
+  `Online`, then fall back to `Degraded`, scoring by capability tags, soft preferred host
+  ids, least effective load (`session_count + reserved`), then lowest `latency_ms`
+  (`None` after `Some`), then `id` ascending. Explicit `host` must still be
+  ACL-allowed and `Online|Degraded` (not `Offline`/`Unknown`) and wins over soft prefer/avoid
+  lists. `host` is a gateway routing hint stripped before forwarding. Namespaced session
+  calls stay sticky to their owner; Offline/Unknown owners return a clear
+  `upstream {id} is Offline|Unknown` error (ACL denial stays `not allowed`).
 * Startup never needs an upstream: control clients connect lazily on their first call (the probe loop
   makes it) and reconnect after socket loss, with exponential backoff after failed connects
   (200 ms doubling to 5 s; calls fail fast with `retry in N ms` meanwhile). Other hostless
@@ -57,22 +57,29 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
   Degraded; two consecutive failed probes = Offline. First failure is Degraded, initial
   state Unknown. Socket reconnection and a fresh hello happen on the next call.
 * Default create/hostless routing prefers Online and may fall back to Degraded; Offline
-  and Unknown are never selected. Upstream discovery remains outside the gateway.
+  and Unknown are never selected. Discovered upstreams with create eligibility cleared
+  (withdrawn from the discovery file but still sticky for existing sessions) are also
+  skipped for new creates.
 
-## Capability tags and reservations
+## Capability tags, host prefer/avoid, and reservations
 
 Each upstream accepts `tags = ["perf", "macos"]` and optional `description = "..."`.
-Token entries accept `prefer_tags = ["perf"]` and `avoid_tags = ["prod-svc", "clash"]`.
-`REX_GATEWAY_UPSTREAM_<exact-id>_TAGS` is comma-separated and `_DESCRIPTION` overrides metadata;
-`REX_GATEWAY_AUTH_TOKEN_<zero-based-token-index>_PREFER_TAGS` / `_AVOID_TAGS` override defaults.
+Token entries accept `prefer_tags` / `avoid_tags` and soft `prefer_hosts` / `avoid_hosts`
+(host ids). `REX_GATEWAY_UPSTREAM_<exact-id>_TAGS` is comma-separated and `_DESCRIPTION`
+overrides metadata; `REX_GATEWAY_AUTH_TOKEN_<zero-based-token-index>_PREFER_TAGS` /
+`_AVOID_TAGS` / `_PREFER_HOSTS` / `_AVOID_HOSTS` override defaults (comma-separated).
 `create_reservation_ttl_ms` (default 5000, env `REX_GATEWAY_CREATE_RESERVATION_TTL_MS`) is nonzero.
 
-A routed create may override defaults with `prefer_tags` / `avoid_tags` string arrays. All preferred
-tags are required so a request for `macos` never falls back to a Linux host. Any avoided tag excludes
-an upstream exclusively for create; this never hides existing sessions. Scoring rewards matching tags,
-keeps Online above Degraded, and subtracts `session_count + reserved_session_count`; highest score,
-then lowest latency, then ID wins. An explicit, allowed and routable `host` wins over both tag lists.
-Unsatisfiable tags and exclusion of every candidate are returned as explicit errors, never downgraded.
+A routed create may override defaults with `prefer_tags` / `avoid_tags` / `prefer_hosts` /
+`avoid_hosts` string arrays. **Tags are hard:** all preferred tags are required so a request
+for `macos` never falls back to a Linux host. **Hosts are soft:** a preferred host id gets a
+score bonus, but a missing preferred host falls through to other candidates instead of
+hard-erroring. Any avoided tag or host id excludes an upstream exclusively for create; this
+never hides existing sessions from `session.list`. Scoring rewards matching tags and preferred
+host ids, keeps Online above Degraded, and subtracts `session_count + reserved_session_count`;
+highest score, then lowest latency, then ID wins. An explicit, allowed and routable `host`
+wins over both tag and host prefer/avoid lists (including avoid). Unsatisfiable tags and
+exclusion of every candidate are returned as explicit errors, never downgraded.
 
 Reservation and selection happen under one mutex, so simultaneous clients observe each other's effective
 load. Completion or failure releases the guard; forced expiry is reaped at selection/status time. `/status`
@@ -211,9 +218,36 @@ agent and upstream sides. Incoming application frames and pong frames keep a con
 close 1001 / `idle timeout`; data idle closes both bridge endpoints. The idle timeout must be
 greater than the ping interval and both must be nonzero. An agent control initial HELLO/welcome
 is completed before the keepalive loop; data HELLO/setup timeouts remain separate as above.
+## Upstream discovery
+
+Optional `[discovery]` watches a JSON file in `rex-discover --json` shape
+(`[{ "source": "tailnet"|"lan", "name": "...", "addr": "https://...", "mode": "..." }, ...]`)
+and upserts those hosts into the upstream pool:
+
+```toml
+[discovery]
+file = "discovered.json"          # re-read on interval; unset = Manual-only (unchanged)
+interval_ms = 30000               # default 30000; must be nonzero when file is set
+store_path = "rex-gateway-discovered.json"  # optional atomic restart snapshot
+```
+
+Env overrides: `REX_GATEWAY_DISCOVERY_FILE`, `REX_GATEWAY_DISCOVERY_INTERVAL_MS`,
+`REX_GATEWAY_DISCOVERY_STORE_PATH`. When `file` is unset the gateway behaves as before
+(Manual `[[upstreams]]` only). Discovered ids are sanitized from `name`; `addr` keeps its
+scheme or defaults to `https`. `source` becomes `Tailnet` or `Lan` (shown on `/status`).
+**Manual upstreams are never overwritten or deleted** when a discovered name collides.
+
+Reconciliation: a discovered host that disappears from the file is **removed when idle**
+(no remembered session references). If sessions still point at it, it stays sticky so
+attach/list/RPC keep working, but create eligibility is cleared so new `session.create`
+will not pick it. On a successful apply the optional `store_path` is written atomically
+(temp + rename); the store is loaded at startup after Manual upserts so a restart can
+route before the live file is refreshed. Each discovered id also gets a lazy control
+client so probes and RPCs work the same as Manual upstreams.
+
 ## Remaining TODOs
 
-- Upstream discovery / persistent configuration synchronization.
+- Optional live `rex-discover` subprocess / Tailscale watch instead of an external JSON file.
 - Configurable data-plane concurrent stream limits and fragmented-message preservation if
   required by a future Rex protocol version.
 - Preserve fragmented-message boundaries if a future Rex version relies on them (Rex
