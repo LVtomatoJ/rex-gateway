@@ -24,13 +24,15 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
-  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 13).
+  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 14).
 * `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
-  namespaced IDs in sorted upstream-ID order. Upstreams that are not `Online`, or that error or time
-  out, are skipped and reported: the response then also carries `"partial":true`,
-  `"failed_upstreams":["id",...]` and `"upstream_errors":{"id":"reason"}`. A complete list has none
-  of these fields. If every allowed upstream fails, the request returns an error instead
-  (`all upstreams failed: ...`). An ACL that permits no upstream returns an empty list.
+  namespaced IDs in sorted upstream-ID order. Upstreams that are not routable (`Online` or
+  `Degraded`), or that error or time out, are skipped and reported: the response then also carries
+  `"partial":true`, `"failed_upstreams":["id",...]` and `"upstream_errors":{"id":"reason"}`. A
+  complete list has none of these fields. If every allowed upstream fails, the request returns an
+  error instead (`all upstreams failed: ...`). An ACL that permits no upstream returns an empty
+  list. Listing Degraded hosts matches create/RPC routing so a slow-but-alive upstream still
+  surfaces its sessions.
 * Namespaced session calls are routed to their owner, with the prefix stripped upstream.
   Top-level returned session IDs, and session data nested beneath `view`, are wrapped.
 * `session.create` (and other hostless non-list methods) targets payload `host` when
@@ -59,7 +61,8 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
   ID to oneshot map, and support concurrent callers; each call is bounded by
   `upstream_call_timeout_ms`. Upstream events are forwarded independently to agent controls
   whose token can access the owning upstream, with recursively namespaced session references
-  and gateway ticket rewrites. Event and response sequence numbers share one monotonically
+  and gateway ticket rewrites (events are namespaced once and recorded into the session store;
+  they are not re-wrapped). Event and response sequence numbers share one monotonically
   increasing per-agent sequence; request/response IDs retain upstream-independent correlation.
 * Probes use `session.list`: success under 1 second = Online, under/over threshold =
   Degraded; two consecutive failed probes = Offline. First failure is Degraded, initial
