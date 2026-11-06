@@ -63,6 +63,61 @@ async fn spawn_fake_rex(sessions: Vec<Value>, hung: bool) -> String {
     url
 }
 
+/// Fake Rex that sleeps `delay` before answering `delay_method`. Request handling is concurrent
+/// (per-request tasks + write lock) so a slow method does not block other methods on the same socket.
+async fn spawn_fake_rex_delayed(delay_method: &str, delay: Duration) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let delay_method = delay_method.to_owned();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let delay_method = delay_method.clone();
+            tokio::spawn(async move {
+                let callback = |_: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+                    response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(SUBPROTOCOL));
+                    Ok(response)
+                };
+                let Ok(socket) = accept_hdr_async(stream, callback).await else { return };
+                let (sink, mut stream) = socket.split();
+                let sink = std::sync::Arc::new(tokio::sync::Mutex::new(sink));
+                while let Some(Ok(frame)) = stream.next().await {
+                    let tungstenite::Message::Text(text) = frame else { continue };
+                    let message: Value = serde_json::from_str(&text).unwrap();
+                    match message["type"].as_str() {
+                        Some("hello") => {
+                            let mut sink = sink.lock().await;
+                            let _ = sink.send(tungstenite::Message::Text(json!({"type":"welcome"}).to_string())).await;
+                        }
+                        Some("request") => {
+                            let sink = sink.clone();
+                            let delay_method = delay_method.clone();
+                            tokio::spawn(async move {
+                                let method = message["method"].as_str().unwrap_or_default().to_owned();
+                                if method == delay_method {
+                                    tokio::time::sleep(delay).await;
+                                }
+                                let payload = if method == "session.list" {
+                                    json!({"sessions": []})
+                                } else if method == delay_method {
+                                    json!({"slow": true})
+                                } else {
+                                    json!({"ok": true})
+                                };
+                                let reply = json!({"type":"response","id":message["id"],"payload":payload});
+                                let mut sink = sink.lock().await;
+                                let _ = sink.send(tungstenite::Message::Text(reply.to_string())).await;
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+    url
+}
+
 /// A loopback URL nothing listens on.
 async fn dead_url() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -289,7 +344,10 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let mut socket = agent_with_auth(addr, "/api/control", SUBPROTOCOL, authorization).await;
     socket.send(tungstenite::Message::Text(json!({"type":"hello"}).to_string())).await.unwrap();
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
-    assert_eq!(serde_json::from_str::<Value>(&welcome).unwrap()["type"], "welcome");
+    let welcome: Value = serde_json::from_str(&welcome).unwrap();
+    assert_eq!(welcome["type"], "welcome");
+    assert_eq!(welcome["api_server_revision"], 21);
+    assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
 
@@ -1288,4 +1346,128 @@ async fn frame_level_data_connect_error_is_not_masked() {
     let frame = rpc_frame(&mut socket, "data.connect", json!({"session_id":"local:session:x"})).await;
     assert_eq!(frame["error"], err, "must forward Rex error, not invent omitted-ticket: {frame}");
     assert_ne!(frame.pointer("/payload/error").and_then(Value::as_str), Some("upstream data.connect omitted ticket"));
+}
+
+#[tokio::test]
+async fn slow_rpc_does_not_stall_events_or_concurrent_rpc() {
+    // A slow upstream RPC must not block event forwarding or a second concurrent RPC.
+    let url = spawn_fake_rex_delayed("server.slow", tmo(400)).await;
+    let h = start_gateway_with_keepalive(
+        &[("local", &url)],
+        tmo(2000),
+        Duration::from_secs(3600),
+        tmo(300),
+        tmo(40),
+        tmo(5000),
+    ).await;
+    wait_state(&h.pool, "local", UpstreamState::Online).await;
+    let mut socket = control_agent(h.addr).await;
+
+    socket.send(tungstenite::Message::Text(
+        json!({"type":"request","id":"slow","method":"server.slow","payload":{}}).to_string(),
+    )).await.unwrap();
+    socket.send(tungstenite::Message::Text(
+        json!({"type":"request","id":"fast","method":"server.version","payload":{}}).to_string(),
+    )).await.unwrap();
+    h.state.events.send(UpstreamEvent {
+        upstream: "local".into(),
+        event: json!({"type":"event","seq":1,"payload":{"session_id":"session:live","note":"while-slow"}}),
+    }).unwrap();
+
+    let mut saw_fast = false;
+    let mut saw_event = false;
+    let mut saw_ping = false;
+    let mut saw_slow = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline && !(saw_fast && saw_event && saw_slow) {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = match tokio::time::timeout(remaining, socket.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            Ok(Some(Err(e))) => panic!("socket error: {e}"),
+            Ok(None) => panic!("socket closed early"),
+            Err(_) => break,
+        };
+        match frame {
+            tungstenite::Message::Ping(bytes) => {
+                saw_ping = true;
+                socket.send(tungstenite::Message::Pong(bytes)).await.unwrap();
+            }
+            tungstenite::Message::Text(text) => {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                match msg["type"].as_str() {
+                    Some("event") => {
+                        assert_eq!(msg["payload"]["session_id"], "local:session:live");
+                        saw_event = true;
+                        // Event must arrive while the slow RPC is still outstanding.
+                        assert!(!saw_slow, "event arrived after slow RPC finished — select was stalled");
+                    }
+                    Some("response") if msg["id"] == "fast" => {
+                        assert_eq!(msg["payload"], json!({"ok": true}));
+                        saw_fast = true;
+                        assert!(!saw_slow, "fast RPC completed only after slow — select was stalled");
+                    }
+                    Some("response") if msg["id"] == "slow" => {
+                        assert_eq!(msg["payload"], json!({"slow": true}));
+                        saw_slow = true;
+                    }
+                    other => panic!("unexpected message {other:?}: {msg}"),
+                }
+            }
+            tungstenite::Message::Pong(_) => {}
+            other => panic!("unexpected frame {other:?}"),
+        }
+    }
+    assert!(saw_fast, "fast concurrent RPC must complete");
+    assert!(saw_event, "upstream event must be forwarded during slow RPC");
+    assert!(saw_slow, "slow RPC must eventually complete");
+    let _ = saw_ping; // keepalive may or may not fire in the short window; event+fast prove liveness
+    assert!(h.state.metrics.snapshot().events_forwarded >= 1);
+}
+
+#[tokio::test]
+async fn in_flight_control_rpc_bound_returns_clear_error() {
+    // Hung upstream keeps calls in flight until call timeout; overflow must reject immediately.
+    let hung = spawn_fake_rex(vec![], true).await;
+    let h = start_gateway(&[("hung", &hung)], Duration::from_secs(5), Duration::from_secs(3600), tmo(300)).await;
+    // Mark online without waiting for probe (hung never answers session.list).
+    h.pool.mark("hung", UpstreamState::Online, Some(1), 0).await;
+    let mut socket = control_agent(h.addr).await;
+
+    for i in 0..MAX_IN_FLIGHT_CONTROL_RPCS {
+        socket.send(tungstenite::Message::Text(
+            json!({"type":"request","id":format!("hold-{i}"),"method":"server.version","payload":{"host":"hung"}}).to_string(),
+        )).await.unwrap();
+    }
+    // Give spawns a moment to claim in-flight slots before the overflow request.
+    tokio::time::sleep(tmo(50)).await;
+    socket.send(tungstenite::Message::Text(
+        json!({"type":"request","id":"overflow","method":"server.version","payload":{"host":"hung"}}).to_string(),
+    )).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut overflow: Option<Value> = None;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = match tokio::time::timeout(remaining, socket.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            _ => break,
+        };
+        match frame {
+            tungstenite::Message::Ping(bytes) => { let _ = socket.send(tungstenite::Message::Pong(bytes)).await; }
+            tungstenite::Message::Text(text) => {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                if msg["type"] == "response" && msg["id"] == "overflow" {
+                    overflow = Some(msg);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let overflow = overflow.expect("overflow response must arrive promptly");
+    assert_eq!(
+        overflow["payload"]["error"].as_str(),
+        Some("too many in-flight control RPCs"),
+        "{overflow}"
+    );
 }

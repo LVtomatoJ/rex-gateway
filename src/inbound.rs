@@ -35,6 +35,11 @@ use crate::{
 
 const DATA_SUBPROTOCOL: &str = "rex.data.terminal.v1";
 
+/// Max concurrent control-plane RPCs in flight on one agent connection. Overflow responds
+/// immediately with a gateway error and does not call upstream. Keeps the select loop live
+/// (events, keepalive, idle) while spawned handlers await upstream.
+const MAX_IN_FLIGHT_CONTROL_RPCS: usize = 16;
+
 /// What the agent control response frame carries after a successful `handle`.
 /// Gateway-originated failures stay `Err(String)` → `payload: {"error":…}` for
 /// backward compatibility. Rex frame-level errors (`response.error`) are forwarded
@@ -169,17 +174,20 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":20});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":21});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
-    let mut seq = 0;
+    let mut seq = 0u64;
     // Delay the first ping so hello/welcome and early RPCs are not raced by keepalive.
     let mut pings = tokio::time::interval_at(tokio::time::Instant::now() + state.options.ping_interval, state.options.ping_interval);
     pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut idle = tokio::time::interval(std::cmp::max(state.options.idle_timeout / 5, Duration::from_millis(1)));
     idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_activity = std::time::Instant::now();
+    // Spawned handlers deliver finished replies here so the select loop never awaits upstream.
+    let (rpc_tx, mut rpc_rx) = tokio::sync::mpsc::channel::<(Value, Result<AgentReply, String>)>(MAX_IN_FLIGHT_CONTROL_RPCS);
+    let mut in_flight = 0usize;
     loop {
         tokio::select! {
             incoming=stream.next()=> {
@@ -190,13 +198,24 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                         if message["type"] != "request" { continue; }
                         let id = message["id"].clone();
                         let method = message["method"].as_str().unwrap_or_default().to_owned();
-                        let response = match handle(&state, &acl, &owner, &method, message["payload"].clone()).await {
-                            Ok(AgentReply::Payload(payload)) => json!({"type":"response","id":id,"seq":seq+1,"payload":payload}),
-                            Ok(AgentReply::FrameError(error)) => json!({"type":"response","id":id,"seq":seq+1,"error":error}),
-                            Err(e) => json!({"type":"response","id":id,"seq":seq+1,"payload":{"error":e.to_string()}}),
-                        };
-                        seq += 1;
-                        if sink.send(Message::Text(response.to_string())).await.is_err() { break; }
+                        let payload = message["payload"].clone();
+                        if in_flight >= MAX_IN_FLIGHT_CONTROL_RPCS {
+                            // Bound overflow: clear immediate error, no upstream call, seq assigned on send.
+                            seq += 1;
+                            let response = json!({"type":"response","id":id,"seq":seq,"payload":{"error":"too many in-flight control RPCs"}});
+                            if sink.send(Message::Text(response.to_string())).await.is_err() { break; }
+                            continue;
+                        }
+                        in_flight += 1;
+                        let state = state.clone();
+                        let acl = acl.clone();
+                        let owner = owner.clone();
+                        let tx = rpc_tx.clone();
+                        tokio::spawn(async move {
+                            let result = handle(&state, &acl, &owner, &method, payload).await;
+                            // Agent may have closed; dropping the response is fine (no panic).
+                            let _ = tx.send((id, result)).await;
+                        });
                     }
                     // Keepalive only: axum/tungstenite auto-answer pings. Pong must not
                     // count as application activity or idle agents are never reaped.
@@ -205,8 +224,28 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                     _=>{}
                 }
             }
+            finished=rpc_rx.recv()=> {
+                let Some((id, result)) = finished else { break };
+                in_flight = in_flight.saturating_sub(1);
+                // Assign seq only when actually sending onto the agent sink.
+                seq += 1;
+                let response = match result {
+                    Ok(AgentReply::Payload(payload)) => json!({"type":"response","id":id,"seq":seq,"payload":payload}),
+                    Ok(AgentReply::FrameError(error)) => json!({"type":"response","id":id,"seq":seq,"error":error}),
+                    Err(e) => json!({"type":"response","id":id,"seq":seq,"payload":{"error":e.to_string()}}),
+                };
+                if sink.send(Message::Text(response.to_string())).await.is_err() { break; }
+            }
             event=events.recv()=> {
-                let event=match event { Ok(event)=>event, Err(broadcast::error::RecvError::Lagged(n))=>{ tracing::warn!(n,"agent event receiver lagged"); continue }, Err(_)=>break };
+                let event=match event {
+                    Ok(event)=>event,
+                    Err(broadcast::error::RecvError::Lagged(n))=>{
+                        state.metrics.events_lagged.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+                        tracing::warn!(n,"agent event receiver lagged");
+                        continue
+                    },
+                    Err(_)=>break
+                };
                 if event.event.get("type").and_then(Value::as_str) != Some("event") { continue; }
                 if !auth::Authenticator::permits(&acl,&event.upstream) { continue; }
                 // Namespace once, then record from the wrapped payload. Re-running
@@ -217,6 +256,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                 seq += 1;
                 let framed = json!({"type":"event","seq":seq,"payload":payload});
                 if sink.send(Message::Text(framed.to_string())).await.is_err() { break; }
+                state.metrics.events_forwarded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             _=pings.tick()=>if sink.send(Message::Ping(Vec::new())).await.is_err() { break; },
             _=idle.tick()=>if last_activity.elapsed()>=state.options.idle_timeout {
@@ -785,6 +825,8 @@ mod tests {
         assert_eq!(json["counters"]["hostless_transport_failovers"], 0);
         assert_eq!(json["counters"]["create_failover_exhausted"], 0);
         assert_eq!(json["counters"]["hostless_failover_exhausted"], 0);
+        assert_eq!(json["counters"]["events_lagged"], 0);
+        assert_eq!(json["counters"]["events_forwarded"], 0);
         assert_eq!(json["discovery"]["enabled"], false);
         assert_eq!(json["discovery"]["mode"], "none");
         assert_eq!(json["discovery"]["refresh_count"], 0);

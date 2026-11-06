@@ -23,6 +23,10 @@ pub struct Metrics {
     pub create_failover_exhausted: AtomicU64,
     /// Hostless non-create RPC exhausted every candidate with transport errors.
     pub hostless_failover_exhausted: AtomicU64,
+    /// Broadcast events skipped because an agent receiver lagged (`RecvError::Lagged(n)` sums `n`).
+    pub events_lagged: AtomicU64,
+    /// Upstream events successfully forwarded onto an agent control socket.
+    pub events_forwarded: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -37,6 +41,8 @@ pub struct MetricsSnapshot {
     pub hostless_transport_failovers: u64,
     pub create_failover_exhausted: u64,
     pub hostless_failover_exhausted: u64,
+    pub events_lagged: u64,
+    pub events_forwarded: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -60,6 +66,8 @@ impl Metrics {
             hostless_transport_failovers: self.hostless_transport_failovers.load(Relaxed),
             create_failover_exhausted: self.create_failover_exhausted.load(Relaxed),
             hostless_failover_exhausted: self.hostless_failover_exhausted.load(Relaxed),
+            events_lagged: self.events_lagged.load(Relaxed),
+            events_forwarded: self.events_forwarded.load(Relaxed),
         }
     }
 
@@ -172,5 +180,16 @@ mod tests {
         assert_eq!(snap.hostless_transport_failovers, 3);
         assert_eq!(snap.create_failover_exhausted, 1);
         assert_eq!(snap.hostless_failover_exhausted, 1);
+    }
+
+    #[test]
+    fn event_lag_counters_accumulate() {
+        let metrics = Metrics::new();
+        metrics.events_lagged.fetch_add(7, Relaxed);
+        metrics.events_lagged.fetch_add(3, Relaxed);
+        metrics.events_forwarded.fetch_add(11, Relaxed);
+        let snap = metrics.snapshot();
+        assert_eq!(snap.events_lagged, 10);
+        assert_eq!(snap.events_forwarded, 11);
     }
 }

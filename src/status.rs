@@ -56,6 +56,8 @@ pub fn build(
             "hostless_transport_failovers": counters.hostless_transport_failovers,
             "create_failover_exhausted": counters.create_failover_exhausted,
             "hostless_failover_exhausted": counters.hostless_failover_exhausted,
+            "events_lagged": counters.events_lagged,
+            "events_forwarded": counters.events_forwarded,
         },
         "discovery": {
             "enabled": discovery.enabled,
@@ -117,6 +119,7 @@ mod tests {
             active_control: 2, active_data: 1,
             create_transport_failovers: 2, hostless_transport_failovers: 3,
             create_failover_exhausted: 1, hostless_failover_exhausted: 0,
+            events_lagged: 4, events_forwarded: 9,
         };
 
         let all = build(&pool.list_allowed(&["*".into()]).await, 4, SessionStoreStats { refs: 3, forgotten: 2 }, counters, disc(), Instant::now());
@@ -143,6 +146,7 @@ mod tests {
             "tickets_issued": 5, "tickets_consumed": 3, "tickets_expired": 1, "tickets_evicted": 1,
             "create_transport_failovers": 2, "hostless_transport_failovers": 3,
             "create_failover_exhausted": 1, "hostless_failover_exhausted": 0,
+            "events_lagged": 4, "events_forwarded": 9,
         }));
         assert_eq!(all["discovery"], json!({
             "enabled": false, "mode": "none", "last_success_age_ms": null, "last_error": null,

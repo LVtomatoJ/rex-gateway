@@ -29,7 +29,7 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
-  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 20).
+  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 21).
 * `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
   namespaced IDs (recursively wrapping nested `session_id` / `ticket` fields the same way as
   other responses) in sorted upstream-ID order. Upstreams that are not routable (`Online` or
@@ -71,13 +71,19 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
   makes it) and reconnect after socket loss, with exponential backoff after failed connects
   (200 ms doubling to 5 s; calls fail fast with `retry in N ms` meanwhile). Upstreams start
   `Unknown` and the probe loop (concurrent per upstream) promotes them to `Online` once reachable.
-* Agent requests are read serially; upstream calls use a single actor-owned WebSocket,
-  ID to oneshot map, and support concurrent callers; each call is bounded by
+* Agent control requests are accepted concurrently (up to 16 in flight per agent connection;
+  overflow returns `payload: {"error":"too many in-flight control RPCs"}` immediately without
+  an upstream call). Each request is handled on a spawned task so the agent select loop stays
+  live for event forwarding, WebSocket keepalive pings, and idle reaping while upstream RPCs
+  (including create failover hops) are in flight. Upstream calls use a single actor-owned
+  WebSocket, ID to oneshot map, and support concurrent callers; each call is bounded by
   `upstream_call_timeout_ms`. Upstream events are forwarded independently to agent controls
   whose token can access the owning upstream, with recursively namespaced session references
   and gateway ticket rewrites (events are namespaced once and recorded into the session store;
   they are not re-wrapped). Event and response sequence numbers share one monotonically
-  increasing per-agent sequence; request/response IDs retain upstream-independent correlation.
+  increasing per-agent sequence (assigned only when the frame is written to the agent sink);
+  request/response IDs retain upstream-independent correlation. The welcome `limits` object
+  advertises `max_in_flight_control_rpcs` alongside `max_message_bytes`.
 * Rex frame-level errors (`{"type":"response","id":…,"error":{"code","message","status"}}`,
   no `payload`) are forwarded to the agent with the same top-level `error` object. The gateway
   does not collapse them to `payload: null`, does not decorate failed `session.bootstrap` with
@@ -234,7 +240,8 @@ least-recently-active capacity cleanup, manual deletion, and the data-plane clos
     "active_control_connections":1,"active_data_streams":0,
     "tickets_issued":5,"tickets_consumed":4,"tickets_expired":1,"tickets_evicted":0,
     "create_transport_failovers":0,"hostless_transport_failovers":0,
-    "create_failover_exhausted":0,"hostless_failover_exhausted":0
+    "create_failover_exhausted":0,"hostless_failover_exhausted":0,
+    "events_lagged":0,"events_forwarded":0
   },
   "discovery": {
     "enabled":true,"mode":"command","last_success_age_ms":1234,"last_error":null,
@@ -257,6 +264,10 @@ transport error (each hop / retry trigger); `create_failover_exhausted` /
 `hostless_failover_exhausted` increment when every candidate fails and the agent sees
 the aggregate `… failed on all candidates: …` error. Application-level errors and hard
 `host` pins do not touch these counters.
+Broadcast event delivery is also counted: `events_forwarded` increments on each successful
+agent event send; `events_lagged` sums the skipped counts from `RecvError::Lagged(n)` when
+an agent control receiver falls behind the broadcast channel (those events are skipped after
+a warn log, not buffered unboundedly).
 `discovery` reports whether pool fill is configured (`enabled`/`mode` = `command`|`file`|`none`),
 ages since last success/error (`null` if never), whether the last refresh applied a snapshot
 (`last_applied`), and `refresh_count` / `error_count` since process start. When discovery is
