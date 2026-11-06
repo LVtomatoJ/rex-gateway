@@ -28,7 +28,7 @@ use crate::{
     metrics::{Gauge, Metrics},
     pool::UpstreamPool,
     status,
-    protocol::{translate_session_id, SUBPROTOCOL},
+    protocol::{namespace_event, namespace_response, translate_session_id, SUBPROTOCOL},
 };
 
 const DATA_SUBPROTOCOL: &str = "rex.data.terminal.v1";
@@ -159,14 +159,10 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
     if let Some(object) = payload.as_object_mut() { object.remove("host"); }
     let mut response = state.clients.get(&owner_upstream).ok_or("upstream client missing")?
         .call(method, payload).await.map_err(|e| e.to_string())?;
-    if method == "data.connect" {
-        let upstream_ticket = response.get("ticket").and_then(Value::as_str).ok_or("upstream data.connect omitted ticket")?;
-        response["ticket"] = Value::String(state.tickets.insert(&owner_upstream, upstream_ticket, owner));
+    if method == "data.connect" && response.get("ticket").and_then(Value::as_str).is_none() {
+        return Err("upstream data.connect omitted ticket".into());
     }
-    if let Some(object) = response.as_object_mut() {
-        for value in object.values_mut() { translate_session_id(value, &owner_upstream, true); }
-    }
-    if method == "session.create" || method == "session.bootstrap" { translate_session_id(&mut response, &owner_upstream, true); }
+    namespace_response(&mut response, &owner_upstream, &state.tickets, owner);
     Ok(response)
 }
 
