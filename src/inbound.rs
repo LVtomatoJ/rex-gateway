@@ -214,12 +214,18 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
             Some(host) => host,
             None => {
                 if method != "session.create" {
+                    // Legacy single-upstream shortcut, else Manual/Online default (discovery may add many).
                     let ids = state.clients.keys();
-                    let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
-                    return dispatch_sole_client(state, acl, &id_refs, method, payload, owner).await;
+                    if ids.len() == 1 {
+                        let id_refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+                        return dispatch_sole_client(state, acl, &id_refs, method, payload, owner).await;
+                    }
+                    let upstream = state.pool.pick_default(acl).await.ok_or_else(|| "no routable upstream".to_owned())?;
+                    upstream.id
+                } else {
+                    let (upstream, reserved) = state.pool.reserve_for_create(acl, &prefs, state.options.create_reservation_ttl).await?;
+                    reservation = Some(reserved); upstream.id
                 }
-                let (upstream, reserved) = state.pool.reserve_for_create(acl, &prefs, state.options.create_reservation_ttl).await?;
-                reservation = Some(reserved); upstream.id
             }
         },
     };

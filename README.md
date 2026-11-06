@@ -45,7 +45,8 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 * Startup never needs an upstream: control clients connect lazily on their first call (the probe loop
   makes it) and reconnect after socket loss, with exponential backoff after failed connects
   (200 ms doubling to 5 s; calls fail fast with `retry in N ms` meanwhile). Other hostless
-  upstream methods retain the legacy single-upstream default route. Upstreams start
+  upstream methods use the sole client when only one exists; with multiple upstreams
+  they default to a routable Manual host (else first Online create-eligible by id). Upstreams start
   `Unknown` and the probe loop (concurrent per upstream) promotes them to `Online` once reachable.
 * Agent requests are read serially; upstream calls use a single actor-owned WebSocket,
   ID to oneshot map, and support concurrent callers; each call is bounded by

@@ -96,6 +96,14 @@ impl UpstreamPool {
         ids.sort(); ids
     }
     pub async fn get(&self, id: &str) -> Option<Upstream> { self.inner.lock().expect("pool mutex").get(id).cloned() }
+    /// Hostless non-create default: Manual Online first, then any routable create-eligible by id.
+    pub async fn pick_default(&self, acl: &[String]) -> Option<Upstream> {
+        let mut candidates: Vec<Upstream> = self.inner.lock().expect("pool mutex").values()
+            .filter(|u| Authenticator::permits(acl, &u.id) && u.accept_creates && u.state.is_routable())
+            .cloned().collect();
+        candidates.sort_by_key(|u| (u.source != Source::Manual, u.state != UpstreamState::Online, u.id.clone()));
+        candidates.into_iter().next()
+    }
     pub async fn reserve_for_create(&self, acl: &[String], prefs: &TagPreferences, ttl: Duration) -> Result<(Upstream, Reservation), String> {
         let now = Instant::now();
         let mut guard = self.inner.lock().expect("pool mutex");
@@ -365,5 +373,17 @@ mod tests {
         assert_eq!(u.id,"local", "stale discovered host is skipped for create"); r.finish();
         assert!(p.remove_discovered("ts-box").await);
         assert!(p.get("ts-box").await.is_none());
+    }
+
+    #[tokio::test]
+    async fn pick_default_prefers_manual_online() {
+        let p=UpstreamPool::new();
+        p.upsert("z-disc","http://z",Source::Tailnet).await;
+        p.upsert("local","http://m",Source::Manual).await;
+        p.mark("z-disc",UpstreamState::Online,Some(1),0).await;
+        p.mark("local",UpstreamState::Online,Some(1),0).await;
+        assert_eq!(p.pick_default(&["*".into()]).await.unwrap().id, "local");
+        p.mark("local",UpstreamState::Offline,None,0).await;
+        assert_eq!(p.pick_default(&["*".into()]).await.unwrap().id, "z-disc");
     }
 }
