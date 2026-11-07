@@ -17,7 +17,7 @@ It is a single Rust binary in this repository (`rex-gateway`). It does not embed
 ## What it does
 
 - Authenticates `GET /api/control`, `GET /api/data`, and `GET /status` with a bearer token before any WebSocket upgrade.
-- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **24**.
+- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **25**.
 - Fans `session.list` out to every allowed upstream and prefixes session ids with the upstream id.
 - Routes a namespaced session call back to that upstream, and routes a hostless `session.create` or other hostless call with the rules in [Routing and failover](#routing-and-failover).
 - Rewrites nested `ticket` strings to single-use gateway tickets and bridges `rex.data.terminal.v1` byte-for-byte.
@@ -161,7 +161,7 @@ Welcome shape (ids are new on every connection):
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 24,
+  "api_server_revision": 25,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -361,13 +361,14 @@ The agent HELLO is the byte `0x01` plus those 16 raw bytes. The gateway then dia
 | Owner upstream missing, or its data URL is not a client request | Close `1011` `upstream unavailable`. Ticket restored |
 | Upstream dial exceeds `data_connect_timeout_ms` | Close `1011` `upstream connect timeout`. Ticket restored |
 | Upstream dial fails | Close `1011` `upstream connection failed`. Ticket restored |
-| Stored upstream ticket is not base64url, after the upstream socket is open | Close `1011` `invalid upstream ticket`. Ticket stays spent |
+| Stored upstream ticket is not base64url, after the upstream socket is open | Close `1011` `invalid upstream ticket`. Ticket restored |
+| Upstream HELLO send fails after the socket is open | Close `1011` `upstream HELLO failed`. Ticket restored |
 | Upstream data socket ends without a Close | Close `1011` `upstream offline` if the pool says `Offline`, otherwise `upstream closed` |
 | Forwarding agent bytes to the upstream fails | Close `1011` `upstream closed` |
 | Agent drops without a Close, or agent send fails | Upstream close `1001` `peer closed` |
 | No binary or text for `ws_idle_timeout_ms` | Both sides close `1001` `idle timeout` |
 
-Stream caps are checked before the ticket is taken, so close `1013` leaves it usable. A forgotten session is refused after `take` and the ticket stays spent. Connect-path failures before the upstream socket is open put that same external id back with its original creation time, so the TTL does not restart. `tickets_consumed` goes up on `take` and down by one on a successful restore. If the original TTL has already elapsed, restore does not put the ticket back and `tickets_expired` increases. A full map can evict some other oldest ticket to make room for the restored one (`tickets_evicted`). If that external id is already present, restore fails and this ticket stays spent. Once the upstream socket is open the ticket stays spent, including a bad base64 ticket and a failed send of the upstream HELLO (that send failure returns without its own close frame).
+Stream caps are checked before the ticket is taken, so close `1013` leaves it usable. A forgotten session is refused after `take` and the ticket stays spent. Failures before the upstream HELLO is delivered — missing upstream, invalid data URL, connect timeout, connection failed, invalid upstream ticket bytes, or HELLO send failure — put that same external id back with its original creation time, so the TTL does not restart and the agent may retry until expiry. `tickets_consumed` goes up on `take` and down by one on a successful restore. If the original TTL has already elapsed, restore does not put the ticket back and `tickets_expired` increases. A full map can evict some other oldest ticket to make room for the restored one (`tickets_evicted`). If that external id is already present, restore fails and this ticket stays spent. After a successful HELLO send the ticket is committed (the upstream may have consumed it).
 
 Rex's own ACCEPT (`0x81…`) and REJECT frames are relayed once the bridge is up. The gateway does not invent an ACCEPT.
 

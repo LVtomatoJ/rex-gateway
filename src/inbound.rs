@@ -174,7 +174,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":24});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":25});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -572,10 +572,22 @@ async fn data_upgrade(
     Ok(ws.protocols([DATA_SUBPROTOCOL]).max_message_size(MAX_MESSAGE_BYTES).on_upgrade(move |socket| proxy_data(socket, state, owner)))
 }
 
-/// Restore a just-taken ticket (connect failed before HELLO) and close the agent once.
+/// Restore a just-taken ticket (failure before upstream HELLO is delivered) and close the agent once.
 async fn restore_ticket_and_close(agent: &mut WebSocket, tickets: &TicketMap, taken: TakenTicket, reason: &'static str) {
     tickets.restore(taken);
     let _ = agent.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed(reason) }))).await;
+}
+
+/// Like [`restore_ticket_and_close`], but also closes an already-opened upstream data socket.
+async fn restore_ticket_and_close_upstream(
+    agent: &mut WebSocket,
+    mut upstream: impl SinkExt<tungstenite::Message> + Unpin,
+    tickets: &TicketMap,
+    taken: TakenTicket,
+    reason: &'static str,
+) {
+    let _ = upstream.close().await;
+    restore_ticket_and_close(agent, tickets, taken, reason).await;
 }
 
 async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
@@ -651,13 +663,19 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
             return;
         }
     };
-    // Connect succeeded: ticket is committed even if HELLO encode/send fails below.
+    // Ticket stays restorable until the rewritten upstream HELLO is successfully sent.
     let mut upstream_hello = vec![1];
-    upstream_hello.extend(match base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &taken.ticket.upstream_ticket) {
-        Ok(bytes) => bytes,
-        Err(_) => { let _ = agent.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed("invalid upstream ticket") }))).await; return; }
-    });
-    if upstream_socket.send(tungstenite::Message::Binary(upstream_hello.into())).await.is_err() { return; }
+    match base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &taken.ticket.upstream_ticket) {
+        Ok(bytes) => upstream_hello.extend(bytes),
+        Err(_) => {
+            restore_ticket_and_close_upstream(&mut agent, upstream_socket, &state.tickets, taken, "invalid upstream ticket").await;
+            return;
+        }
+    };
+    if upstream_socket.send(tungstenite::Message::Binary(upstream_hello.into())).await.is_err() {
+        restore_ticket_and_close_upstream(&mut agent, upstream_socket, &state.tickets, taken, "upstream HELLO failed").await;
+        return;
+    }
     let ticket = taken.ticket;
 
     let (mut upstream_sink, mut upstream_stream) = upstream_socket.split();

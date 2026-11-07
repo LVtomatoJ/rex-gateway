@@ -113,7 +113,7 @@ impl TicketMap {
     /// Consumes a ticket. Unknown, expired, already-used and wrong-owner tickets all yield `None`
     /// (callers cannot tell them apart). A wrong-owner attempt does not burn a live ticket.
     /// The returned [`TakenTicket`] can be put back with [`restore`] / [`restore_at`] if the
-    /// agent never reaches the upstream (connect-path failure before HELLO is forwarded).
+    /// upstream HELLO is never successfully delivered (connect-path or HELLO encode/send failure).
     pub fn take_at(&self, external: &str, owner: &str, now: Instant) -> Option<TakenTicket> {
         let mut inner = self.lock();
         let entry = inner.entries.get(external)?;

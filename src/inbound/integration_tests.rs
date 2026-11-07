@@ -349,7 +349,7 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let welcome: Value = serde_json::from_str(&welcome).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["api_server_revision"], 24);
+    assert_eq!(welcome["api_server_revision"], 25);
     assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
@@ -541,6 +541,110 @@ async fn data_plane_missing_upstream_restores_ticket() {
     }
     assert_eq!(h.state.tickets.pending(), 1);
     assert!(h.state.tickets.take(&external, SECRET).is_some());
+}
+
+#[tokio::test]
+async fn data_plane_invalid_upstream_ticket_restores_ticket() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let Ok(mut upstream) = accept_hdr_async(stream, |req: &Request, mut response: Response| {
+                if !req.uri().path().ends_with("/api/data") { return Err(ErrorResponse::new(None)); }
+                response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(DATA_SUBPROTOCOL));
+                Ok(response)
+            }).await else { continue };
+            while let Some(Ok(_)) = upstream.next().await {}
+        }
+    });
+    let h = start_gateway(&[("local", &url)], tmo(300), Duration::from_secs(3600), tmo(300)).await;
+    let external = h.state.tickets.insert("local", "!!!not-valid-base64!!!", SECRET);
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
+    let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat().into())).await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(5), socket.next()).await.expect("must not hang").unwrap().unwrap() {
+        tungstenite::Message::Close(Some(frame)) => assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1011, "invalid upstream ticket")),
+        other => panic!("expected close, got {other:?}"),
+    }
+    assert_eq!(h.state.tickets.pending(), 1, "ticket restored after invalid upstream ticket");
+    let restored = h.state.tickets.take(&external, SECRET).expect("same ticket takeable again");
+    assert_eq!(restored.upstream, "local");
+    assert_eq!(restored.upstream_ticket, "!!!not-valid-base64!!!");
+}
+
+#[tokio::test]
+async fn data_plane_upstream_hello_send_failed_restores_ticket() {
+    // Complete the WS handshake then RST the peer while the gateway flushes a large HELLO so
+    // `upstream_socket.send` returns Err and the ticket is restored (not committed).
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            {
+                use std::os::fd::AsRawFd;
+                #[repr(C)]
+                struct Linger { l_onoff: i32, l_linger: i32 }
+                extern "C" {
+                    fn setsockopt(fd: i32, level: i32, name: i32, val: *const Linger, len: u32) -> i32;
+                }
+                let linger = Linger { l_onoff: 1, l_linger: 0 };
+                unsafe { setsockopt(stream.as_raw_fd(), 1, 13, &linger, std::mem::size_of::<Linger>() as u32); }
+            }
+            let Ok(upstream) = accept_hdr_async(stream, |req: &Request, mut response: Response| {
+                if !req.uri().path().ends_with("/api/data") { return Err(ErrorResponse::new(None)); }
+                response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(DATA_SUBPROTOCOL));
+                Ok(response)
+            }).await else { continue };
+            drop(upstream);
+        }
+    });
+    let oversized = base64::Engine::encode(
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+        vec![0u8; 256 * 1024],
+    );
+    let h = start_gateway(&[("local", &url)], tmo(300), Duration::from_secs(3600), tmo(500)).await;
+    let external = h.state.tickets.insert("local", &oversized, SECRET);
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
+    let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat().into())).await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(5), socket.next()).await.expect("must not hang").unwrap().unwrap() {
+        tungstenite::Message::Close(Some(frame)) => assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1011, "upstream HELLO failed")),
+        other => panic!("expected close, got {other:?}"),
+    }
+    assert_eq!(h.state.tickets.pending(), 1, "ticket restored after HELLO send failure");
+    let restored = h.state.tickets.take(&external, SECRET).expect("same ticket takeable again");
+    assert_eq!(restored.upstream, "local");
+    assert_eq!(restored.upstream_ticket, oversized);
+}
+
+#[tokio::test]
+async fn data_plane_successful_hello_consumes_ticket() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let Ok(mut upstream) = accept_hdr_async(stream, |req: &Request, mut response: Response| {
+                if !req.uri().path().ends_with("/api/data") { return Err(ErrorResponse::new(None)); }
+                response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(DATA_SUBPROTOCOL));
+                Ok(response)
+            }).await else { continue };
+            let Some(Ok(tungstenite::Message::Binary(hello))) = upstream.next().await else { continue };
+            if hello.first() != Some(&1) { continue; }
+            if upstream.send(tungstenite::Message::Binary(vec![0x81])).await.is_err() { continue; }
+            while let Some(Ok(_)) = upstream.next().await {}
+        }
+    });
+    let h = start_gateway(&[("local", &url)], tmo(300), Duration::from_secs(3600), tmo(300)).await;
+    let external = h.state.tickets.insert("local", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
+    let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat().into())).await.unwrap();
+    assert!(!next_binary(&mut socket).await.is_empty());
+    assert_eq!(h.state.tickets.pending(), 0, "successful HELLO commits the ticket");
+    assert!(h.state.tickets.take(&external, SECRET).is_none(), "committed ticket is not restorable");
 }
 
 #[tokio::test]

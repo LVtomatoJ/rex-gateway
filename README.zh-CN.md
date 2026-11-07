@@ -17,7 +17,7 @@ Rex Gateway 是放在你自己的一台或多台 Rex 服务器前面的控制面
 ## 它做什么
 
 - 在 WebSocket 升级之前，用 Bearer 令牌认证 `GET /api/control`、`GET /api/data` 和 `GET /status`。
-- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **24**。
+- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **25**。
 - 把 `session.list` 并发发到每个允许的上游，并给会话 id 加上上游 id 前缀。
 - 带上游前缀的会话调用回到那台上游；没有会话 id 的 `session.create` 和其他无主机调用按[路由与故障转移](#路由与故障转移)处理。
 - 把嵌套的 `ticket` 字符串换成一次性网关票据，并按消息原样桥接 `rex.data.terminal.v1`。
@@ -161,7 +161,7 @@ avoid_hosts = []
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 24,
+  "api_server_revision": 25,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -361,13 +361,14 @@ Agent 的 HELLO 是字节 `0x01` 加上这 16 个原始字节。网关随后拨�
 | 所属上游已不在池中，或它的数据 URL 不能变成客户端请求 | 关闭 `1011` `upstream unavailable`。票据退回 |
 | 拨号上游超过 `data_connect_timeout_ms` | 关闭 `1011` `upstream connect timeout`。票据退回 |
 | 拨号上游失败 | 关闭 `1011` `upstream connection failed`。票据退回 |
-| 上游套接字已经打开之后，保存的上游票据不是 base64url | 关闭 `1011` `invalid upstream ticket`。票据保持已消耗 |
+| 上游套接字已经打开之后，保存的上游票据不是 base64url | 关闭 `1011` `invalid upstream ticket`。票据退回 |
+| 上游套接字打开后，向上游发送 HELLO 失败 | 关闭 `1011` `upstream HELLO failed`。票据退回 |
 | 上游数据套接字没有 Close 就结束 | 若池中状态为 `Offline` 则关闭 `1011` `upstream offline`，否则 `upstream closed` |
 | 把 agent 字节转发到上游失败 | 关闭 `1011` `upstream closed` |
 | Agent 没有 Close 就断开，或发给 agent 失败 | 上游关闭 `1001` `peer closed` |
 | 在 `ws_idle_timeout_ms` 内没有二进制或文本 | 两侧都关闭 `1001` `idle timeout` |
 
-数据流上限在取走票据之前检查，因此关闭 `1013` 后票据仍可使用。会话已忘记是在 `take` 之后拒绝的，票据保持已消耗。上游套接字打开之前的连接失败会把同一个外部 id 放回去，创建时间不变，所以 TTL 不会重新计时。`tickets_consumed` 在 `take` 时加一，成功退回时减一。若原来的 TTL 已经走完，退回不会把票据放回去，并且 `tickets_expired` 增加。映射已满时，退回可能淘汰另一张最旧的票据来腾位置（`tickets_evicted`）。若这个外部 id 已经在映射里，退回失败，这张票据保持已消耗。上游套接字一旦打开，票据就保持已消耗，包括 base64 无效，以及向上游发送 HELLO 失败（这次发送失败直接返回，不再另发关闭帧）。
+数据流上限在取走票据之前检查，因此关闭 `1013` 后票据仍可使用。会话已忘记是在 `take` 之后拒绝的，票据保持已消耗。上游 HELLO 送达之前的失败——上游缺失、数据 URL 无效、连接超时、连接失败、上游票据字节无效，或 HELLO 发送失败——会把同一个外部 id 放回去，创建时间不变，所以 TTL 不会重新计时，agent 可以在过期前重试。`tickets_consumed` 在 `take` 时加一，成功退回时减一。若原来的 TTL 已经走完，退回不会把票据放回去，并且 `tickets_expired` 增加。映射已满时，退回可能淘汰另一张最旧的票据来腾位置（`tickets_evicted`）。若这个外部 id 已经在映射里，退回失败，这张票据保持已消耗。HELLO 发送成功后票据才算提交（上游可能已经消耗了自己的票据）。
 
 桥建立之后，Rex 自己的 ACCEPT（`0x81…`）和 REJECT 会被转发。网关不会自己造一个 ACCEPT。
 
