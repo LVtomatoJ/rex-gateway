@@ -150,7 +150,8 @@ impl ControlClient {
                 }
                 incoming=async { socket.as_mut().unwrap().next().await }, if socket.is_some()=> {
                     match incoming {
-                        Some(Ok(Message::Pong(_)))=> { last_activity=Instant::now(); }
+                        // Keepalive only: ping/pong must not refresh application-idle.
+                        Some(Ok(Message::Pong(_)))=> {}
                         Some(Ok(Message::Text(text)))=> {
                             last_activity=Instant::now();
                             let Ok(message)=serde_json::from_str::<Value>(&text) else { continue };
@@ -167,7 +168,6 @@ impl ControlClient {
                             }
                         }
                         Some(Ok(Message::Ping(_)))=> {
-                            last_activity=Instant::now();
                             if let Some(s)=socket.as_mut() { let _=s.send(Message::Pong(Vec::new())).await; }
                         }
                         Some(Ok(Message::Close(_)))|None|Some(Err(_))=> {
@@ -360,6 +360,50 @@ mod tests {
         assert!(
             msg2.contains("upstream request timeout") || msg2.contains("upstream response timed out") || msg2.contains("upstream response lost"),
             "unexpected error: {msg2}"
+        );
+    }
+
+    async fn mock_upstream_ping_only() -> String {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr=listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream,_)=listener.accept().await.unwrap();
+            let mut socket=tokio_tungstenite::accept_hdr_async(stream, |_: &tokio_tungstenite::tungstenite::handshake::server::Request, mut response: tokio_tungstenite::tungstenite::handshake::server::Response| { response.headers_mut().insert("sec-websocket-protocol", SUBPROTOCOL.parse().unwrap()); Ok(response) }).await.unwrap();
+            socket.next().await;
+            socket.send(Message::Text(json!({"type":"welcome"}).to_string())).await.unwrap();
+            // Keep the socket alive on ping/pong alone; never emit application text.
+            while let Some(Ok(frame))=socket.next().await {
+                match frame {
+                    Message::Ping(_)=> { let _=socket.send(Message::Pong(Vec::new())).await; }
+                    Message::Pong(_)=> {}
+                    Message::Text(_)=> { /* swallow RPC; no response/event */ }
+                    _=>{}
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn application_idle_closes_despite_ping_pong() {
+        let url=mock_upstream_ping_only().await;
+        let (events,_)=broadcast::channel(4);
+        let client=ControlClient::new(
+            "keepalive-only".into(),
+            url,
+            Options {
+                // call_timeout longer than idle so the pending oneshot survives until idle close.
+                call_timeout: Duration::from_millis(800),
+                ping_interval: Duration::from_millis(40),
+                idle_timeout: Duration::from_millis(150),
+            },
+            events,
+        );
+        let err = client.call("session.list", json!({})).await.expect_err("must idle-close");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("upstream idle timeout"),
+            "expected application-idle close while ping/pong kept flowing, got: {msg}"
         );
     }
 

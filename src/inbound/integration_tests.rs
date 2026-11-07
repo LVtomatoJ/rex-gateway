@@ -349,7 +349,7 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let welcome: Value = serde_json::from_str(&welcome).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["api_server_revision"], 31);
+    assert_eq!(welcome["api_server_revision"], 32);
     assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
@@ -1992,9 +1992,14 @@ async fn control_rpc_responses_refresh_application_idle() {
 
 /// Bound-overflow responses are still delivered control replies: they must refresh application-idle
 /// the same way successful RPC responses do (README: "successfully delivered control response").
+///
+/// The hung upstream must stay application-alive (so the 16 holds remain in flight and overflow
+/// stays local). Ping/pong alone no longer counts on the upstream control client, so the mock
+/// emits ignored application text (`type: keepalive`) that refreshes upstream idle without
+/// completing RPCs or forwarding events to the agent.
 #[tokio::test]
 async fn overflow_control_responses_refresh_application_idle() {
-    let hung = spawn_fake_rex(vec![], true).await;
+    let hung = spawn_fake_rex_hung_keepalive_text().await;
     let h = start_gateway_with_keepalive(
         &[("hung", &hung)], Duration::from_secs(5), Duration::from_secs(3600), tmo(300), tmo(40), tmo(200),
     ).await;
@@ -2042,7 +2047,9 @@ async fn overflow_control_responses_refresh_application_idle() {
     assert!(n >= 2, "expected multiple overflow deliveries, got {n}");
 
     // After overflow traffic stops, application idle must still reap.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    // Upstream keepalive text also stops shortly after; once holds fail they may deliver late
+    // error texts (still application traffic). Then idle close.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         match tokio::time::timeout(left, socket.next()).await {
@@ -2059,4 +2066,56 @@ async fn overflow_control_responses_refresh_application_idle() {
             Ok(Some(Ok(other))) => panic!("unexpected {other:?}"),
         }
     }
+}
+
+/// Hung upstream that never answers RPCs, but periodically sends ignored application text so the
+/// gateway's upstream-control application-idle timer does not reap the socket mid-test.
+async fn spawn_fake_rex_hung_keepalive_text() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            tokio::spawn(async move {
+                let callback = |_: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+                    response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(SUBPROTOCOL));
+                    Ok(response)
+                };
+                let Ok(mut socket) = accept_hdr_async(stream, callback).await else { return };
+                let mut keep = tokio::time::interval(Duration::from_millis(50));
+                keep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // Stop keepalive text after ~500ms so the agent-side idle close phase can finish.
+                let stop_keep_at = tokio::time::Instant::now() + Duration::from_millis(500);
+                loop {
+                    tokio::select! {
+                        frame = socket.next() => {
+                            match frame {
+                                Some(Ok(tungstenite::Message::Text(text))) => {
+                                    let message: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+                                    if message["type"] == "hello" {
+                                        let _ = socket.send(tungstenite::Message::Text(json!({"type":"welcome"}).to_string())).await;
+                                    }
+                                    // requests: swallow (hung)
+                                }
+                                Some(Ok(tungstenite::Message::Ping(bytes))) => {
+                                    let _ = socket.send(tungstenite::Message::Pong(bytes)).await;
+                                }
+                                Some(Ok(tungstenite::Message::Pong(_))) => {}
+                                Some(Ok(tungstenite::Message::Close(_))) | None | Some(Err(_)) => return,
+                                _ => {}
+                            }
+                        }
+                        _ = keep.tick(), if tokio::time::Instant::now() < stop_keep_at => {
+                            // Text refreshes upstream application-idle; unknown type is ignored by the actor
+                            // (not a correlated response, not a forwarded event).
+                            if socket.send(tungstenite::Message::Text(json!({"type":"keepalive"}).to_string())).await.is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        }
+    });
+    url
 }

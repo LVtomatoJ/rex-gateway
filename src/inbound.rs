@@ -180,7 +180,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":31});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":32});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -854,12 +854,31 @@ async fn close_upstream_peer_closed(
     let _ = upstream_sink.close().await;
 }
 
+/// WebSocket close reasons are capped at 123 UTF-8 bytes (RFC 6455). Truncate on a char boundary.
+fn truncate_close_reason(reason: &str) -> String {
+    const MAX: usize = 123;
+    if reason.len() <= MAX {
+        return reason.to_owned();
+    }
+    let mut end = MAX;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    reason[..end].to_owned()
+}
+
 fn to_upstream_close(frame: CloseFrame) -> tungstenite::protocol::CloseFrame {
-    tungstenite::protocol::CloseFrame { code: frame.code.into(), reason: frame.reason.to_string().into() }
+    tungstenite::protocol::CloseFrame {
+        code: frame.code.into(),
+        reason: truncate_close_reason(frame.reason.as_ref()).into(),
+    }
 }
 
 fn to_agent_close(frame: tungstenite::protocol::CloseFrame) -> CloseFrame {
-    CloseFrame { code: frame.code.into(), reason: Cow::Owned(frame.reason.to_string()) }
+    CloseFrame {
+        code: frame.code.into(),
+        reason: Cow::Owned(truncate_close_reason(frame.reason.as_ref())),
+    }
 }
 
 #[cfg(test)]
@@ -938,5 +957,40 @@ mod tests {
         let json: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(json["upstreams"].as_array().unwrap().len(), 1);
         assert_eq!(json["upstreams"][0]["id"], "b");
+    }
+
+    #[test]
+    fn truncate_close_reason_caps_at_123_utf8_bytes() {
+        assert_eq!(truncate_close_reason("short"), "short");
+        let ascii = "a".repeat(200);
+        let truncated = truncate_close_reason(&ascii);
+        assert_eq!(truncated.len(), 123);
+        assert_eq!(truncated, "a".repeat(123));
+
+        // Multi-byte char straddling the 123-byte boundary must not split a codepoint.
+        // 40 ASCII + 30 × U+4E2D (3 bytes each) = 40 + 90 = 130 bytes.
+        let mixed = format!("{}{}", "x".repeat(40), "中".repeat(30));
+        assert_eq!(mixed.len(), 130);
+        let cut = truncate_close_reason(&mixed);
+        assert!(cut.len() <= 123, "len={}", cut.len());
+        assert!(cut.is_char_boundary(cut.len()));
+        assert!(!cut.contains('\u{FFFD}'));
+        // 40 + 27*3 = 121 (next 中 would push to 124)
+        assert_eq!(cut, format!("{}{}", "x".repeat(40), "中".repeat(27)));
+    }
+
+    #[test]
+    fn close_frame_helpers_truncate_long_reasons() {
+        let long = "r".repeat(200);
+        let up = to_upstream_close(CloseFrame {
+            code: 1000,
+            reason: Cow::Owned(long.clone()),
+        });
+        assert_eq!(up.reason.as_ref().len(), 123);
+        let agent = to_agent_close(tungstenite::protocol::CloseFrame {
+            code: tungstenite::protocol::frame::coding::CloseCode::Normal,
+            reason: long.into(),
+        });
+        assert_eq!(agent.reason.len(), 123);
     }
 }
