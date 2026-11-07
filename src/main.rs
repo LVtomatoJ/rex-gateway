@@ -9,6 +9,7 @@ mod pool;
 mod probe;
 mod protocol;
 mod status;
+mod subscriptions;
 mod sessions;
 
 use std::sync::Arc;

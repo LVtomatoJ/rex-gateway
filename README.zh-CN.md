@@ -17,7 +17,7 @@ Rex Gateway 是放在你自己的一台或多台 Rex 服务器前面的控制面
 ## 它做什么
 
 - 在 WebSocket 升级之前，用 Bearer 令牌认证 `GET /api/control`、`GET /api/data` 和 `GET /status`。
-- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **34**。
+- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **35**。
 - 把 `session.list` 并发发到每个允许的上游，并给会话 id 加上上游 id 前缀。
 - 带上游前缀的会话调用回到那台上游；没有会话 id 的 `session.create` 和其他无主机调用按[路由与故障转移](#路由与故障转移)处理。
 - 把嵌套的 `ticket` 字符串换成一次性网关票据，并按消息原样桥接 `rex.data.terminal.v1`。
@@ -161,7 +161,7 @@ avoid_hosts = []
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 34,
+  "api_server_revision": 35,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -198,14 +198,14 @@ avoid_hosts = []
 
 ## 开发与测试
 
-`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、票据退回、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码（含已忘记会话的二进制 REJECT、Offline 附着拒绝，以及意外上游断开后结束 agent sink）、事件滞后通知、控制响应刷新空闲（含在途溢出回复）、钉住主机离线文案、控制面在途 RPC 上限、panic 时释放在途槽位、挂起的上游控制面 pending RPC 收割、上游控制面应用空闲（ping/pong 不刷新）、数据桥关闭原因截断到 123 字节，agent WebSocket 帧/消息 1 MiB 上限、`session.attach_all` 扇出、仅嵌套会话引用的路由，以及数据桥关闭握手排空。
+`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、票据退回、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码（含已忘记会话的二进制 REJECT、Offline 附着拒绝，以及意外上游断开后结束 agent sink）、事件滞后通知、控制响应刷新空闲（含在途溢出回复）、钉住主机离线文案、控制面在途 RPC 上限、panic 时释放在途槽位、挂起的上游控制面 pending RPC 收割、上游控制面应用空闲（ping/pong 不刷新）、数据桥关闭原因截断到 123 字节，agent WebSocket 帧/消息 1 MiB 上限、`session.attach_all` 扇出、仅嵌套会话引用的路由、数据桥关闭握手排空、按 agent 过滤事件订阅与共享 detach，以及上游控制连接重连后重新订阅。
 
 ```sh
 cargo test --locked
 cargo build --locked
 ```
 
-在当前这棵树上，`cargo test --locked` 用 rustc 1.99.1 通过了 138 项测试。`--locked` 让构建停在 `Cargo.lock` 上；Cargo 1.83 无法解析这份锁文件。
+在当前这棵树上，`cargo test --locked` 用 rustc 1.99.1 通过了 156 项测试。`--locked` 让构建停在 `Cargo.lock` 上；Cargo 1.83 无法解析这份锁文件。
 
 现场脚本的工作目录必须是仓库根，地址是 `127.0.0.1:7300`，令牌是 `smoke-secret`。它们不属于 `cargo test`。
 
@@ -213,6 +213,7 @@ cargo build --locked
 | --- | --- | --- |
 | [`smoke.py`](smoke.py) | 无令牌和错误令牌为 401；欢迎消息；`session.list` 给出 `local:session:` id；`server.version`；带 `event_scope` `session` 的 `session.attach` | 示例配置，且令牌能列出至少一个会话 |
 | [`smoke_data.py`](smoke_data.py) | 网关票据为 16 字节；数据面 ACCEPT `0x81`；快照和 `HELLO_FROM_GATEWAY` 字节；重用票据为 `0x82 0x01` 且关闭码 1008 | 列出的会话里有聚焦块，并且 `PATH` 上有 `rex`（用 `REX_BIN` 覆盖） |
+| [`smoke_events.py`](smoke_events.py) | 两个 agent 各自只收到自己 attach 的会话的事件；另一个 agent 仍持有该会话时，一个 agent 的 `session.detach` 由网关本地应答；`/status` 含 `events_dropped_scope` / `events_dropped_acl` | 至少两个列出的会话，且能直连 `127.0.0.1:7297` 上的 Rex（脚本用自己的客户端去触发会话事件） |
 | [`smoke_tags.py`](smoke_tags.py) | `session.bootstrap` 报出 `local` 的标签 `perf` / `ci`；无法满足的 `prefer_tags` 会报错；`/status` 含这些标签 | 与示例相同的上游元数据，以及一个活会话 |
 | [`smoke_ttl.py`](smoke_ttl.py) | 回收器清掉未使用票据；超时后的 HELLO 为 `0x82 0x01`；计量回到零 | 用 `REX_GATEWAY_TICKET_TTL_MS=2000` 启动网关，并且 Rex 上存在 `smoke_data.py` 顶部写死的会话和块（此脚本不会自己发现它们） |
 | [`smoke_sessions.py`](smoke_sessions.py) | 用列出的引用做 attach 和数据面 ACCEPT；`--check-gc` 检查 `session.forget`；`--after-ttl` 期望 `session reference expired/forgotten` | 至少一个列出的会话。重启步骤是手工的：用同一个 `REX_GATEWAY_SESSION_STORE_PATH` 停掉再启动网关。脚本还会发送 `session.rename`；`smoke.py` 注明当前 Rex 已不再实现该方法。若 Rex 返回帧级错误，脚本失败 |
@@ -290,7 +291,23 @@ cargo build --locked
 
 `seq` 是每条 agent 连接上响应和事件共用的计数器，在帧真正写出时赋值。agent 的 `id` 由网关原样放回，并不是上游套接字上使用的 id。上游调用使用新的 UUID。因此事件和响应会按写出顺序共用 `seq`。
 
-令牌无权访问的上游事件会被丢掉。转发给每个 agent 的副本只做一次命名空间处理，所以每个 agent 拿到自己的网关票据。广播通道容量是 1024。跟不上的 agent 会跳过缺口。`events_lagged` 加上这个缺口的数量（`RecvError::Lagged(n)` 加上 `n`）。Agent 还会收到一条合成事件，它和别的帧共用同一个 `seq`：
+每台上游只有一条控制连接，所有 agent 共享；Rex 在同一连接上的订阅是叠加的。因此网关按 agent 连接分别记录订阅，上游事件只转发给订阅了它的 agent：
+
+- 带 `event_scope` `session` 的 `session.attach` / `session.bootstrap` 让该 agent 订阅这个会话的事件；`all` 订阅该上游的全部事件。不带 `session_id` 的 `session.bootstrap` 订阅 Rex 选中的那个会话（`view.session_id`）。
+- `session.attach_all` 取 `session` 时覆盖每台成功附着的上游上的所有会话；取 `all` 时覆盖全部事件。
+- 若 agent 在该上游有 `all`，或事件最浅层的 `session_id` 已被 attach（或被 `attach_all` `session` 覆盖），事件就发给它。没有 `session_id` 的事件只发给 `all` 订阅者。
+- 订阅在调用上游之前记下（Rex 可能先于响应发出第一批事件），调用失败或返回错误时回滚。
+- `session.detach` 只移除本 agent 的 attach。只有没有别的 agent 连接还持有该会话时才发到 Rex；否则网关像 Rex 一样自己回 `{}`。关闭 agent 连接会释放它的持有，但不会向上游 detach；多余的上游订阅会被过滤掉。
+
+Rex 在连接关闭时会忘掉该连接的订阅。上游控制连接重连时（探测会在 `probe_interval_ms` 内重新打开它），网关会在触发重连的那次请求之前，把在这条连接上成功过的订阅重放一遍（`all` / `session` 用 `session.attach_all`，再对每个会话发 `session.attach`），并给在该上游有订阅的每个 agent 发：
+
+```json
+{"type":"event","seq":7,"payload":{"gateway":{"notice":"upstream_resubscribed","upstream":"local"}}}
+```
+
+断开期间的事件不会重放；请用 `session.list` / `session.bootstrap` 重新同步。
+
+令牌无权访问的上游事件会被丢掉（`events_dropped_acl`）；agent 没订阅的事件也会被丢掉（`events_dropped_scope`）。转发给每个 agent 的副本只做一次命名空间处理，所以每个 agent 拿到自己的网关票据。广播通道容量是 1024。跟不上的 agent 会跳过缺口。`events_lagged` 加上这个缺口的数量（`RecvError::Lagged(n)` 加上 `n`）。Agent 还会收到一条合成事件，它和别的帧共用同一个 `seq`：
 
 ```json
 {"type":"event","seq":1,"payload":{"gateway":{"notice":"events_lagged","skipped":4}}}
@@ -300,7 +317,7 @@ cargo build --locked
 
 `session.list` 会像其他响应一样改写嵌套的 `session_id` 和 `ticket`。没有以 `session:` 开头的字符串 `session_id` 的条目会被丢掉。
 
-无 `host` 的 `session.attach_all` 会在每台 ACL 允许的上游的共享控制连接上各调一次，并按同样方式合并 `sessions`（加前缀、记录、丢弃不以 `session:` 开头的条目）。payload 另带 `attached_upstreams`（成功的上游 id），部分失败或不可路由时还带 `partial` / `failed_upstreams` / `upstream_errors`。全部失败且至少一台返回 Rex 帧级错误（例如 `event_scope` 不合法）时，原样转发该帧级错误；否则报 `all upstreams failed: …`。带 `host` 时只发给那一台。由于上游控制连接是共享的，这次订阅会作用于所有有权限的 agent 从这些上游收到的事件。
+无 `host` 的 `session.attach_all` 会在每台 ACL 允许的上游的共享控制连接上各调一次，并按同样方式合并 `sessions`（加前缀、记录、丢弃不以 `session:` 开头的条目）。payload 另带 `attached_upstreams`（成功的上游 id），部分失败或不可路由时还带 `partial` / `failed_upstreams` / `upstream_errors`。全部失败且至少一台返回 Rex 帧级错误（例如 `event_scope` 不合法）时，原样转发该帧级错误；否则报 `all upstreams failed: …`。带 `host` 时只发给那一台。订阅只记在发起调用的 agent 名下，按成功附着的上游分别记录。
 
 `session.bootstrap` 成功时网关会加上：
 
@@ -479,7 +496,9 @@ store_path = "rex-gateway-discovered.json"
     "create_failover_exhausted": 0,
     "hostless_failover_exhausted": 0,
     "events_lagged": 0,
-    "events_forwarded": 0
+    "events_forwarded": 0,
+    "events_dropped_acl": 0,
+    "events_dropped_scope": 0
   },
   "discovery": {
     "enabled": false,
@@ -496,7 +515,7 @@ store_path = "rex-gateway-discovered.json"
 
 `state` 为 `Unknown`、`Online`、`Degraded` 或 `Offline`。`source` 为 `Manual`、`Tailnet` 或 `Lan`。`latency_ms` 是上一次探测的延迟；该次探测失败或还没探测过时为 null。`last_error` 是最近的探测或故障转移错误。之后某次探测若收到 `sessions` 数组，会把它清掉。`session_count` 是上一次探测里会话数组的长度，不是 CPU。Rex 探测不采集 CPU。
 
-当前值（计量）：`pending_tickets`、`session_refs`、`session_forgotten`、`active_control_connections`、`active_data_streams`。`tickets_issued`、故障转移计数、`events_lagged` 和 `events_forwarded` 在进程存活期间递增。`tickets_consumed` 在取走时增加，连接失败把票据退回时减少。`tickets_restored` 统计进程存活期间成功退回的次数（退回失败不加）。`tickets_expired` 统计因 TTL 删除的票据，包括退回时发现原来的 TTL 已经走完。`tickets_evicted` 统计因容量丢掉的票据，包括为退回腾位置而丢掉的。`events_lagged` 是被跳过的上游事件数量之和。`events_forwarded` 统计已送达的上游事件，不含 `events_lagged` 通知。若之后的列举或事件再次记录某个 id，`session_forgotten` 会减小。
+当前值（计量）：`pending_tickets`、`session_refs`、`session_forgotten`、`active_control_connections`、`active_data_streams`。`tickets_issued`、故障转移计数、`events_lagged`、`events_forwarded`、`events_dropped_acl` 和 `events_dropped_scope` 在进程存活期间递增。`tickets_consumed` 在取走时增加，连接失败把票据退回时减少。`tickets_restored` 统计进程存活期间成功退回的次数（退回失败不加）。`tickets_expired` 统计因 TTL 删除的票据，包括退回时发现原来的 TTL 已经走完。`tickets_evicted` 统计因容量丢掉的票据，包括为退回腾位置而丢掉的。`events_lagged` 是被跳过的上游事件数量之和。`events_forwarded` 统计已送达的上游事件，不含 `events_lagged` 和 `upstream_resubscribed` 通知。`events_dropped_acl` 和 `events_dropped_scope` 按 agent 连接计数：因令牌无权访问该上游、或 agent 没有订阅而没有发出的上游事件。若之后的列举或事件再次记录某个 id，`session_forgotten` 会减小。
 
 `discovery.mode` 为 `command`、`file` 或 `none`。对应事件还没发生时，年龄为 null。`last_applied` 表示最近一次成功刷新是否用快照更新了池。未启用发现时这个对象仍在，`enabled` 为 false，`mode` 为 `"none"`。
 

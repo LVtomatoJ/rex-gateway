@@ -17,7 +17,7 @@ It is a single Rust binary in this repository (`rex-gateway`). It does not embed
 ## What it does
 
 - Authenticates `GET /api/control`, `GET /api/data`, and `GET /status` with a bearer token before any WebSocket upgrade.
-- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **34**.
+- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **35**.
 - Fans `session.list` out to every allowed upstream and prefixes session ids with the upstream id.
 - Routes a namespaced session call back to that upstream, and routes a hostless `session.create` or other hostless call with the rules in [Routing and failover](#routing-and-failover).
 - Rewrites nested `ticket` strings to single-use gateway tickets and bridges `rex.data.terminal.v1` byte-for-byte.
@@ -161,7 +161,7 @@ Welcome shape (ids are new on every connection):
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 34,
+  "api_server_revision": 35,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -198,14 +198,14 @@ Short version. Exact order, errors, and counters are below.
 
 ## Development
 
-`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes (including forgotten-session binary REJECT, Offline attach refuse, and finishing the agent sink after an unexpected upstream drop), event-lag notices, control-response idle refresh (including in-flight overflow replies), host-pin offline errors, the control-plane in-flight bound, panic-safe in-flight slot release, hung upstream-control pending RPC reap, upstream-control application-idle (ping/pong do not refresh), data-bridge close-reason truncation to 123 bytes, agent WebSocket frame/message caps at 1 MiB, `session.attach_all` fan-out, nested-only session routing, and the data-bridge close-handshake drain.
+`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes (including forgotten-session binary REJECT, Offline attach refuse, and finishing the agent sink after an unexpected upstream drop), event-lag notices, control-response idle refresh (including in-flight overflow replies), host-pin offline errors, the control-plane in-flight bound, panic-safe in-flight slot release, hung upstream-control pending RPC reap, upstream-control application-idle (ping/pong do not refresh), data-bridge close-reason truncation to 123 bytes, agent WebSocket frame/message caps at 1 MiB, `session.attach_all` fan-out, nested-only session routing, the data-bridge close-handshake drain, per-agent event subscription filtering and shared detach, and re-subscribing an upstream control socket after reconnect.
 
 ```sh
 cargo test --locked
 cargo build --locked
 ```
 
-On this tree, `cargo test --locked` passed 138 tests with rustc 1.99.1. `--locked` keeps the build on `Cargo.lock`; Cargo 1.83 cannot parse it.
+On this tree, `cargo test --locked` passed 156 tests with rustc 1.99.1. `--locked` keeps the build on `Cargo.lock`; Cargo 1.83 cannot parse it.
 
 The live scripts assume the repository root as the working directory, `127.0.0.1:7300`, and token `smoke-secret`. They are not part of `cargo test`.
 
@@ -213,6 +213,7 @@ The live scripts assume the repository root as the working directory, `127.0.0.1
 | --- | --- | --- |
 | [`smoke.py`](smoke.py) | 401 without a token and with the wrong token; welcome; a `local:session:` id from `session.list`; `server.version`; `session.attach` with `event_scope` `session` | Example config, and at least one session on an upstream the token can list |
 | [`smoke_data.py`](smoke_data.py) | Gateway ticket is 16 bytes; data ACCEPT `0x81`; snapshot and `HELLO_FROM_GATEWAY` bytes; reused ticket is `0x82 0x01` and close 1008 | A listed session with a focused block, and `rex` on `PATH` (override with `REX_BIN`) |
+| [`smoke_events.py`](smoke_events.py) | Two agents each get only events for the session they attached; one agent's `session.detach` is answered locally while the other still holds the session; `/status` has `events_dropped_scope` / `events_dropped_acl` | At least two listed sessions, and Rex reachable directly at `127.0.0.1:7297` (the script pokes sessions with its own client) |
 | [`smoke_tags.py`](smoke_tags.py) | `session.bootstrap` reports `local` tags `perf`/`ci`; unsatisfiable `prefer_tags` errors; `/status` shows those tags | Same example upstream metadata, and a live session |
 | [`smoke_ttl.py`](smoke_ttl.py) | Reaper clears an unused ticket; late HELLO is `0x82 0x01`; gauges return to zero | Gateway started with `REX_GATEWAY_TICKET_TTL_MS=2000`, plus the hardcoded session and block at the top of `smoke_data.py` (this script does not discover them) |
 | [`smoke_sessions.py`](smoke_sessions.py) | Attach and data ACCEPT using a listed reference; `--check-gc` checks `session.forget`; `--after-ttl` expects `session reference expired/forgotten` | A listed session. The restart step is manual: stop and start the gateway on the same `REX_GATEWAY_SESSION_STORE_PATH`. The script also sends `session.rename`, which `smoke.py` notes current Rex no longer implements. A frame error there fails the script |
@@ -290,7 +291,23 @@ Gateway failures use `payload.error` as a string. Rex frame errors (`{"code","me
 
 `seq` is one counter per agent connection for responses and events, assigned when the frame is written. The agent `id` is echoed by the gateway and is not the id used on the upstream socket. Upstream calls use a new UUID. Events and responses can therefore interleave in `seq` order.
 
-Events whose upstream the token cannot access are dropped. Each forwarded copy is namespaced once for that agent, so each agent gets its own gateway tickets. The broadcast channel holds 1024 events. A slow agent skips the gap. `events_lagged` adds that gap's count (`RecvError::Lagged(n)` adds `n`). The agent also gets one synthetic event, which shares the same `seq` counter:
+Each upstream has one control connection shared by every agent, and Rex subscriptions on a connection are additive. The gateway therefore tracks subscriptions per agent connection and forwards an upstream event only to agents that asked for it:
+
+- `session.attach` / `session.bootstrap` with `event_scope` `session` subscribes that agent to that session's events; `all` subscribes it to every event from that upstream. A session-less `session.bootstrap` subscribes to the session Rex picked (`view.session_id`).
+- `session.attach_all` with `session` covers every session on each upstream it attached; with `all`, every event.
+- An event goes to an agent when it has `all` on that upstream, or the event's shallowest `session_id` is attached (or covered by `attach_all` `session`). Events without a `session_id` only go to `all` subscribers.
+- The subscription is recorded before the upstream call (Rex can send the first events ahead of its response) and rolled back if the call fails or returns an error.
+- `session.detach` removes only this agent's attach. It reaches Rex only when no other agent connection still holds that session; otherwise the gateway answers `{}` itself, as Rex does. Closing an agent connection releases its holds without detaching upstream; leftover upstream subscriptions are filtered out.
+
+Rex forgets a socket's subscriptions when it closes. When an upstream control socket reconnects (the probe reopens it within `probe_interval_ms`), the gateway replays the subscriptions that succeeded on it (`session.attach_all` for `all` / `session`, then `session.attach` per session) before the request that reopened it, and every agent subscribed on that upstream gets:
+
+```json
+{"type":"event","seq":7,"payload":{"gateway":{"notice":"upstream_resubscribed","upstream":"local"}}}
+```
+
+Events from the gap are not replayed; resync with `session.list` / `session.bootstrap`.
+
+Events whose upstream the token cannot access are dropped (`events_dropped_acl`); events the agent did not subscribe to are dropped (`events_dropped_scope`). Each forwarded copy is namespaced once for that agent, so each agent gets its own gateway tickets. The broadcast channel holds 1024 events. A slow agent skips the gap. `events_lagged` adds that gap's count (`RecvError::Lagged(n)` adds `n`). The agent also gets one synthetic event, which shares the same `seq` counter:
 
 ```json
 {"type":"event","seq":1,"payload":{"gateway":{"notice":"events_lagged","skipped":4}}}
@@ -300,7 +317,7 @@ Missed upstream events are not replayed. `events_forwarded` counts successful se
 
 `session.list` rewrites nested `session_id` and `ticket` fields the same way other responses do. Items without a string `session_id` that starts with `session:` are dropped.
 
-Hostless `session.attach_all` fans out to every ACL-allowed upstream on that upstream's shared control connection and merges `sessions` the same way (namespaced, recorded, non-`session:` items dropped). The payload also carries `attached_upstreams` (ids that succeeded) and, when some failed or were not routable, `partial` / `failed_upstreams` / `upstream_errors`. If every upstream fails and at least one returned a Rex frame error (for example a bad `event_scope`), that frame error is forwarded unchanged; otherwise the error is `all upstreams failed: …`. With `host` it goes to that one upstream only. Because upstream control connections are shared, the subscription applies to events every permitted agent receives from those upstreams.
+Hostless `session.attach_all` fans out to every ACL-allowed upstream on that upstream's shared control connection and merges `sessions` the same way (namespaced, recorded, non-`session:` items dropped). The payload also carries `attached_upstreams` (ids that succeeded) and, when some failed or were not routable, `partial` / `failed_upstreams` / `upstream_errors`. If every upstream fails and at least one returned a Rex frame error (for example a bad `event_scope`), that frame error is forwarded unchanged; otherwise the error is `all upstreams failed: …`. With `host` it goes to that one upstream only. The subscription is recorded for the calling agent only, per upstream that attached.
 
 On `session.bootstrap` success the gateway adds:
 
@@ -479,7 +496,9 @@ Illustrative shape (values depend on the running process):
     "create_failover_exhausted": 0,
     "hostless_failover_exhausted": 0,
     "events_lagged": 0,
-    "events_forwarded": 0
+    "events_forwarded": 0,
+    "events_dropped_acl": 0,
+    "events_dropped_scope": 0
   },
   "discovery": {
     "enabled": false,
@@ -496,7 +515,7 @@ Illustrative shape (values depend on the running process):
 
 `state` is `Unknown`, `Online`, `Degraded`, or `Offline`. `source` is `Manual`, `Tailnet`, or `Lan`. `latency_ms` is the last probe latency, or null when that probe failed or none has run. `last_error` is the latest probe or failover error. A later probe that receives a `sessions` array clears it. `session_count` is the last probe's session array length, not a CPU reading. Rex probes do not report CPU.
 
-Gauges, current values: `pending_tickets`, `session_refs`, `session_forgotten`, `active_control_connections`, `active_data_streams`. `tickets_issued`, the failover counters, `events_lagged`, and `events_forwarded` increase for the life of the process. `tickets_consumed` increases on take and decreases when a connect-path failure restores the ticket. `tickets_restored` counts successful restores for the life of the process (failed restores do not bump it). `tickets_expired` counts TTL removals, including a restore that finds the original TTL already elapsed. `tickets_evicted` counts capacity drops, including one done to make room for a restore. `events_lagged` is the sum of skipped upstream events. `events_forwarded` counts delivered upstream events and not the `events_lagged` notice. `session_forgotten` shrinks again if a later list or event records that id.
+Gauges, current values: `pending_tickets`, `session_refs`, `session_forgotten`, `active_control_connections`, `active_data_streams`. `tickets_issued`, the failover counters, `events_lagged`, `events_forwarded`, `events_dropped_acl`, and `events_dropped_scope` increase for the life of the process. `tickets_consumed` increases on take and decreases when a connect-path failure restores the ticket. `tickets_restored` counts successful restores for the life of the process (failed restores do not bump it). `tickets_expired` counts TTL removals, including a restore that finds the original TTL already elapsed. `tickets_evicted` counts capacity drops, including one done to make room for a restore. `events_lagged` is the sum of skipped upstream events. `events_forwarded` counts delivered upstream events and not the `events_lagged` or `upstream_resubscribed` notices. `events_dropped_acl` and `events_dropped_scope` count, per agent connection, upstream events not sent because the token cannot access that upstream or the agent did not subscribe to them. `session_forgotten` shrinks again if a later list or event records that id.
 
 `discovery.mode` is `command`, `file`, or `none`. Ages are null until that event has happened. `last_applied` is whether the last successful refresh changed the pool from a snapshot. Disabled discovery still returns the object with `enabled: false` and `mode: "none"`.
 

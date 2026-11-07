@@ -351,6 +351,7 @@ async fn start_gateway_with_event_cap(upstreams: &[(&str, &str)], call_timeout: 
         control_limiter: OwnerLimiter::new(),
         events,
         discovery: crate::discovery::DiscoveryHealth::disabled(),
+        holds: crate::subscriptions::HoldRegistry::default(),
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -392,7 +393,7 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let welcome: Value = serde_json::from_str(&welcome).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["api_server_revision"], 34);
+    assert_eq!(welcome["api_server_revision"], 35);
     assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
@@ -731,6 +732,7 @@ async fn events_are_namespaced_forwarded_and_do_not_break_rpc() {
     let h=start_gateway(&[("good",&good)],tmo(500),Duration::from_secs(3600),tmo(300)).await;
     wait_state(&h.pool, "good", UpstreamState::Online).await;
     let mut socket=control_agent(h.addr).await;
+    rpc(&mut socket, "session.attach", json!({"session_id":"good:session:e","event_scope":"session"})).await;
     let sender=h.state.events.clone();
     let before_tickets = h.state.tickets.pending();
     sender.send(UpstreamEvent { upstream:"good".into(), event:json!({"type":"event","seq":99,"payload":{"session_id":"session:e","view":{"session_id":"session:v","ticket":"up-ticket"}}}) }).unwrap();
@@ -1694,6 +1696,7 @@ async fn slow_rpc_does_not_stall_events_or_concurrent_rpc() {
     ).await;
     wait_state(&h.pool, "local", UpstreamState::Online).await;
     let mut socket = control_agent(h.addr).await;
+    rpc(&mut socket, "session.attach", json!({"session_id":"local:session:live","event_scope":"session"})).await;
 
     socket.send(tungstenite::Message::Text(
         json!({"type":"request","id":"slow","method":"server.slow","payload":{}}).to_string(),
@@ -1918,7 +1921,9 @@ async fn forwarded_events_refresh_control_application_idle() {
     let h = start_gateway_with_keepalive(
         &[("good", &good)], tmo(300), Duration::from_secs(3600), tmo(300), tmo(30), tmo(120),
     ).await;
+    wait_state(&h.pool, "good", UpstreamState::Online).await;
     let mut socket = control_agent(h.addr).await;
+    rpc(&mut socket, "session.attach", json!({"session_id":"good:session:alive","event_scope":"session"})).await;
     let sender = h.state.events.clone();
 
     // Keep delivering events across several idle windows; connection must stay open.
@@ -2248,4 +2253,85 @@ async fn hostless_nested_session_reference_routes_to_its_owner() {
     h.state.sessions.forget("zzz:session:gone").unwrap();
     let reply = rpc(&mut socket, "target.resolve", json!({"view":{"session_id":"zzz:session:gone"}})).await;
     assert!(reply["error"].as_str().unwrap_or("").contains("forgotten"), "{reply}");
+}
+
+/// Next text frame, answering pings; `None` when nothing arrives within `wait`.
+async fn next_text(socket: &mut Agent, wait: Duration) -> Option<Value> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, socket.next()).await {
+            Ok(Some(Ok(tungstenite::Message::Text(text)))) => return Some(serde_json::from_str(&text).unwrap()),
+            Ok(Some(Ok(tungstenite::Message::Ping(bytes)))) => { let _ = socket.send(tungstenite::Message::Pong(bytes)).await; }
+            Ok(Some(Ok(_))) => {}
+            _ => return None,
+        }
+    }
+}
+
+#[tokio::test]
+async fn events_follow_each_agents_own_subscriptions() {
+    let good = spawn_fake_rex(vec![], false).await;
+    let h = start_gateway(&[("good", &good)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    wait_state(&h.pool, "good", UpstreamState::Online).await;
+    let mut x = control_agent(h.addr).await;
+    let mut y = control_agent(h.addr).await;
+    let mut z = control_agent_with_auth(h.addr, "Bearer only-online").await;
+    rpc(&mut x, "session.attach", json!({"session_id":"good:session:a","event_scope":"session"})).await;
+    rpc(&mut y, "session.attach", json!({"session_id":"good:session:a","event_scope":"session"})).await;
+    rpc(&mut y, "session.attach", json!({"session_id":"good:session:b","event_scope":"session"})).await;
+    let send = |session: &str| h.state.events.send(UpstreamEvent {
+        upstream: "good".into(),
+        event: json!({"type":"event","payload":{"type":"session_event","payload":{"session_id":session,"event":{"type":"tick"}}}}),
+    }).unwrap();
+    send("session:b");
+    send("session:a");
+    let first = next_text(&mut x, tmo(500)).await.expect("x gets a");
+    assert_eq!(first["payload"]["payload"]["session_id"], "good:session:a", "x never sees b: {first}");
+    assert_eq!(next_text(&mut y, tmo(500)).await.unwrap()["payload"]["payload"]["session_id"], "good:session:b");
+    assert_eq!(next_text(&mut y, tmo(500)).await.unwrap()["payload"]["payload"]["session_id"], "good:session:a");
+    assert!(next_text(&mut z, tmo(100)).await.is_none(), "token without access to good gets nothing");
+    let counters = h.state.metrics.snapshot();
+    assert_eq!(counters.events_dropped_scope, 1, "b dropped for x");
+    assert_eq!(counters.events_dropped_acl, 2, "both dropped for z");
+
+    // y still holds a, so x's detach is answered locally and Rex keeps sending a.
+    let local = rpc(&mut x, "session.detach", json!({"session_id":"good:session:a"})).await;
+    assert_eq!(local, json!({}), "answered by the gateway: {local}");
+    send("session:a");
+    assert_eq!(next_text(&mut y, tmo(500)).await.unwrap()["payload"]["payload"]["session_id"], "good:session:a");
+    assert!(next_text(&mut x, tmo(100)).await.is_none(), "x detached a");
+    // Last holder: the detach reaches the (fake) upstream, which answers {"ok":true}.
+    let forwarded = rpc(&mut y, "session.detach", json!({"session_id":"good:session:a"})).await;
+    assert_eq!(forwarded, json!({"ok":true}), "{forwarded}");
+    assert_eq!(h.state.holds.holders("good", "session:a"), 0);
+
+    // attach_all with scope "session" covers every session; failed attaches roll back.
+    rpc(&mut x, "session.attach_all", json!({"event_scope":"session"})).await;
+    send("session:zzz");
+    assert_eq!(next_text(&mut x, tmo(500)).await.unwrap()["payload"]["payload"]["session_id"], "good:session:zzz");
+    drop(y);
+    tokio::time::sleep(tmo(50)).await;
+    assert_eq!(h.state.holds.holders("good", "session:b"), 0, "closed agent releases its holds");
+}
+
+#[tokio::test]
+async fn failed_attach_does_not_subscribe_and_resubscribe_notice_reaches_subscribers() {
+    let err = json!({"code":"session_not_found","message":"session not found","status":404});
+    let bad = spawn_fake_rex_frame_error("session.attach", err).await;
+    let h = start_gateway(&[("bad", &bad)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    wait_state(&h.pool, "bad", UpstreamState::Online).await;
+    let mut x = control_agent(h.addr).await;
+    let mut y = control_agent(h.addr).await;
+    let frame = rpc_frame(&mut x, "session.attach", json!({"session_id":"bad:session:a","event_scope":"session"})).await;
+    assert!(frame["error"].is_object(), "{frame}");
+    assert_eq!(h.state.holds.holders("bad", "session:a"), 0, "rolled back");
+    h.state.events.send(UpstreamEvent { upstream: "bad".into(), event: json!({"type":"event","payload":{"session_id":"session:a"}}) }).unwrap();
+    assert!(next_text(&mut x, tmo(100)).await.is_none(), "failed attach must not subscribe");
+    // y subscribes to everything on "bad" (host-pinned attach_all; this fake answers ok).
+    rpc(&mut y, "session.attach_all", json!({"event_scope":"all","host":"bad"})).await;
+    h.state.events.send(UpstreamEvent { upstream: "bad".into(), event: json!({"type":crate::control_client::RESUBSCRIBED_EVENT_TYPE}) }).unwrap();
+    let notice = next_text(&mut y, tmo(500)).await.expect("notice");
+    assert_eq!(notice["payload"]["gateway"], json!({"notice":"upstream_resubscribed","upstream":"bad"}));
+    assert!(next_text(&mut x, tmo(100)).await.is_none(), "unsubscribed agent gets no resubscribe notice");
 }

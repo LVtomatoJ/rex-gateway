@@ -29,6 +29,10 @@ pub struct Metrics {
     pub events_lagged: AtomicU64,
     /// Upstream events successfully forwarded onto an agent control socket.
     pub events_forwarded: AtomicU64,
+    /// Upstream events not sent to an agent because its token cannot access that upstream.
+    pub events_dropped_acl: AtomicU64,
+    /// Upstream events not sent to an agent because it did not subscribe to them.
+    pub events_dropped_scope: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -46,6 +50,8 @@ pub struct MetricsSnapshot {
     pub hostless_failover_exhausted: u64,
     pub events_lagged: u64,
     pub events_forwarded: u64,
+    pub events_dropped_acl: u64,
+    pub events_dropped_scope: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -72,6 +78,8 @@ impl Metrics {
             hostless_failover_exhausted: self.hostless_failover_exhausted.load(Relaxed),
             events_lagged: self.events_lagged.load(Relaxed),
             events_forwarded: self.events_forwarded.load(Relaxed),
+            events_dropped_acl: self.events_dropped_acl.load(Relaxed),
+            events_dropped_scope: self.events_dropped_scope.load(Relaxed),
         }
     }
 

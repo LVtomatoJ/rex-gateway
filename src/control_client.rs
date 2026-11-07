@@ -1,4 +1,4 @@
-use std::{collections::HashMap, sync::{Arc, Mutex}, time::Duration};
+use std::{collections::{BTreeSet, HashMap}, sync::{Arc, Mutex}, time::Duration};
 use tokio::time::Instant;
 use anyhow::{anyhow, bail, Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -46,6 +46,86 @@ impl UpstreamReply {
 
 #[derive(Clone, Debug)]
 pub struct UpstreamEvent { pub upstream: String, pub event: Value }
+
+/// Synthetic broadcast frame type the actor emits after it re-subscribed a reconnected
+/// upstream control socket (events in the gap were not delivered).
+pub const RESUBSCRIBED_EVENT_TYPE: &str = "gateway.upstream_resubscribed";
+
+/// Effect a successful control RPC has on the shared upstream connection's event
+/// subscription. Rex subscriptions are additive per connection: `session.attach` /
+/// `session.bootstrap` add one session (or every event for `event_scope` `all`),
+/// `session.attach_all` adds every session (`session`) or every event (`all`), and
+/// `session.detach` removes only an explicit per-session attach.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SubscriptionEffect {
+    Attach { session: String, all: bool },
+    /// `session.bootstrap` without `session_id`: Rex picks the session (`view.session_id`).
+    BootstrapDefault { all: bool },
+    AttachAll { all: bool },
+    Detach { session: String },
+}
+
+impl SubscriptionEffect {
+    /// Classifies a request as Rex would see it (session ids already de-namespaced).
+    pub fn classify(method: &str, payload: &Value) -> Option<Self> {
+        let scope_all = || match payload.get("event_scope").and_then(Value::as_str) {
+            Some("all") => Some(true),
+            Some("session") => Some(false),
+            _ => None,
+        };
+        let session = || payload.get("session_id").and_then(Value::as_str).map(str::to_owned);
+        match method {
+            "session.attach" => Some(Self::Attach { session: session()?, all: scope_all()? }),
+            "session.bootstrap" => Some(match session() {
+                Some(session) => Self::Attach { session, all: scope_all()? },
+                None => Self::BootstrapDefault { all: scope_all()? },
+            }),
+            "session.attach_all" => Some(Self::AttachAll { all: scope_all()? }),
+            "session.detach" => Some(Self::Detach { session: session()? }),
+            _ => None,
+        }
+    }
+
+    /// Final effect once the successful response is known (fills the session Rex picked for
+    /// a session-less bootstrap from `view.session_id`).
+    pub fn resolve(&self, response: &Value) -> Option<Self> {
+        match self {
+            Self::BootstrapDefault { all } => match response.pointer("/view/session_id").and_then(Value::as_str) {
+                Some(session) => Some(Self::Attach { session: session.to_owned(), all: *all }),
+                None if *all => Some(Self::AttachAll { all: true }),
+                None => None,
+            },
+            other => Some(other.clone()),
+        }
+    }
+}
+
+/// Union of event subscriptions that succeeded on one upstream control socket. Replayed after
+/// a reconnect because Rex forgets them when the socket closes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Subscriptions { pub all: bool, pub all_sessions: bool, pub sessions: BTreeSet<String> }
+
+impl Subscriptions {
+    pub fn is_empty(&self) -> bool { !self.all && !self.all_sessions && self.sessions.is_empty() }
+    pub fn apply(&mut self, effect: &SubscriptionEffect) {
+        match effect {
+            SubscriptionEffect::Attach { session, all } => { self.sessions.insert(session.clone()); self.all |= *all; }
+            SubscriptionEffect::BootstrapDefault { all } => { self.all |= *all; }
+            SubscriptionEffect::AttachAll { all } => { if *all { self.all = true } else { self.all_sessions = true } }
+            SubscriptionEffect::Detach { session } => { self.sessions.remove(session); }
+        }
+    }
+    /// Requests that rebuild this subscription set on a fresh socket.
+    pub fn replay(&self) -> Vec<(&'static str, Value)> {
+        let mut calls = Vec::new();
+        if self.all { calls.push(("session.attach_all", json!({"event_scope":"all"}))); }
+        else if self.all_sessions { calls.push(("session.attach_all", json!({"event_scope":"session"}))); }
+        for session in &self.sessions {
+            calls.push(("session.attach", json!({"session_id":session,"event_scope":"session"})));
+        }
+        calls
+    }
+}
 
 type Socket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 struct Command { id: String, method: String, payload: Value, reply: oneshot::Sender<Result<UpstreamReply>> }
@@ -96,6 +176,9 @@ impl ControlClient {
         let mut pings=tokio::time::interval_at(Instant::now()+options.ping_interval, options.ping_interval); pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut idle=tokio::time::interval(std::cmp::max(options.idle_timeout / 5, Duration::from_millis(1))); idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut last_activity=Instant::now();
+        // Successful subscriptions on this upstream, replayed after every reconnect.
+        let mut subscriptions=Subscriptions::default();
+        let mut ever_connected=false;
         loop {
             tokio::select! {
                 _=pings.tick(), if socket.is_some()=> {
@@ -126,7 +209,25 @@ impl ControlClient {
                             Err(_)=>Err(anyhow!("upstream connect timed out after {} ms",call_timeout.as_millis())),
                         };
                         match opened {
-                            Ok(opened)=>{ last_activity=Instant::now(); socket=Some(opened); failures=0; retry_at=None; last_error.clear(); }
+                            Ok(mut opened)=>{
+                                last_activity=Instant::now(); failures=0; retry_at=None; last_error.clear();
+                                if ever_connected && !subscriptions.is_empty() {
+                                    // Rex dropped this socket's subscriptions with the old socket.
+                                    let mut replayed=true;
+                                    for (method,payload) in subscriptions.replay() {
+                                        let frame=json!({"type":"request","id":format!("resubscribe-{}",uuid::Uuid::new_v4()),"method":method,"payload":payload}).to_string();
+                                        let sent=tokio::time::timeout(call_timeout,opened.send(Message::Text(frame))).await;
+                                        if !matches!(sent,Ok(Ok(()))) { replayed=false; break; }
+                                    }
+                                    if replayed {
+                                        let _=events.send(UpstreamEvent { upstream:upstream.clone(), event:json!({"type":RESUBSCRIBED_EVENT_TYPE}) });
+                                    } else {
+                                        tracing::warn!(upstream=%upstream,"re-subscribe after reconnect failed");
+                                    }
+                                }
+                                ever_connected=true;
+                                socket=Some(opened);
+                            }
                             Err(e)=>{
                                 failures=failures.saturating_add(1); retry_at=Some(Instant::now()+backoff_delay(failures)); last_error=format!("{e:#}");
                                 let _=cmd.reply.send(Err(e)); continue;
@@ -137,7 +238,8 @@ impl ControlClient {
                     // Calls that timed out on the caller side must not accumulate forever.
                     reap_pending(&mut pending, call_timeout);
                     let id=cmd.id.clone();
-                    pending.insert(cmd.id, PendingReply { inserted: Instant::now(), reply: cmd.reply });
+                    let effect=SubscriptionEffect::classify(&cmd.method,&cmd.payload);
+                    pending.insert(cmd.id, PendingReply { inserted: Instant::now(), reply: cmd.reply, effect });
                     let sent=match tokio::time::timeout(call_timeout,socket.as_mut().unwrap().send(Message::Text(frame))).await {
                         Ok(result)=>result.map_err(anyhow::Error::from),
                         Err(_)=>Err(anyhow!("upstream send timed out")),
@@ -160,6 +262,9 @@ impl ControlClient {
                                     if let Some(p)=message["id"].as_str().and_then(|id|pending.remove(id)) {
                                         let error = message.get("error").cloned().filter(|e| !e.is_null());
                                         let payload = message.get("payload").cloned().unwrap_or(Value::Null);
+                                        if let Some(effect)=p.effect.as_ref().filter(|_| error.is_none() && payload.get("error").is_none()).and_then(|e| e.resolve(&payload)) {
+                                            subscriptions.apply(&effect);
+                                        }
                                         let _=p.reply.send(Ok(UpstreamReply { payload, error }));
                                     }
                                 }
@@ -185,6 +290,7 @@ impl ControlClient {
 struct PendingReply {
     inserted: Instant,
     reply: oneshot::Sender<Result<UpstreamReply>>,
+    effect: Option<SubscriptionEffect>,
 }
 
 /// Drop slots whose caller already timed out, and fail any still-open slot older than
@@ -414,11 +520,98 @@ mod tests {
         let (tx_open, _rx_open) = oneshot::channel::<Result<UpstreamReply>>();
         let old = Instant::now() - Duration::from_secs(10);
         let mut pending = HashMap::from([
-            ("closed".into(), PendingReply { inserted: Instant::now(), reply: tx_closed }),
-            ("aged".into(), PendingReply { inserted: old, reply: tx_open }),
+            ("closed".into(), PendingReply { inserted: Instant::now(), reply: tx_closed, effect: None }),
+            ("aged".into(), PendingReply { inserted: old, reply: tx_open, effect: None }),
         ]);
         reap_pending(&mut pending, Duration::from_secs(1));
         assert!(pending.is_empty(), "closed and aged entries must be removed");
+    }
+
+    #[test]
+    fn classifies_and_replays_subscriptions() {
+        let c = SubscriptionEffect::classify;
+        assert_eq!(c("session.attach", &json!({"session_id":"session:a","event_scope":"session"})), Some(SubscriptionEffect::Attach { session: "session:a".into(), all: false }));
+        assert_eq!(c("session.bootstrap", &json!({"session_id":"session:a","event_scope":"all"})), Some(SubscriptionEffect::Attach { session: "session:a".into(), all: true }));
+        assert_eq!(c("session.bootstrap", &json!({"event_scope":"session"})), Some(SubscriptionEffect::BootstrapDefault { all: false }));
+        assert_eq!(c("session.attach", &json!({"session_id":"session:a"})), None, "no event_scope: Rex rejects, nothing to track");
+        assert_eq!(c("session.attach_all", &json!({"event_scope":"bogus"})), None);
+        assert_eq!(c("session.detach", &json!({"session_id":"session:a"})), Some(SubscriptionEffect::Detach { session: "session:a".into() }));
+        assert_eq!(c("session.list", &json!({})), None);
+        assert_eq!(SubscriptionEffect::BootstrapDefault { all: false }.resolve(&json!({"view":{"session_id":"session:p"}})), Some(SubscriptionEffect::Attach { session: "session:p".into(), all: false }));
+        let mut subs = Subscriptions::default();
+        assert!(subs.is_empty() && subs.replay().is_empty());
+        subs.apply(&SubscriptionEffect::Attach { session: "session:a".into(), all: false });
+        subs.apply(&SubscriptionEffect::Attach { session: "session:b".into(), all: false });
+        subs.apply(&SubscriptionEffect::Detach { session: "session:b".into() });
+        subs.apply(&SubscriptionEffect::AttachAll { all: false });
+        assert_eq!(subs.replay(), vec![
+            ("session.attach_all", json!({"event_scope":"session"})),
+            ("session.attach", json!({"session_id":"session:a","event_scope":"session"})),
+        ]);
+        subs.apply(&SubscriptionEffect::AttachAll { all: true });
+        assert_eq!(subs.replay()[0], ("session.attach_all", json!({"event_scope":"all"})));
+    }
+
+    /// Every connection reports its requests; `test.drop` closes the socket without answering
+    /// and attaching `session:bad` gets a Rex frame error.
+    async fn mock_upstream_recording(seen: tokio::sync::mpsc::UnboundedSender<(usize, String, Value)>) -> String {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr=listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut connection=0usize;
+            loop {
+                let Ok((stream,_))=listener.accept().await else { return };
+                connection+=1;
+                let seen=seen.clone();
+                let conn=connection;
+                tokio::spawn(async move {
+                    let mut socket=tokio_tungstenite::accept_hdr_async(stream, |_: &tokio_tungstenite::tungstenite::handshake::server::Request, mut response: tokio_tungstenite::tungstenite::handshake::server::Response| { response.headers_mut().insert("sec-websocket-protocol", SUBPROTOCOL.parse().unwrap()); Ok(response) }).await.unwrap();
+                    while let Some(Ok(Message::Text(text)))=socket.next().await {
+                        let message:Value=serde_json::from_str(&text).unwrap();
+                        match message["type"].as_str() {
+                            Some("hello")=>{ socket.send(Message::Text(json!({"type":"welcome"}).to_string())).await.unwrap(); }
+                            Some("request")=>{
+                                let method=message["method"].as_str().unwrap().to_owned();
+                                let _=seen.send((conn, method.clone(), message["payload"].clone()));
+                                if method=="test.drop" { return; }
+                                let reply=if message["payload"]["session_id"]=="session:bad" {
+                                    json!({"type":"response","id":message["id"],"error":{"code":"session_not_found","message":"nope","status":404}})
+                                } else {
+                                    json!({"type":"response","id":message["id"],"payload":{}})
+                                };
+                                socket.send(Message::Text(reply.to_string())).await.unwrap();
+                            }
+                            _=>{}
+                        }
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn replays_successful_subscriptions_after_reconnect_and_announces_it() {
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let url = mock_upstream_recording(seen_tx).await;
+        let (events, mut events_rx) = broadcast::channel(16);
+        let options = Options { call_timeout: Duration::from_millis(500), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120) };
+        let client = ControlClient::new("up".into(), url, options, events);
+        client.call("session.attach", json!({"session_id":"session:a","event_scope":"session"})).await.unwrap();
+        let rejected = client.call("session.attach", json!({"session_id":"session:bad","event_scope":"session"})).await.unwrap();
+        assert!(rejected.is_frame_error());
+        assert!(client.call("test.drop", json!({})).await.is_err(), "socket closed without reply");
+        client.call("server.version", json!({})).await.unwrap();
+        let mut second = Vec::new();
+        while let Ok(Some((conn, method, payload))) = tokio::time::timeout(Duration::from_millis(200), seen.recv()).await {
+            if conn == 2 { second.push((method, payload)); }
+        }
+        assert_eq!(second, vec![
+            ("session.attach".to_owned(), json!({"session_id":"session:a","event_scope":"session"})),
+            ("server.version".to_owned(), json!({})),
+        ], "only the successful attach is replayed, before the new call");
+        let notice = events_rx.try_recv().expect("resubscribe notice");
+        assert_eq!((notice.upstream.as_str(), &notice.event), ("up", &json!({"type":RESUBSCRIBED_EVENT_TYPE})));
     }
 }
 

@@ -23,7 +23,8 @@ use tokio_tungstenite::{
 use crate::{
     auth::{self, Authenticator},
     pool::{UpstreamState, TagPreferences},
-    control_client::{ClientMap, UpstreamEvent, UpstreamReply},
+    control_client::{ClientMap, SubscriptionEffect, UpstreamEvent, UpstreamReply, RESUBSCRIBED_EVENT_TYPE},
+    subscriptions::{AgentSubscriptions, HoldRegistry},
     data::{decode_hello, TakenTicket, TicketMap},
     discovery::DiscoveryHealth,
     metrics::{Gauge, Metrics, OwnerLimiter},
@@ -76,6 +77,8 @@ struct AppState {
     options: Options,
     events: broadcast::Sender<UpstreamEvent>,
     discovery: DiscoveryHealth,
+    /// Explicit per-session attaches held by agent connections (gates upstream detach).
+    holds: HoldRegistry,
 }
 
 /// Tunables of the inbound server.
@@ -104,7 +107,7 @@ pub async fn serve(
     events: broadcast::Sender<UpstreamEvent>,
     discovery: DiscoveryHealth,
 ) -> Result<()> {
-    let state = AppState { pool, clients, auth, tickets, sessions, metrics, data_limiter: OwnerLimiter::new(), control_limiter: OwnerLimiter::new(), options, events, discovery };
+    let state = AppState { pool, clients, auth, tickets, sessions, metrics, data_limiter: OwnerLimiter::new(), control_limiter: OwnerLimiter::new(), options, events, discovery, holds: HoldRegistry::default() };
     let router = router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "gateway listening");
@@ -180,10 +183,12 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":34});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":35});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
+    // What this agent subscribed to; upstream events are filtered against it.
+    let subs = AgentSubscriptions::new(state.holds.clone());
     let mut seq = 0u64;
     // Delay the first ping so hello/welcome and early RPCs are not raced by keepalive.
     let mut pings = tokio::time::interval_at(tokio::time::Instant::now() + state.options.ping_interval, state.options.ping_interval);
@@ -219,10 +224,11 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                         let acl = acl.clone();
                         let owner = owner.clone();
                         let tx = rpc_tx.clone();
+                        let subs = subs.clone();
                         tokio::spawn(async move {
                             // catch_unwind so a panicked handler still frees the in-flight slot
                             // (otherwise overflow would stick until the agent reconnects).
-                            let result = AssertUnwindSafe(handle(&state, &acl, &owner, &method, payload))
+                            let result = AssertUnwindSafe(handle(&state, &acl, &owner, &subs, &method, payload))
                                 .catch_unwind()
                                 .await
                                 .unwrap_or_else(|_| Err("control RPC task panicked".into()));
@@ -273,8 +279,27 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                     },
                     Err(_)=>break
                 };
-                if event.event.get("type").and_then(Value::as_str) != Some("event") { continue; }
-                if !auth::Authenticator::permits(&acl,&event.upstream) { continue; }
+                let kind = event.event.get("type").and_then(Value::as_str);
+                if kind == Some(RESUBSCRIBED_EVENT_TYPE) {
+                    // Upstream control socket was re-established and its subscriptions replayed;
+                    // events in the gap were lost. Only agents subscribed there care.
+                    if !auth::Authenticator::permits(&acl,&event.upstream) || !subs.has_any(&event.upstream) { continue; }
+                    seq += 1;
+                    let notice = json!({"type":"event","seq":seq,"payload":{"gateway":{"notice":"upstream_resubscribed","upstream":event.upstream}}});
+                    if sink.send(Message::Text(notice.to_string())).await.is_err() { break; }
+                    last_activity = std::time::Instant::now();
+                    continue;
+                }
+                if kind != Some("event") { continue; }
+                if !auth::Authenticator::permits(&acl,&event.upstream) {
+                    state.metrics.events_dropped_acl.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
+                // The upstream connection is shared: forward only what this agent subscribed to.
+                if !subs.wants(&event.upstream, event.event.get("payload").unwrap_or(&Value::Null)) {
+                    state.metrics.events_dropped_scope.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    continue;
+                }
                 // Namespace once, then record from the wrapped payload. Re-running
                 // namespace_and_record on an already-wrapped payload double-prefixes
                 // session ids (so recording fails) and re-issues orphan tickets.
@@ -297,7 +322,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
     }
 }
 
-async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut payload: Value) -> Result<AgentReply, String> {
+async fn handle(state: &AppState, acl: &[String], owner: &str, subs: &AgentSubscriptions, method: &str, mut payload: Value) -> Result<AgentReply, String> {
     // Test-only: prove a panicked RPC still releases its in-flight slot (see integration test).
     #[cfg(test)]
     if method == "gateway.__test_panic" {
@@ -340,13 +365,13 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
                 (owner_id, false)
             }
             None if method == "session.attach_all" => {
-                return attach_all_fanout(state, acl, owner, payload).await;
+                return attach_all_fanout(state, acl, owner, subs, payload).await;
             }
             None => {
                 if method != "session.create" {
                     // Hostless non-create (e.g. server.version): Manual/Online default with
                     // transport-error failover across candidates (same policy as create).
-                    return hostless_with_failover(state, acl, owner, method, payload).await;
+                    return hostless_with_failover(state, acl, owner, subs, method, payload).await;
                 } else {
                     return create_with_failover(state, acl, owner, prefs, payload).await;
                 }
@@ -379,8 +404,21 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
         object.remove("host"); object.remove("prefer_tags"); object.remove("avoid_tags");
         object.remove("prefer_hosts"); object.remove("avoid_hosts");
     }
-    let reply = state.clients.get(&owner_upstream).ok_or("upstream client missing")?
-        .call(method, payload).await.map_err(|e| e.to_string())?;
+    let effect = SubscriptionEffect::classify(method, &payload);
+    if let Some(SubscriptionEffect::Detach { session }) = &effect {
+        // Another agent connection still attached to this session on the shared upstream
+        // socket: answer like Rex and keep the upstream subscription.
+        if !subs.detach(&owner_upstream, session) { return Ok(AgentReply::Payload(json!({}))); }
+    }
+    let undo = effect.as_ref().map(|effect| subs.begin(&owner_upstream, effect));
+    let call = match state.clients.get(&owner_upstream) {
+        Some(client) => client.call(method, payload).await.map_err(|e| e.to_string()),
+        None => Err("upstream client missing".to_owned()),
+    };
+    if !matches!(&call, Ok(reply) if !reply.is_application_error()) {
+        if let Some(undo) = undo { subs.undo(undo); }
+    }
+    let reply = call?;
     if reply.is_frame_error() {
         // Do not decorate failed bootstrap / invent "omitted ticket" over a real Rex error.
         return Ok(reply_from_upstream(reply));
@@ -389,6 +427,10 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
     if method == "session.create" {
         // Hard-pin create (no reservation). Hostless create returns earlier via create_with_failover.
         if response.get("error").is_some() { return Ok(AgentReply::Payload(response)); }
+    }
+    if let Some(SubscriptionEffect::BootstrapDefault { .. }) = &effect {
+        // Host-pinned bootstrap without session_id: Rex picked the session.
+        if let Some(session) = response.pointer("/view/session_id").and_then(Value::as_str) { subs.record_attach(&owner_upstream, session); }
     }
     if method == "session.bootstrap" {
         response["upstream"] = json!({"id":upstream.id,"tags":upstream.tags,"description":upstream.description,"state":upstream.state.as_str(),"latency_ms":upstream.latency_ms,"session_count":upstream.session_count});
@@ -496,6 +538,7 @@ async fn hostless_with_failover(
     state: &AppState,
     acl: &[String],
     owner: &str,
+    subs: &AgentSubscriptions,
     method: &str,
     mut payload: Value,
 ) -> Result<AgentReply, String> {
@@ -531,10 +574,16 @@ async fn hostless_with_failover(
         if let Err(e) = denamespace_request(&mut attempt, &id) {
             return Err(e);
         }
+        // Session-less `session.bootstrap` subscribes on whichever upstream answers.
+        let effect = SubscriptionEffect::classify(method, &attempt);
+        let undo = effect.as_ref().map(|effect| subs.begin(&id, effect));
         let call = match state.clients.get(&id) {
             Some(client) => client.call(method, attempt).await.map_err(|e| e.to_string()),
             None => Err("upstream client missing".into()),
         };
+        if !matches!(&call, Ok(reply) if !reply.is_application_error()) {
+            if let Some(undo) = undo { subs.undo(undo); }
+        }
         match call {
             Ok(reply) if reply.is_application_error() => {
                 // Application error: do not failover (parity with session.create).
@@ -542,6 +591,9 @@ async fn hostless_with_failover(
             }
             Ok(reply) => {
                 let mut response = reply.payload;
+                if let Some(SubscriptionEffect::BootstrapDefault { .. }) = &effect {
+                    if let Some(session) = response.pointer("/view/session_id").and_then(Value::as_str) { subs.record_attach(&id, session); }
+                }
                 namespace_and_record(&mut response, &id, &state.tickets, owner, &state.sessions, None);
                 return Ok(AgentReply::Payload(response));
             }
@@ -579,7 +631,7 @@ fn find_nested_session_owner(payload: &Value) -> Option<(String, String)> {
 /// Failures are reported through `partial` / `failed_upstreams` / `upstream_errors`. If every
 /// upstream fails and at least one answered with a Rex frame error (e.g. a bad `event_scope`),
 /// that frame error is forwarded unchanged; otherwise `all upstreams failed: …`.
-async fn attach_all_fanout(state: &AppState, acl: &[String], owner: &str, mut payload: Value) -> Result<AgentReply, String> {
+async fn attach_all_fanout(state: &AppState, acl: &[String], owner: &str, subs: &AgentSubscriptions, mut payload: Value) -> Result<AgentReply, String> {
     if let Some(object) = payload.as_object_mut() {
         for hint in ["host", "prefer_tags", "avoid_tags", "prefer_hosts", "avoid_hosts"] { object.remove(hint); }
     }
@@ -591,6 +643,8 @@ async fn attach_all_fanout(state: &AppState, acl: &[String], owner: &str, mut pa
             return (id, Err((format!("upstream is {}", upstream.state.as_str()), None)));
         }
         let Some(client) = state.clients.get(id) else { return (id, Err(("upstream client missing".to_owned(), None))) };
+        let effect = SubscriptionEffect::classify("session.attach_all", payload);
+        let undo = effect.as_ref().map(|effect| subs.begin(id, effect));
         let result = match client.call("session.attach_all", payload.clone()).await {
             Err(e) => Err((format!("{e:#}"), None)),
             Ok(reply) => match reply.error.filter(|e| !e.is_null()) {
@@ -608,6 +662,7 @@ async fn attach_all_fanout(state: &AppState, acl: &[String], owner: &str, mut pa
                 },
             },
         };
+        if result.is_err() { if let Some(undo) = undo { subs.undo(undo); } }
         (id, result)
     })).await;
     let mut sessions = Vec::new();
@@ -1043,7 +1098,7 @@ mod tests {
             ("onlyb".to_owned(), vec!["b".to_owned()]),
         ])));
         let tickets = TicketMap::new(Duration::from_secs(30), 16, metrics.clone());
-        let state = AppState { pool, clients: ClientMap::new(), auth, tickets, sessions: SessionStore::open(tempfile::tempdir().unwrap().path().join("sessions.json"),Duration::from_secs(86400),16384).unwrap(), metrics, data_limiter: OwnerLimiter::new(), control_limiter: OwnerLimiter::new(), options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120), max_data_streams: 128, max_data_streams_per_token: 32, max_control_connections: 128, max_control_connections_per_token: 32, create_reservation_ttl: Duration::from_secs(5) }, events: broadcast::channel(8).0, discovery: DiscoveryHealth::disabled() };
+        let state = AppState { pool, clients: ClientMap::new(), auth, tickets, sessions: SessionStore::open(tempfile::tempdir().unwrap().path().join("sessions.json"),Duration::from_secs(86400),16384).unwrap(), metrics, holds: HoldRegistry::default(), data_limiter: OwnerLimiter::new(), control_limiter: OwnerLimiter::new(), options: Options { data_connect_timeout: Duration::from_secs(5), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120), max_data_streams: 128, max_data_streams_per_token: 32, max_control_connections: 128, max_control_connections_per_token: 32, create_reservation_ttl: Duration::from_secs(5) }, events: broadcast::channel(8).0, discovery: DiscoveryHealth::disabled() };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let app = router(state.clone());
