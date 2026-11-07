@@ -180,7 +180,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":33});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":34});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -331,6 +331,17 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
         Some((upstream, _)) => (upstream.to_owned(), false),
         None => match payload.get("host").and_then(Value::as_str).map(str::to_owned) {
             Some(host) => (host, true),
+            // Hostless with only a nested namespaced reference (e.g. `target.resolve`
+            // `context.session_id`): route sticky to that owner instead of the default upstream.
+            None if method != "session.create" && find_nested_session_owner(&payload).is_some() => {
+                let (owner_id, external) = find_nested_session_owner(&payload).expect("checked");
+                state.sessions.resolve(&external)?;
+                state.sessions.touch(&external);
+                (owner_id, false)
+            }
+            None if method == "session.attach_all" => {
+                return attach_all_fanout(state, acl, owner, payload).await;
+            }
             None => {
                 if method != "session.create" {
                     // Hostless non-create (e.g. server.version): Manual/Online default with
@@ -541,6 +552,98 @@ async fn hostless_with_failover(
             }
         }
     }
+}
+
+/// First nested namespaced `session_id` (depth-first, document order) when the payload has
+/// no top-level one. Returns `(owner upstream, external id)`.
+fn find_nested_session_owner(payload: &Value) -> Option<(String, String)> {
+    fn walk(value: &Value) -> Option<(String, String)> {
+        match value {
+            Value::Array(items) => items.iter().find_map(walk),
+            Value::Object(object) => object.iter().find_map(|(key, item)| {
+                if key == "session_id" {
+                    let id = item.as_str()?;
+                    crate::protocol::unwrap_session_id(id).map(|(owner, _)| (owner.to_owned(), id.to_owned()))
+                } else {
+                    walk(item)
+                }
+            }),
+            _ => None,
+        }
+    }
+    walk(payload)
+}
+
+/// Hostless `session.attach_all`: subscribe every ACL-allowed routable upstream (its shared
+/// control connection) and merge their `sessions`, namespaced and recorded like `session.list`.
+/// Failures are reported through `partial` / `failed_upstreams` / `upstream_errors`. If every
+/// upstream fails and at least one answered with a Rex frame error (e.g. a bad `event_scope`),
+/// that frame error is forwarded unchanged; otherwise `all upstreams failed: …`.
+async fn attach_all_fanout(state: &AppState, acl: &[String], owner: &str, mut payload: Value) -> Result<AgentReply, String> {
+    if let Some(object) = payload.as_object_mut() {
+        for hint in ["host", "prefer_tags", "avoid_tags", "prefer_hosts", "avoid_hosts"] { object.remove(hint); }
+    }
+    let allowed = state.pool.list_allowed(acl).await;
+    let payload = &payload;
+    let results = futures_util::future::join_all(allowed.iter().map(|upstream| async move {
+        let id = upstream.id.as_str();
+        if !upstream.state.is_routable() {
+            return (id, Err((format!("upstream is {}", upstream.state.as_str()), None)));
+        }
+        let Some(client) = state.clients.get(id) else { return (id, Err(("upstream client missing".to_owned(), None))) };
+        let result = match client.call("session.attach_all", payload.clone()).await {
+            Err(e) => Err((format!("{e:#}"), None)),
+            Ok(reply) => match reply.error.filter(|e| !e.is_null()) {
+                Some(error) => {
+                    let message = error.get("message").and_then(Value::as_str).unwrap_or("upstream frame error").to_owned();
+                    Err((format!("session.attach_all frame error: {message}"), Some(error)))
+                }
+                None => match reply.payload {
+                    Value::Object(mut object) => match object.remove("sessions") {
+                        Some(Value::Array(sessions)) => Ok(sessions),
+                        Some(Value::Null) => Ok(Vec::new()),
+                        _ => Err(("upstream session.attach_all omitted sessions".to_owned(), None)),
+                    },
+                    _ => Err(("upstream session.attach_all omitted sessions".to_owned(), None)),
+                },
+            },
+        };
+        (id, result)
+    })).await;
+    let mut sessions = Vec::new();
+    let mut attached = Vec::new();
+    let mut errors = serde_json::Map::new();
+    let mut first_frame_error = None;
+    for (id, result) in results {
+        match result {
+            Ok(items) => {
+                attached.push(Value::String(id.to_owned()));
+                for mut session in items {
+                    let Some(raw) = session.get("session_id").and_then(Value::as_str) else { continue };
+                    if !raw.starts_with("session:") { continue; }
+                    namespace_and_record(&mut session, id, &state.tickets, owner, &state.sessions, None);
+                    sessions.push(session);
+                }
+            }
+            Err((error, frame)) => {
+                tracing::warn!(upstream = id, %error, "session.attach_all skipped upstream");
+                if first_frame_error.is_none() { first_frame_error = frame; }
+                errors.insert(id.to_owned(), Value::String(error));
+            }
+        }
+    }
+    if !allowed.is_empty() && errors.len() == allowed.len() {
+        if let Some(frame) = first_frame_error { return Ok(AgentReply::FrameError(frame)); }
+        let detail: Vec<String> = errors.iter().map(|(id, e)| format!("{id}: {}", e.as_str().unwrap_or_default())).collect();
+        return Err(format!("all upstreams failed: {}", detail.join("; ")));
+    }
+    let mut response = json!({"sessions": sessions, "attached_upstreams": attached});
+    if !errors.is_empty() {
+        response["partial"] = Value::Bool(true);
+        response["failed_upstreams"] = Value::Array(errors.keys().cloned().map(Value::String).collect());
+        response["upstream_errors"] = Value::Object(errors);
+    }
+    Ok(AgentReply::Payload(response))
 }
 
 fn string_list(payload: &Value, field: &str) -> Option<Vec<String>> {
@@ -839,6 +942,30 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
             }
         }
     }
+    // Complete the WebSocket close handshake on both sides before dropping the sockets.
+    // Dropping right after sending Close lets the kernel answer the peer's in-flight frames
+    // (pongs, its own Close) with a TCP RST, which can discard our Close so the peer sees
+    // "connection reset" instead of the propagated code (e.g. 1001 idle timeout).
+    drain_after_close(agent_stream, upstream_stream).await;
+}
+
+/// Upper bound on waiting for peers to finish the close handshake after the bridge ends.
+const CLOSE_DRAIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Reads (and discards) whatever is left on both streams until each ends, bounded by
+/// [`CLOSE_DRAIN_TIMEOUT`]. A stream that already ended returns immediately.
+async fn drain_after_close<A, U, AI, UI>(mut agent: A, mut upstream: U)
+where
+    A: futures_util::Stream<Item = AI> + Unpin,
+    U: futures_util::Stream<Item = UI> + Unpin,
+{
+    let _ = tokio::time::timeout(CLOSE_DRAIN_TIMEOUT, async {
+        tokio::join!(
+            async { while agent.next().await.is_some() {} },
+            async { while upstream.next().await.is_some() {} },
+        )
+    })
+    .await;
 }
 
 /// Notify the agent that forwarding to the upstream failed mid-bridge (no clean upstream Close),

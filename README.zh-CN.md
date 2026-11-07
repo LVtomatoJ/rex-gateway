@@ -17,7 +17,7 @@ Rex Gateway 是放在你自己的一台或多台 Rex 服务器前面的控制面
 ## 它做什么
 
 - 在 WebSocket 升级之前，用 Bearer 令牌认证 `GET /api/control`、`GET /api/data` 和 `GET /status`。
-- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **32**。
+- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **34**。
 - 把 `session.list` 并发发到每个允许的上游，并给会话 id 加上上游 id 前缀。
 - 带上游前缀的会话调用回到那台上游；没有会话 id 的 `session.create` 和其他无主机调用按[路由与故障转移](#路由与故障转移)处理。
 - 把嵌套的 `ticket` 字符串换成一次性网关票据，并按消息原样桥接 `rex.data.terminal.v1`。
@@ -161,7 +161,7 @@ avoid_hosts = []
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 33,
+  "api_server_revision": 34,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -198,7 +198,7 @@ avoid_hosts = []
 
 ## 开发与测试
 
-`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、票据退回、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码（含已忘记会话的二进制 REJECT、Offline 附着拒绝，以及意外上游断开后结束 agent sink）、事件滞后通知、控制响应刷新空闲（含在途溢出回复）、钉住主机离线文案、控制面在途 RPC 上限、panic 时释放在途槽位、挂起的上游控制面 pending RPC 收割、上游控制面应用空闲（ping/pong 不刷新）、数据桥关闭原因截断到 123 字节，以及 agent WebSocket 帧/消息 1 MiB 上限。
+`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、票据退回、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码（含已忘记会话的二进制 REJECT、Offline 附着拒绝，以及意外上游断开后结束 agent sink）、事件滞后通知、控制响应刷新空闲（含在途溢出回复）、钉住主机离线文案、控制面在途 RPC 上限、panic 时释放在途槽位、挂起的上游控制面 pending RPC 收割、上游控制面应用空闲（ping/pong 不刷新）、数据桥关闭原因截断到 123 字节，agent WebSocket 帧/消息 1 MiB 上限、`session.attach_all` 扇出、仅嵌套会话引用的路由，以及数据桥关闭握手排空。
 
 ```sh
 cargo test --locked
@@ -300,6 +300,8 @@ cargo build --locked
 
 `session.list` 会像其他响应一样改写嵌套的 `session_id` 和 `ticket`。没有以 `session:` 开头的字符串 `session_id` 的条目会被丢掉。
 
+无 `host` 的 `session.attach_all` 会在每台 ACL 允许的上游的共享控制连接上各调一次，并按同样方式合并 `sessions`（加前缀、记录、丢弃不以 `session:` 开头的条目）。payload 另带 `attached_upstreams`（成功的上游 id），部分失败或不可路由时还带 `partial` / `failed_upstreams` / `upstream_errors`。全部失败且至少一台返回 Rex 帧级错误（例如 `event_scope` 不合法）时，原样转发该帧级错误；否则报 `all upstreams failed: …`。带 `host` 时只发给那一台。由于上游控制连接是共享的，这次订阅会作用于所有有权限的 agent 从这些上游收到的事件。
+
 `session.bootstrap` 成功时网关会加上：
 
 - `upstream`：所属上游的 `id`、`tags`、`description`、`state`、`latency_ms`、`session_count`。
@@ -314,6 +316,8 @@ cargo build --locked
 **Manual 上游**来自 `[[upstreams]]` 表（`source` 为 `Manual`）。发现来的是 `Tailnet` 或 `Lan`。
 
 **无主机、且不是 create 的顺序**（`pick_default`）：在 ACL 允许、可路由、且仍接受创建的上游里，先 Manual 后其他，再 `Online` 先于 `Degraded`，然后按 id 升序，取第一个。传输失败会标记该上游（与探测失败共用计数），并尝试其余上游，排除本次请求已经试过的 id。应用层错误（包括 Rex 帧级错误和 payload 里的 `error` 字段）停在这一台。全部耗尽时是 `<method> failed on all candidates: <id>: <reason>; …`。一次都还没开始就没有候选时，错误是 `no routable upstream`。
+
+**只有嵌套会话引用。** 非 create 调用若没有顶层 `session_id`、也没有 `host`，但 payload 内部某处有带前缀的 `session_id`（例如 `target.resolve` 的 `context.session_id`），会粘滞路由到第一个这样的 id（深度优先、文档顺序）所属的上游，而不是 `pick_default`。该 id 与顶层 id 一样做遗忘检查并刷新活跃时间；属于其他上游的嵌套 id 仍然报错。
 
 **不带 `host` 的 `session.create`。** 偏好来自请求（该字段是 JSON 数组时）或令牌（否则）。非数组值保留令牌默认。空数组会在这一次调用里清空该项。请求里的标签和主机列表不与令牌合并。
 
@@ -372,6 +376,8 @@ Agent 的 HELLO 是字节 `0x01` 加上这 16 个原始字节。网关随后拨�
 数据流上限在取走票据之前检查，因此关闭 `1013` 后票据仍可使用。会话已忘记是在 `take` 之后拒绝的，票据保持已消耗。上游 HELLO 送达之前的失败——上游缺失、Offline 拒绝、数据 URL 无效、连接超时、连接失败、上游票据字节无效，或 HELLO 发送失败——会把同一个外部 id 放回去，创建时间不变，所以 TTL 不会重新计时，agent 可以在过期前重试。`tickets_consumed` 在 `take` 时加一，成功退回时减一。只有退回真正把票据放回去时，`tickets_restored` 才会加一。若原来的 TTL 已经走完，退回不会把票据放回去，并且 `tickets_expired` 增加。映射已满时，退回可能淘汰另一张最旧的票据来腾位置（`tickets_evicted`）。若这个外部 id 已经在映射里，退回失败，这张票据保持已消耗（既不增加 `tickets_restored`，也不撤销消耗计数）。HELLO 发送成功后票据才算提交（上游可能已经消耗了自己的票据）。
 
 桥建立之后，Rex 自己的 ACCEPT（`0x81…`）和 REJECT 会被转发。网关不会自己造一个 ACCEPT。
+
+数据桥因任何原因结束时，网关会继续读取两侧 socket（丢弃数据）最多 1 秒，让双方完成 WebSocket 关闭握手后再丢弃 TCP 连接。否则对端正在发送的 pong 或 Close 回复可能触发 TCP reset，丢掉网关发出的 Close，对端看到的就是 `connection reset` 而不是转发的关闭码。
 
 控制连接上限是另一套，发生在 HTTP 升级之后、欢迎消息之前：关闭 `1013`，原因为 `per-token control connection limit` 或 `gateway control connection limit`（默认 32 / 128）。
 

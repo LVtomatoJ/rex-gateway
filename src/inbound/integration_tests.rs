@@ -38,7 +38,7 @@ async fn spawn_fake_rex_on(listener: TcpListener, sessions: Vec<Value>, hung: bo
                     match message["type"].as_str() {
                         Some("hello") => { let _ = socket.send(tungstenite::Message::Text(json!({"type":"welcome"}).to_string())).await; }
                         Some("request") if !hung => {
-                            let payload = if message["method"] == "session.list" {
+                            let payload = if message["method"] == "session.list" || message["method"] == "session.attach_all" {
                                 json!({"sessions": sessions})
                             } else if message["method"] == "session.create" {
                                 json!({"session_id":"session:created"})
@@ -392,7 +392,7 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let welcome: Value = serde_json::from_str(&welcome).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["api_server_revision"], 33);
+    assert_eq!(welcome["api_server_revision"], 34);
     assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
@@ -2194,4 +2194,58 @@ async fn spawn_fake_rex_hung_keepalive_text() -> String {
         }
     });
     url
+}
+
+#[tokio::test]
+async fn attach_all_fans_out_across_upstreams_and_reports_partial() {
+    let a = spawn_fake_rex(vec![json!({"session_id":"session:a1","label":"a"})], false).await;
+    let b = spawn_fake_rex(vec![json!({"session_id":"session:b1","label":"b"}), json!({"session_id":"bogus"})], false).await;
+    let dead = dead_url().await;
+    let h = start_gateway(&[("a", &a), ("b", &b), ("dead", &dead)], tmo(500), tmo(50), tmo(300)).await;
+    wait_state(&h.pool, "a", UpstreamState::Online).await;
+    wait_state(&h.pool, "b", UpstreamState::Online).await;
+    wait_state(&h.pool, "dead", UpstreamState::Offline).await;
+    let mut socket = control_agent(h.addr).await;
+    let reply = rpc(&mut socket, "session.attach_all", json!({"event_scope":"session"})).await;
+    assert_eq!(ids(&reply), ["a:session:a1", "b:session:b1"], "{reply}");
+    assert_eq!(reply["attached_upstreams"], json!(["a", "b"]), "{reply}");
+    assert_eq!(reply["partial"], true);
+    assert_eq!(reply["failed_upstreams"], json!(["dead"]));
+    assert!(h.state.sessions.contains("b:session:b1"));
+    // A hard host pin still goes to exactly one upstream (no fan-out decoration).
+    let pinned = rpc(&mut socket, "session.attach_all", json!({"event_scope":"session","host":"a"})).await;
+    assert_eq!(ids(&pinned), ["a:session:a1"], "{pinned}");
+    assert!(pinned.get("attached_upstreams").is_none(), "{pinned}");
+}
+
+#[tokio::test]
+async fn attach_all_forwards_frame_error_when_every_upstream_rejects() {
+    let err = json!({"code":"bad_request","message":"event_scope must be \"all\" or \"session\"","status":400});
+    let x = spawn_fake_rex_frame_error("session.attach_all", err.clone()).await;
+    let y = spawn_fake_rex_frame_error("session.attach_all", err.clone()).await;
+    let h = start_gateway(&[("x", &x), ("y", &y)], tmo(500), tmo(50), tmo(300)).await;
+    wait_state(&h.pool, "x", UpstreamState::Online).await;
+    wait_state(&h.pool, "y", UpstreamState::Online).await;
+    let mut socket = control_agent(h.addr).await;
+    let frame = rpc_frame(&mut socket, "session.attach_all", json!({"event_scope":"bogus"})).await;
+    assert_eq!(frame["error"], err, "{frame}");
+    assert!(frame.get("payload").is_none() || frame["payload"].is_null(), "{frame}");
+}
+
+#[tokio::test]
+async fn hostless_nested_session_reference_routes_to_its_owner() {
+    // "aaa" would be the pick_default choice; the nested reference must win.
+    let aaa = spawn_fake_rex_echo_forwarded_session_ids().await;
+    let zzz = spawn_fake_rex_echo_forwarded_session_ids().await;
+    let h = start_gateway(&[("aaa", &aaa), ("zzz", &zzz)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("aaa", UpstreamState::Online, Some(1), 0).await;
+    h.pool.mark("zzz", UpstreamState::Online, Some(1), 0).await;
+    let mut socket = control_agent(h.addr).await;
+    let reply = rpc(&mut socket, "target.resolve", json!({"view":{"session_id":"zzz:session:ctx"},"queries":[""]})).await;
+    assert_eq!(reply["forwarded_view"], "session:ctx", "routed to zzz and stripped: {reply}");
+    // Forgotten nested reference is refused like a top-level one.
+    h.state.sessions.record("zzz", "session:gone");
+    h.state.sessions.forget("zzz:session:gone").unwrap();
+    let reply = rpc(&mut socket, "target.resolve", json!({"view":{"session_id":"zzz:session:gone"}})).await;
+    assert!(reply["error"].as_str().unwrap_or("").contains("forgotten"), "{reply}");
 }

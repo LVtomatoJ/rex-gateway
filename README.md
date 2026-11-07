@@ -17,7 +17,7 @@ It is a single Rust binary in this repository (`rex-gateway`). It does not embed
 ## What it does
 
 - Authenticates `GET /api/control`, `GET /api/data`, and `GET /status` with a bearer token before any WebSocket upgrade.
-- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **32**.
+- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **34**.
 - Fans `session.list` out to every allowed upstream and prefixes session ids with the upstream id.
 - Routes a namespaced session call back to that upstream, and routes a hostless `session.create` or other hostless call with the rules in [Routing and failover](#routing-and-failover).
 - Rewrites nested `ticket` strings to single-use gateway tickets and bridges `rex.data.terminal.v1` byte-for-byte.
@@ -161,7 +161,7 @@ Welcome shape (ids are new on every connection):
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 33,
+  "api_server_revision": 34,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -198,7 +198,7 @@ Short version. Exact order, errors, and counters are below.
 
 ## Development
 
-`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes (including forgotten-session binary REJECT, Offline attach refuse, and finishing the agent sink after an unexpected upstream drop), event-lag notices, control-response idle refresh (including in-flight overflow replies), host-pin offline errors, the control-plane in-flight bound, panic-safe in-flight slot release, hung upstream-control pending RPC reap, upstream-control application-idle (ping/pong do not refresh), data-bridge close-reason truncation to 123 bytes, and agent WebSocket frame/message caps at 1 MiB.
+`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes (including forgotten-session binary REJECT, Offline attach refuse, and finishing the agent sink after an unexpected upstream drop), event-lag notices, control-response idle refresh (including in-flight overflow replies), host-pin offline errors, the control-plane in-flight bound, panic-safe in-flight slot release, hung upstream-control pending RPC reap, upstream-control application-idle (ping/pong do not refresh), data-bridge close-reason truncation to 123 bytes, agent WebSocket frame/message caps at 1 MiB, `session.attach_all` fan-out, nested-only session routing, and the data-bridge close-handshake drain.
 
 ```sh
 cargo test --locked
@@ -300,6 +300,8 @@ Missed upstream events are not replayed. `events_forwarded` counts successful se
 
 `session.list` rewrites nested `session_id` and `ticket` fields the same way other responses do. Items without a string `session_id` that starts with `session:` are dropped.
 
+Hostless `session.attach_all` fans out to every ACL-allowed upstream on that upstream's shared control connection and merges `sessions` the same way (namespaced, recorded, non-`session:` items dropped). The payload also carries `attached_upstreams` (ids that succeeded) and, when some failed or were not routable, `partial` / `failed_upstreams` / `upstream_errors`. If every upstream fails and at least one returned a Rex frame error (for example a bad `event_scope`), that frame error is forwarded unchanged; otherwise the error is `all upstreams failed: …`. With `host` it goes to that one upstream only. Because upstream control connections are shared, the subscription applies to events every permitted agent receives from those upstreams.
+
 On `session.bootstrap` success the gateway adds:
 
 - `upstream`: `id`, `tags`, `description`, `state`, `latency_ms`, `session_count` for the owner.
@@ -314,6 +316,8 @@ Routing hints removed before a payload is forwarded: `host`, `prefer_tags`, `avo
 **Manual upstreams** are the `[[upstreams]]` table (`source` `Manual`). Discovered ones are `Tailnet` or `Lan`.
 
 **Hostless non-create order** (`pick_default`): among ACL-allowed, routable upstreams that still accept creates, sort by Manual before anything else, then `Online` before `Degraded`, then id ascending. Take the first. Transport failure marks that upstream (the same failure counter as a probe) and tries the rest, excluding ids already tried for this request. Application errors, including Rex frame errors and a payload `error` field, stop at that upstream. Exhaustion is `<method> failed on all candidates: <id>: <reason>; …`. If nothing was eligible before any attempt, the error is `no routable upstream`.
+
+**Nested-only session reference.** A non-create call with no top-level `session_id` and no `host`, but a namespaced `session_id` somewhere inside the payload (for example `target.resolve` `context.session_id`), is routed sticky to the owner of the first such id (depth-first, document order) instead of `pick_default`. That id goes through the same forgotten check and touch as a top-level one; nested ids owned by another upstream are still an error.
 
 **`session.create` without `host`.** Preferences come from the request when the field is a JSON array, otherwise from the token. A non-array value leaves the token default in place. An empty array clears that list for this call. Tags and host lists on the request are not merged with the token.
 
@@ -372,6 +376,8 @@ The agent HELLO is the byte `0x01` plus those 16 raw bytes. The gateway then dia
 Stream caps are checked before the ticket is taken, so close `1013` leaves it usable. A forgotten session is refused after `take` and the ticket stays spent. Failures before the upstream HELLO is delivered — missing upstream, Offline refuse, invalid data URL, connect timeout, connection failed, invalid upstream ticket bytes, or HELLO send failure — put that same external id back with its original creation time, so the TTL does not restart and the agent may retry until expiry. `tickets_consumed` goes up on `take` and down by one on a successful restore. `tickets_restored` increases only when restore puts the ticket back. If the original TTL has already elapsed, restore does not put the ticket back and `tickets_expired` increases. A full map can evict some other oldest ticket to make room for the restored one (`tickets_evicted`). If that external id is already present, restore fails and this ticket stays spent (neither `tickets_restored` nor a consume undo). After a successful HELLO send the ticket is committed (the upstream may have consumed it).
 
 Rex's own ACCEPT (`0x81…`) and REJECT frames are relayed once the bridge is up. The gateway does not invent an ACCEPT.
+
+When a bridge ends for any reason, the gateway keeps reading both sockets (discarding data) for up to 1 second so each peer can finish the WebSocket close handshake before the TCP sockets are dropped. Without that, a peer's in-flight pong or Close reply could trigger a TCP reset that discards the gateway's Close, so the peer saw `connection reset` instead of the propagated close code.
 
 Control connection caps are separate and happen after the HTTP upgrade, before welcome: close `1013` `per-token control connection limit` or `gateway control connection limit` (defaults 32 / 128).
 
