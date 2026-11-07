@@ -17,7 +17,7 @@ It is a single Rust binary in this repository (`rex-gateway`). It does not embed
 ## What it does
 
 - Authenticates `GET /api/control`, `GET /api/data`, and `GET /status` with a bearer token before any WebSocket upgrade.
-- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **29**.
+- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **30**.
 - Fans `session.list` out to every allowed upstream and prefixes session ids with the upstream id.
 - Routes a namespaced session call back to that upstream, and routes a hostless `session.create` or other hostless call with the rules in [Routing and failover](#routing-and-failover).
 - Rewrites nested `ticket` strings to single-use gateway tickets and bridges `rex.data.terminal.v1` byte-for-byte.
@@ -161,7 +161,7 @@ Welcome shape (ids are new on every connection):
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 29,
+  "api_server_revision": 30,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -198,14 +198,14 @@ Short version. Exact order, errors, and counters are below.
 
 ## Development
 
-`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes (including forgotten-session binary REJECT), event-lag notices, control-response idle refresh, host-pin offline errors, the control-plane in-flight bound, panic-safe in-flight slot release, and agent WebSocket frame/message caps at 1 MiB.
+`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes (including forgotten-session binary REJECT and Offline attach refuse), event-lag notices, control-response idle refresh (including in-flight overflow replies), host-pin offline errors, the control-plane in-flight bound, panic-safe in-flight slot release, and agent WebSocket frame/message caps at 1 MiB.
 
 ```sh
 cargo test --locked
 cargo build --locked
 ```
 
-On this tree, `cargo test --locked` passed 131 tests with rustc 1.99.1. `--locked` keeps the build on `Cargo.lock`; Cargo 1.83 cannot parse it.
+On this tree, `cargo test --locked` passed 133 tests with rustc 1.99.1. `--locked` keeps the build on `Cargo.lock`; Cargo 1.83 cannot parse it.
 
 The live scripts assume the repository root as the working directory, `127.0.0.1:7300`, and token `smoke-secret`. They are not part of `cargo test`.
 
@@ -359,6 +359,7 @@ The agent HELLO is the byte `0x01` plus those 16 raw bytes. The gateway then dia
 | Unknown, expired, evicted, already used | Binary `0x82 0x01`, close `1008` `bad or used ticket`. Wrong owner is the same response and does not burn the ticket |
 | Ticket's session reference is forgotten | Binary `0x82 0x01`, close `1008` `session reference expired/forgotten`. Ticket stays spent and is not restored |
 | Owner upstream missing, or its data URL is not a client request | Close `1011` `upstream unavailable`. Ticket restored |
+| Owner upstream is `Offline` | Close `1011` `upstream offline`. Ticket restored (no dial) |
 | Upstream dial exceeds `data_connect_timeout_ms` | Close `1011` `upstream connect timeout`. Ticket restored |
 | Upstream dial fails | Close `1011` `upstream connection failed`. Ticket restored |
 | Stored upstream ticket is not base64url, after the upstream socket is open | Close `1011` `invalid upstream ticket`. Ticket restored |
@@ -368,7 +369,7 @@ The agent HELLO is the byte `0x01` plus those 16 raw bytes. The gateway then dia
 | Agent drops without a Close, or agent send fails | Upstream close `1001` `peer closed` |
 | No binary or text for `ws_idle_timeout_ms` | Both sides close `1001` `idle timeout` |
 
-Stream caps are checked before the ticket is taken, so close `1013` leaves it usable. A forgotten session is refused after `take` and the ticket stays spent. Failures before the upstream HELLO is delivered — missing upstream, invalid data URL, connect timeout, connection failed, invalid upstream ticket bytes, or HELLO send failure — put that same external id back with its original creation time, so the TTL does not restart and the agent may retry until expiry. `tickets_consumed` goes up on `take` and down by one on a successful restore. `tickets_restored` increases only when restore puts the ticket back. If the original TTL has already elapsed, restore does not put the ticket back and `tickets_expired` increases. A full map can evict some other oldest ticket to make room for the restored one (`tickets_evicted`). If that external id is already present, restore fails and this ticket stays spent (neither `tickets_restored` nor a consume undo). After a successful HELLO send the ticket is committed (the upstream may have consumed it).
+Stream caps are checked before the ticket is taken, so close `1013` leaves it usable. A forgotten session is refused after `take` and the ticket stays spent. Failures before the upstream HELLO is delivered — missing upstream, Offline refuse, invalid data URL, connect timeout, connection failed, invalid upstream ticket bytes, or HELLO send failure — put that same external id back with its original creation time, so the TTL does not restart and the agent may retry until expiry. `tickets_consumed` goes up on `take` and down by one on a successful restore. `tickets_restored` increases only when restore puts the ticket back. If the original TTL has already elapsed, restore does not put the ticket back and `tickets_expired` increases. A full map can evict some other oldest ticket to make room for the restored one (`tickets_evicted`). If that external id is already present, restore fails and this ticket stays spent (neither `tickets_restored` nor a consume undo). After a successful HELLO send the ticket is committed (the upstream may have consumed it).
 
 Rex's own ACCEPT (`0x81…`) and REJECT frames are relayed once the bridge is up. The gateway does not invent an ACCEPT.
 
@@ -497,7 +498,7 @@ The gateway sends WebSocket pings every `ws_ping_interval_ms` (default 20 second
 
 What counts as activity differs:
 
-- Agent control idle is application-idle. Inbound text refreshes it. So does a successfully delivered control response, a successfully forwarded upstream event, and the synthetic `events_lagged` notice. Inbound ping and pong do not. An agent that receives responses, events, or lag notices stays up. An agent with none of that traffic for `ws_idle_timeout_ms` (default 120 seconds) is closed with `1001` `idle timeout`, even while keepalive pings are flowing.
+- Agent control idle is application-idle. Inbound text refreshes it. So does a successfully delivered control response (including the immediate `too many in-flight control RPCs` overflow reply), a successfully forwarded upstream event, and the synthetic `events_lagged` notice. Inbound ping and pong do not. An agent that receives responses, events, or lag notices stays up. An agent with none of that traffic for `ws_idle_timeout_ms` (default 120 seconds) is closed with `1001` `idle timeout`, even while keepalive pings are flowing.
 - The upstream control client treats inbound ping, pong, and text as activity. The gateway's pings, once ponged, keep that socket up. On idle it closes the upstream with `1001` `idle timeout` and fails in-flight calls on that socket with `upstream idle timeout`.
 - A data bridge refreshes on binary or text in either direction, not on ping or pong. Idle closes both sides with `1001` `idle timeout`.
 

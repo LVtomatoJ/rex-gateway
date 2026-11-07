@@ -349,7 +349,7 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let welcome: Value = serde_json::from_str(&welcome).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["api_server_revision"], 29);
+    assert_eq!(welcome["api_server_revision"], 30);
     assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
@@ -493,6 +493,7 @@ async fn data_plane_upstream_connect_timeout_closes_with_1011() {
     let url = format!("http://{}", stuck.local_addr().unwrap());
     let held = tokio::spawn(async move { let mut keep = Vec::new(); while let Ok((s, _)) = stuck.accept().await { keep.push(s); } });
     let h = start_gateway(&[("stuck", &url)], tmo(300), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("stuck", UpstreamState::Online, Some(1), 0).await;
     let external = h.state.tickets.insert("stuck", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
     let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
 
@@ -516,6 +517,7 @@ async fn data_plane_upstream_connect_timeout_closes_with_1011() {
 async fn data_plane_upstream_connection_failed_restores_ticket() {
     // Nothing listens: TCP connect fails immediately → 1011 + ticket restored.
     let h = start_gateway(&[("down", "http://127.0.0.1:9")], tmo(300), Duration::from_secs(3600), tmo(500)).await;
+    h.pool.mark("down", UpstreamState::Online, Some(1), 0).await;
     let external = h.state.tickets.insert("down", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
     let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
     let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
@@ -543,6 +545,26 @@ async fn data_plane_missing_upstream_restores_ticket() {
     assert!(h.state.tickets.take(&external, SECRET).is_some());
 }
 
+/// Sticky control refuses Offline hosts; data attach must too (fail-fast, restore ticket) instead of
+/// dialing a known-Offline URL and waiting for connect timeout / connection failed.
+#[tokio::test]
+async fn data_plane_offline_upstream_refuses_and_restores_ticket() {
+    let h = start_gateway(&[("dead", "http://127.0.0.1:9")], tmo(300), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("dead", UpstreamState::Offline, None, 0).await;
+    let external = h.state.tickets.insert("dead", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
+    let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat().into())).await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(2), socket.next()).await.expect("must not hang").unwrap().unwrap() {
+        tungstenite::Message::Close(Some(frame)) => assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1011, "upstream offline")),
+        other => panic!("expected offline close, got {other:?}"),
+    }
+    assert_eq!(h.state.tickets.pending(), 1, "ticket restored after offline refuse");
+    assert_eq!(h.state.metrics.snapshot().tickets_restored, 1);
+    assert!(h.state.tickets.take(&external, SECRET).is_some());
+}
+
+
 #[tokio::test]
 async fn data_plane_invalid_upstream_ticket_restores_ticket() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -559,6 +581,7 @@ async fn data_plane_invalid_upstream_ticket_restores_ticket() {
         }
     });
     let h = start_gateway(&[("local", &url)], tmo(300), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("local", UpstreamState::Online, Some(1), 0).await;
     let external = h.state.tickets.insert("local", "!!!not-valid-base64!!!", SECRET);
     let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
     let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
@@ -605,6 +628,7 @@ async fn data_plane_upstream_hello_send_failed_restores_ticket() {
         vec![0u8; 256 * 1024],
     );
     let h = start_gateway(&[("local", &url)], tmo(300), Duration::from_secs(3600), tmo(500)).await;
+    h.pool.mark("local", UpstreamState::Online, Some(1), 0).await;
     let external = h.state.tickets.insert("local", &oversized, SECRET);
     let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
     let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
@@ -638,6 +662,7 @@ async fn data_plane_successful_hello_consumes_ticket() {
         }
     });
     let h = start_gateway(&[("local", &url)], tmo(300), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("local", UpstreamState::Online, Some(1), 0).await;
     let external = h.state.tickets.insert("local", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
     let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
     let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
@@ -765,6 +790,7 @@ async fn data_bridges_send_pings_and_propagate_upstream_close() {
         }
     });
     let h=start_gateway_with_keepalive(&[("local",&url)],tmo(300),Duration::from_secs(3600),tmo(300),tmo(30),tmo(120)).await;
+    h.pool.mark("local", UpstreamState::Online, Some(1), 0).await;
     let external=h.state.tickets.insert("local","AAAAAAAAAAAAAAAAAAAAAA",SECRET);
     let raw=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,external).unwrap();
     let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
@@ -843,6 +869,7 @@ async fn idle_data_bridges_send_pings_then_close_both_sides() {
         }
     });
     let h=start_gateway_with_keepalive(&[("local",&url)],tmo(300),Duration::from_secs(3600),tmo(300),tmo(30),tmo(120)).await;
+    h.pool.mark("local", UpstreamState::Online, Some(1), 0).await;
     let external=h.state.tickets.insert("local","AAAAAAAAAAAAAAAAAAAAAA",SECRET);
     let raw=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,external).unwrap();
     let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
@@ -900,6 +927,7 @@ async fn agent_abrupt_disconnect_closes_upstream_data_socket() {
         }
     });
     let h=start_gateway(&[("local",&url)],tmo(300),Duration::from_secs(3600),tmo(300)).await;
+    h.pool.mark("local", UpstreamState::Online, Some(1), 0).await;
     let external=h.state.tickets.insert("local","AAAAAAAAAAAAAAAAAAAAAA",SECRET);
     let raw=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,external).unwrap();
     let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
@@ -950,6 +978,7 @@ async fn agent_gone_during_upstream_send_closes_upstream_1001() {
         }
     });
     let h=start_gateway(&[("local",&url)],tmo(300),Duration::from_secs(3600),tmo(300)).await;
+    h.pool.mark("local", UpstreamState::Online, Some(1), 0).await;
     let external=h.state.tickets.insert("local","AAAAAAAAAAAAAAAAAAAAAA",SECRET);
     let raw=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,external).unwrap();
     let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
@@ -982,6 +1011,7 @@ async fn data_stream_limit_closes_1013_without_burning_ticket() {
         }
     });
     let h=start_gateway_with_limits(&[("local",&url)],tmo(300),Duration::from_secs(3600),tmo(300),Duration::from_secs(20),Duration::from_secs(120),1,1).await;
+    h.pool.mark("local", UpstreamState::Online, Some(1), 0).await;
     let first=h.state.tickets.insert("local","AAAAAAAAAAAAAAAAAAAAAA",SECRET);
     let second=h.state.tickets.insert("local","BBBBBBBBBBBBBBBBBBBBBB",SECRET);
     let raw1=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,&first).unwrap();
@@ -1154,6 +1184,7 @@ async fn data_plane_unexpected_upstream_drop_closes_agent_1011() {
         }
     });
     let h = start_gateway(&[("local", &url)], tmo(300), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("local", UpstreamState::Online, Some(1), 0).await;
     let external = h.state.tickets.insert("local", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
     let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
     let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
@@ -1193,6 +1224,7 @@ async fn agent_to_upstream_send_failure_closes_agent_1011() {
         }
     });
     let h = start_gateway(&[("local", &url)], tmo(300), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("local", UpstreamState::Online, Some(1), 0).await;
     let external = h.state.tickets.insert("local", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
     let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
     let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
@@ -1951,6 +1983,77 @@ async fn control_rpc_responses_refresh_application_idle() {
                     tokio::time::Instant::now().duration_since(after_response) >= Duration::from_millis(150),
                     "closed too early after response",
                 );
+                return;
+            }
+            Ok(Some(Ok(other))) => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+/// Bound-overflow responses are still delivered control replies: they must refresh application-idle
+/// the same way successful RPC responses do (README: "successfully delivered control response").
+#[tokio::test]
+async fn overflow_control_responses_refresh_application_idle() {
+    let hung = spawn_fake_rex(vec![], true).await;
+    let h = start_gateway_with_keepalive(
+        &[("hung", &hung)], Duration::from_secs(5), Duration::from_secs(3600), tmo(300), tmo(40), tmo(200),
+    ).await;
+    h.pool.mark("hung", UpstreamState::Online, Some(1), 0).await;
+    let mut socket = control_agent(h.addr).await;
+
+    // Fill all in-flight slots with hung upstream calls (never answer).
+    for i in 0..MAX_IN_FLIGHT_CONTROL_RPCS {
+        socket.send(tungstenite::Message::Text(
+            json!({"type":"request","id":format!("hold-{i}"),"method":"server.version","payload":{"host":"hung"}}).to_string(),
+        )).await.unwrap();
+    }
+    tokio::time::sleep(tmo(50)).await;
+
+    // Deliver overflow replies across several idle windows; connection must stay open.
+    let keep_until = tokio::time::Instant::now() + Duration::from_millis(360);
+    let mut n = 0u64;
+    while tokio::time::Instant::now() < keep_until {
+        let id = format!("overflow-{n}");
+        socket.send(tungstenite::Message::Text(
+            json!({"type":"request","id":id,"method":"server.version","payload":{"host":"hung"}}).to_string(),
+        )).await.unwrap();
+        n += 1;
+        let drain_until = tokio::time::Instant::now() + tmo(40);
+        while tokio::time::Instant::now() < drain_until {
+            let left = drain_until.saturating_duration_since(tokio::time::Instant::now());
+            match tokio::time::timeout(left, socket.next()).await {
+                Ok(Some(Ok(tungstenite::Message::Text(text)))) => {
+                    let msg: Value = serde_json::from_str(&text).unwrap();
+                    if msg["type"] == "response" && msg["id"].as_str().unwrap_or("").starts_with("overflow-") {
+                        assert_eq!(msg["payload"]["error"].as_str(), Some("too many in-flight control RPCs"), "{msg}");
+                    }
+                }
+                Ok(Some(Ok(tungstenite::Message::Ping(bytes)))) => {
+                    let _ = socket.send(tungstenite::Message::Pong(bytes)).await;
+                }
+                Ok(Some(Ok(tungstenite::Message::Pong(_)))) => {}
+                Ok(Some(Ok(tungstenite::Message::Close(frame)))) => {
+                    panic!("idle closed while overflow responses were flowing: {frame:?}");
+                }
+                _ => break,
+            }
+        }
+    }
+    assert!(n >= 2, "expected multiple overflow deliveries, got {n}");
+
+    // After overflow traffic stops, application idle must still reap.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, socket.next()).await {
+            Err(_) => panic!("idle agent was not closed after overflow traffic stopped"),
+            Ok(None) | Ok(Some(Err(_))) => panic!("agent dropped without close frame"),
+            Ok(Some(Ok(tungstenite::Message::Ping(_)))) => {}
+            Ok(Some(Ok(tungstenite::Message::Pong(_)))) => {}
+            Ok(Some(Ok(tungstenite::Message::Text(_)))) => {} // late hung replies
+            Ok(Some(Ok(tungstenite::Message::Close(frame)))) => {
+                let frame = frame.expect("close frame");
+                assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1001, "idle timeout"));
                 return;
             }
             Ok(Some(Ok(other))) => panic!("unexpected {other:?}"),

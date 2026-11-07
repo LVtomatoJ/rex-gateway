@@ -180,7 +180,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":29});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":30});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -207,9 +207,11 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                         let payload = message["payload"].clone();
                         if in_flight >= MAX_IN_FLIGHT_CONTROL_RPCS {
                             // Bound overflow: clear immediate error, no upstream call, seq assigned on send.
+                            // Delivered overflow responses still refresh application-idle (same as RPC replies).
                             seq += 1;
                             let response = json!({"type":"response","id":id,"seq":seq,"payload":{"error":"too many in-flight control RPCs"}});
                             if sink.send(Message::Text(response.to_string())).await.is_err() { break; }
+                            last_activity = std::time::Instant::now();
                             continue;
                         }
                         in_flight += 1;
@@ -660,6 +662,13 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
         restore_ticket_and_close(&mut agent, &state.tickets, taken, "upstream unavailable").await;
         return;
     };
+    // Confirmed Offline: fail fast with the same close reason mid-bridge uses, and restore
+    // so the agent can retry when the host returns. Unknown/Degraded still dial (optimistic);
+    // Unknown is common before the first probe finishes, and Degraded is still routable.
+    if upstream.state == UpstreamState::Offline {
+        restore_ticket_and_close(&mut agent, &state.tickets, taken, "upstream offline").await;
+        return;
+    }
     let url = format!("{}/api/data", upstream.url.trim_end_matches('/'));
     let url = url.strip_prefix("http://").map(|u| format!("ws://{u}"))
         .or_else(|| url.strip_prefix("https://").map(|u| format!("wss://{u}"))).unwrap_or(url);
