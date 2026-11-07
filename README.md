@@ -17,7 +17,7 @@ It is a single Rust binary in this repository (`rex-gateway`). It does not embed
 ## What it does
 
 - Authenticates `GET /api/control`, `GET /api/data`, and `GET /status` with a bearer token before any WebSocket upgrade.
-- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **26**.
+- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **27**.
 - Fans `session.list` out to every allowed upstream and prefixes session ids with the upstream id.
 - Routes a namespaced session call back to that upstream, and routes a hostless `session.create` or other hostless call with the rules in [Routing and failover](#routing-and-failover).
 - Rewrites nested `ticket` strings to single-use gateway tickets and bridges `rex.data.terminal.v1` byte-for-byte.
@@ -161,7 +161,7 @@ Welcome shape (ids are new on every connection):
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 26,
+  "api_server_revision": 27,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -188,7 +188,7 @@ Short version. Exact order, errors, and counters are below.
 
 **Sticky call.** A payload `session_id` of the form `<upstream>:session:…` goes only to that upstream, with the prefix removed. The id must be allowed. `Offline` or `Unknown` returns `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`. There is no failover.
 
-**Create.** No `session_id` and no `host`: the gateway reserves the best `Online` or `Degraded` upstream that still accepts creates, under your tag and host preferences, then calls it. A transport failure releases the reservation, marks that upstream, and tries the next candidate. An application error or a payload `host` does not. A pinned `host` that is `Offline` or `Unknown` returns `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host` (there is no session to remove yet).
+**Create.** No `session_id` and no `host`: the gateway reserves the best `Online` or `Degraded` upstream that still accepts creates, under your tag and host preferences, then calls it. A transport failure releases the reservation, marks that upstream, and tries the next candidate. An application error or a payload `host` does not. A pinned `host` that is `Offline` or `Unknown` returns `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host` (there is no session to remove yet). The same pinned-host Offline copy applies to every other method that names `host` without a namespaced `session_id` (for example `server.version`).
 
 **Other hostless calls.** No `session_id` and no `host` (`server.version` and anything else): try `Manual` before discovered, `Online` before `Degraded`, then upstream id. Same transport-only failover.
 
@@ -198,7 +198,7 @@ Short version. Exact order, errors, and counters are below.
 
 ## Development
 
-`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes, event-lag notices, and the control-plane in-flight bound.
+`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes, event-lag notices, control-response idle refresh, host-pin offline errors, and the control-plane in-flight bound.
 
 ```sh
 cargo test --locked
@@ -335,7 +335,7 @@ Explicit unusable preferences return:
 
 Selection and the reservation counter share one mutex, so overlapping creates see each other's reservation. The reservation lasts until the attempt finishes or `create_reservation_ttl_ms` (default 5000) passes, and is reaped on the next selection and on `GET /status`. A transport failure drops it and continues. The agent-facing exhaustion string is `session.create failed on all candidates: <id>: <reason>; …`.
 
-A payload `host` on any method, including create, skips scoring, reservations, and failover. It must be ACL-allowed and routable. It may name a discovered upstream that no longer accepts automatic creates. Unknown id: `upstream <id> is unknown`. ACL miss: `upstream <id> is not allowed`. `Offline` or `Unknown` on `session.create` returns `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host`. The same states on a namespaced session call still return `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`.
+A payload `host` on any method, including create, skips scoring, reservations, and failover. It must be ACL-allowed and routable. It may name a discovered upstream that no longer accepts automatic creates. Unknown id: `upstream <id> is unknown`. ACL miss: `upstream <id> is not allowed`. `Offline` or `Unknown` on a host-pinned call (any method, including `session.create` and `server.version`) returns `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host`. The same states on a namespaced session call still return `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`.
 
 Transport errors that do failover are the control client's errors: connect failure, timeout, missing client, socket closed, and `upstream unavailable (retry in <ms> ms): …` while reconnect backoff is in effect. Backoff after a failed connect is 200 ms, doubled, capped at 5 seconds. During the wait the call fails fast with that `retry in` text instead of dialing again.
 
@@ -497,7 +497,7 @@ The gateway sends WebSocket pings every `ws_ping_interval_ms` (default 20 second
 
 What counts as activity differs:
 
-- Agent control idle is application-idle. Inbound text refreshes it. So does a successfully forwarded upstream event, and so does the synthetic `events_lagged` notice. Inbound ping and pong do not. An agent that receives events or lag notices stays up. An agent with none of that traffic for `ws_idle_timeout_ms` (default 120 seconds) is closed with `1001` `idle timeout`, even while keepalive pings are flowing.
+- Agent control idle is application-idle. Inbound text refreshes it. So does a successfully delivered control response, a successfully forwarded upstream event, and the synthetic `events_lagged` notice. Inbound ping and pong do not. An agent that receives responses, events, or lag notices stays up. An agent with none of that traffic for `ws_idle_timeout_ms` (default 120 seconds) is closed with `1001` `idle timeout`, even while keepalive pings are flowing.
 - The upstream control client treats inbound ping, pong, and text as activity. The gateway's pings, once ponged, keep that socket up. On idle it closes the upstream with `1001` `idle timeout` and fails in-flight calls on that socket with `upstream idle timeout`.
 - A data bridge refreshes on binary or text in either direction, not on ping or pong. Idle closes both sides with `1001` `idle timeout`.
 

@@ -174,7 +174,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":26});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":27});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -235,6 +235,8 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                     Err(e) => json!({"type":"response","id":id,"seq":seq,"payload":{"error":e.to_string()}}),
                 };
                 if sink.send(Message::Text(response.to_string())).await.is_err() { break; }
+                // Delivered control responses are useful agent traffic (application-idle).
+                last_activity = std::time::Instant::now();
             }
             event=events.recv()=> {
                 let event=match event {
@@ -305,10 +307,12 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
             avoid_hosts: string_list(&payload, "avoid_hosts").unwrap_or(defaults.avoid_hosts),
         }
     } else { TagPreferences::default() };
-    let owner_upstream = match payload.get("session_id").and_then(Value::as_str).and_then(crate::protocol::unwrap_session_id) {
-        Some((upstream, _)) => upstream.to_owned(),
+    // Sticky session_id wins over host. Host pin (any method) is distinct from a namespaced
+    // session call for Offline/Unknown error copy: pins have no session to remove/recreate.
+    let (owner_upstream, routed_via_host_pin) = match payload.get("session_id").and_then(Value::as_str).and_then(crate::protocol::unwrap_session_id) {
+        Some((upstream, _)) => (upstream.to_owned(), false),
         None => match payload.get("host").and_then(Value::as_str).map(str::to_owned) {
-            Some(host) => host,
+            Some(host) => (host, true),
             None => {
                 if method != "session.create" {
                     // Hostless non-create (e.g. server.version): Manual/Online default with
@@ -327,8 +331,8 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
         return Err(format!("upstream {owner_upstream} is unknown"));
     };
     if !upstream.state.is_routable() {
-        if method == "session.create" {
-            // Hard host pin on create: there is no session yet, so do not suggest remove/recreate.
+        if routed_via_host_pin {
+            // Hard host pin (create or any other method): do not suggest remove/recreate.
             return Err(format!(
                 "upstream {owner_upstream} is {}; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host",
                 upstream.state.as_str()

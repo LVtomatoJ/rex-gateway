@@ -349,7 +349,7 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let welcome: Value = serde_json::from_str(&welcome).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["api_server_revision"], 26);
+    assert_eq!(welcome["api_server_revision"], 27);
     assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
@@ -1076,7 +1076,17 @@ async fn host_targeted_unknown_and_degraded_routing() {
     let mut socket = control_agent(h.addr).await;
 
     let reply = rpc(&mut socket, "server.version", json!({"host":"gone"})).await;
-    assert!(reply["error"].as_str().unwrap().contains("Unknown"), "{reply}");
+    let err = reply["error"].as_str().unwrap();
+    assert!(err.contains("Unknown"), "{reply}");
+    assert!(err.contains("pinned host is unavailable"), "host pin must not suggest remove/recreate: {reply}");
+    assert!(!err.contains("remove/recreate"), "{reply}");
+
+    h.pool.mark("gone", UpstreamState::Offline, None, 0).await;
+    let reply = rpc(&mut socket, "server.version", json!({"host":"gone"})).await;
+    let err = reply["error"].as_str().unwrap();
+    assert!(err.contains("Offline"), "{reply}");
+    assert!(err.contains("pinned host is unavailable"), "{reply}");
+    assert!(!err.contains("remove/recreate"), "host-pinned non-create Offline: {reply}");
 
     // Degraded remains routable.
     assert_eq!(rpc(&mut socket, "server.version", json!({"host":"live"})).await, json!({"ok":true}));
@@ -1756,6 +1766,104 @@ async fn forwarded_events_refresh_control_application_idle() {
             Ok(Some(Ok(tungstenite::Message::Close(frame)))) => {
                 let frame = frame.expect("close frame");
                 assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1001, "idle timeout"));
+                return;
+            }
+            Ok(Some(Ok(other))) => panic!("unexpected {other:?}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn control_rpc_responses_refresh_application_idle() {
+    // Application-idle: a late but successful control response must refresh last_activity.
+    // Request at T=0, response at ~100ms, idle=120ms. Without response refresh the socket
+    // would close ~120ms after the request (before or just as the agent finished reading);
+    // with refresh it stays open until ~100+120ms after the request.
+    let delayed = spawn_fake_rex_delayed("server.version", tmo(150)).await;
+    let h = start_gateway_with_keepalive(
+        &[("slow", &delayed)], tmo(800), Duration::from_secs(3600), tmo(300), tmo(40), tmo(200),
+    ).await;
+    wait_state(&h.pool, "slow", UpstreamState::Online).await;
+    let mut socket = control_agent(h.addr).await;
+
+    let sent_at = tokio::time::Instant::now();
+    socket.send(tungstenite::Message::Text(
+        json!({"type":"request","id":"slow-1","method":"server.version","payload":{"host":"slow"}}).to_string(),
+    )).await.unwrap();
+
+    // Wait for the response; tolerate keepalive frames.
+    let mut got_response = false;
+    let deadline = sent_at + Duration::from_millis(700);
+    while tokio::time::Instant::now() < deadline && !got_response {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, socket.next()).await {
+            Ok(Some(Ok(tungstenite::Message::Text(text)))) => {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                if msg["type"] == "response" && msg["id"] == "slow-1" {
+                    assert_eq!(msg["payload"], json!({"slow":true}), "{msg}");
+                    got_response = true;
+                }
+            }
+            Ok(Some(Ok(tungstenite::Message::Ping(bytes)))) => {
+                let _ = socket.send(tungstenite::Message::Pong(bytes)).await;
+            }
+            Ok(Some(Ok(tungstenite::Message::Pong(_)))) => {}
+            Ok(Some(Ok(tungstenite::Message::Close(frame)))) => {
+                panic!("closed before delayed response arrived: {frame:?}");
+            }
+            Ok(Some(Err(e))) => panic!("socket error before response: {e}"),
+            Ok(None) => panic!("socket ended before response"),
+            Err(_) => break,
+            Ok(Some(Ok(other))) => panic!("unexpected {other:?}"),
+        }
+    }
+    assert!(got_response, "delayed response never arrived");
+    let after_response = tokio::time::Instant::now();
+    assert!(
+        after_response.duration_since(sent_at) >= Duration::from_millis(120),
+        "response arrived too fast to distinguish request vs response idle: {:?}",
+        after_response.duration_since(sent_at),
+    );
+
+    // Still open past the request-relative idle window (request + 120ms).
+    let past_request_idle = sent_at + Duration::from_millis(250);
+    while tokio::time::Instant::now() < past_request_idle {
+        let left = past_request_idle.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, socket.next()).await {
+            Ok(Some(Ok(tungstenite::Message::Ping(bytes)))) => {
+                let _ = socket.send(tungstenite::Message::Pong(bytes)).await;
+            }
+            Ok(Some(Ok(tungstenite::Message::Pong(_)))) => {}
+            Ok(Some(Ok(tungstenite::Message::Close(frame)))) => {
+                panic!(
+                    "idle closed on request clock despite response refresh (elapsed since request {:?}): {frame:?}",
+                    tokio::time::Instant::now().duration_since(sent_at),
+                );
+            }
+            Ok(Some(Ok(tungstenite::Message::Text(_)))) => {}
+            Ok(Some(Err(_))) | Ok(None) => panic!("socket dropped while proving response refresh"),
+            Err(_) => {} // timeout until past_request_idle — expected
+            Ok(Some(Ok(other))) => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // After responses stop, application idle measured from the response must still reap.
+    let close_deadline = after_response + Duration::from_secs(2);
+    loop {
+        let left = close_deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, socket.next()).await {
+            Err(_) => panic!("idle agent was not closed after response went idle"),
+            Ok(None) | Ok(Some(Err(_))) => panic!("agent dropped without close frame"),
+            Ok(Some(Ok(tungstenite::Message::Ping(_)))) => {}
+            Ok(Some(Ok(tungstenite::Message::Pong(_)))) => {}
+            Ok(Some(Ok(tungstenite::Message::Text(_)))) => {}
+            Ok(Some(Ok(tungstenite::Message::Close(frame)))) => {
+                let frame = frame.expect("close frame");
+                assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1001, "idle timeout"));
+                assert!(
+                    tokio::time::Instant::now().duration_since(after_response) >= Duration::from_millis(150),
+                    "closed too early after response",
+                );
                 return;
             }
             Ok(Some(Ok(other))) => panic!("unexpected {other:?}"),

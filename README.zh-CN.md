@@ -17,7 +17,7 @@ Rex Gateway 是放在你自己的一台或多台 Rex 服务器前面的控制面
 ## 它做什么
 
 - 在 WebSocket 升级之前，用 Bearer 令牌认证 `GET /api/control`、`GET /api/data` 和 `GET /status`。
-- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **26**。
+- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **27**。
 - 把 `session.list` 并发发到每个允许的上游，并给会话 id 加上上游 id 前缀。
 - 带上游前缀的会话调用回到那台上游；没有会话 id 的 `session.create` 和其他无主机调用按[路由与故障转移](#路由与故障转移)处理。
 - 把嵌套的 `ticket` 字符串换成一次性网关票据，并按消息原样桥接 `rex.data.terminal.v1`。
@@ -161,7 +161,7 @@ avoid_hosts = []
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 26,
+  "api_server_revision": 27,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -188,7 +188,7 @@ avoid_hosts = []
 
 **粘滞调用。** 载荷里的 `session_id` 若是 `<上游>:session:…`，只发给那台上游，并去掉前缀。该 id 必须在 ACL 内。`Offline` 或 `Unknown` 返回 `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`。这条路径没有故障转移。
 
-**创建。** 没有 `session_id` 也没有 `host`：网关按标签和主机偏好，在仍接受创建、且为 `Online` 或 `Degraded` 的上游里预留一台，然后调用它。传输失败会释放预留、标记该上游，并尝试下一个候选。应用层错误或载荷里的 `host` 不会这样做。被钉住的 `host` 若是 `Offline` 或 `Unknown`，返回 `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host`（这时还没有会话可以删）。
+**创建。** 没有 `session_id` 也没有 `host`：网关按标签和主机偏好，在仍接受创建、且为 `Online` 或 `Degraded` 的上游里预留一台，然后调用它。传输失败会释放预留、标记该上游，并尝试下一个候选。应用层错误或载荷里的 `host` 不会这样做。被钉住的 `host` 若是 `Offline` 或 `Unknown`，返回 `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host`（这时还没有会话可以删）。其他只带 `host`、没有带前缀 `session_id` 的方法（例如 `server.version`）在同样状态下使用同一句钉住主机的文案。
 
 **其他无主机调用。** 没有 `session_id` 也没有 `host`（例如 `server.version`，以及其他同类方法）：先 `Manual` 后发现来的主机，先 `Online` 后 `Degraded`，再按上游 id。同样只对传输错误做故障转移。
 
@@ -198,7 +198,7 @@ avoid_hosts = []
 
 ## 开发与测试
 
-`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、票据退回、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码、事件滞后通知，以及控制面在途 RPC 上限。
+`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、票据退回、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码、事件滞后通知、控制响应刷新空闲、钉住主机离线文案，以及控制面在途 RPC 上限。
 
 ```sh
 cargo test --locked
@@ -335,7 +335,7 @@ cargo build --locked
 
 选择和预留计数共用一把互斥锁，重叠的 create 能看见彼此的预留。预留保持到这次尝试结束，或过了 `create_reservation_ttl_ms`（默认 5000），并在下一次选择和 `GET /status` 时回收。传输失败会丢掉预留并继续。给 agent 的耗尽字符串是 `session.create failed on all candidates: <id>: <reason>; …`。
 
-任何方法（包括 create）的载荷 `host` 都会跳过打分、预留和故障转移。它必须在 ACL 内且可路由。它可以指向一台已经不再接受自动创建的已发现上游。未知 id：`upstream <id> is unknown`。ACL 拒绝：`upstream <id> is not allowed`。`session.create` 打到 `Offline` 或 `Unknown` 时返回 `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host`。带前缀的会话调用在同样状态下仍然返回 `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`。
+任何方法（包括 create）的载荷 `host` 都会跳过打分、预留和故障转移。它必须在 ACL 内且可路由。它可以指向一台已经不再接受自动创建的已发现上游。未知 id：`upstream <id> is unknown`。ACL 拒绝：`upstream <id> is not allowed`。带 `host`、且没有带前缀 `session_id` 的调用（包括 `session.create` 和 `server.version`）打到 `Offline` 或 `Unknown` 时返回 `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host`。带前缀的会话调用在同样状态下仍然返回 `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`。
 
 会触发故障转移的传输错误是控制客户端的错误：连接失败、超时、缺少客户端、套接字关闭，以及重连退避期间的 `upstream unavailable (retry in <ms> ms): …`。连接失败后的退避从 200 ms 起翻倍，最高 5 秒。等待期间调用会快速失败并带上这段 `retry in` 文本，而不是立刻再拨。
 
@@ -497,7 +497,7 @@ store_path = "rex-gateway-discovered.json"
 
 什么算活动并不相同：
 
-- Agent 控制连接的空闲看的是应用数据。入站文本会刷新它。成功转发的上游事件也会，合成的 `events_lagged` 通知也会。入站 ping 和 pong 不算。正在收到事件或滞后通知的 agent 会保持连接。若在 `ws_idle_timeout_ms`（默认 120 秒）内这些都没有，即使保活 ping 还在发，也会以 `1001` `idle timeout` 关闭。
+- Agent 控制连接的空闲看的是应用数据。入站文本会刷新它。成功送达的控制面响应、成功转发的上游事件，以及合成的 `events_lagged` 通知也会。入站 ping 和 pong 不算。正在收到响应、事件或滞后通知的 agent 会保持连接。若在 `ws_idle_timeout_ms`（默认 120 秒）内这些都没有，即使保活 ping 还在发，也会以 `1001` `idle timeout` 关闭。
 - 上游控制客户端把入站 ping、pong 和文本都算作活动。网关发出的 ping 得到 pong 后，可以维持这条套接字。空闲时它以 `1001` `idle timeout` 关闭上游，并把这条套接字上尚未完成的调用失败为 `upstream idle timeout`。
 - 数据桥在任一方向的二进制或文本上刷新，ping 和 pong 不算。空闲时两侧都以 `1001` `idle timeout` 关闭。
 
