@@ -161,7 +161,7 @@ avoid_hosts = []
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 32,
+  "api_server_revision": 33,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -186,7 +186,7 @@ avoid_hosts = []
 
 **列举。** `session.list` 忽略载荷。每个 ACL 允许、且状态为 `Online` 或 `Degraded` 的上游会被同时查询。结果按上游 id 顺序拼接，每台 Rex 自己的顺序保持不变。`Offline` 和 `Unknown` 被跳过。部分失败会多出 `partial: true`、`failed_upstreams` 和 `upstream_errors`。允许的上游全部失败时，错误是 `all upstreams failed: …`。ACL 什么都不允许时返回 `{"sessions":[]}`。
 
-**粘滞调用。** 载荷里的 `session_id` 若是 `<上游>:session:…`，只发给那台上游，并去掉前缀。该 id 必须在 ACL 内。`Offline` 或 `Unknown` 返回 `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`。这条路径没有故障转移。
+**粘滞调用。** 载荷里的 `session_id` 若是 `<上游>:session:…`，只发给那台上游。转发出去之前会去掉顶层前缀，以及属于该上游的每一个嵌套 `session_id`。嵌套 id 若属于别的上游，则报错。顶层 id 必须在 ACL 内。`Offline` 或 `Unknown` 返回 `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`。这条路径没有故障转移。
 
 **创建。** 没有 `session_id` 也没有 `host`：网关按标签和主机偏好，在仍接受创建、且为 `Online` 或 `Degraded` 的上游里预留一台，然后调用它。传输失败会释放预留、标记该上游，并尝试下一个候选。应用层错误或载荷里的 `host` 不会这样做。被钉住的 `host` 若是 `Offline` 或 `Unknown`，返回 `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host`（这时还没有会话可以删）。其他只带 `host`、没有带前缀 `session_id` 的方法（例如 `server.version`）在同样状态下使用同一句钉住主机的文案。
 
@@ -418,11 +418,13 @@ store_path = "rex-gateway-discovered.json"
 
 ```json
 [
-  {"source": "tailnet", "name": "Build Mac", "addr": "https://mac.example:7297", "mode": ""}
+  {"source": "tailnet", "name": "Build Mac", "addr": "https://mac.example:7297", "mode": "", "tags": ["macos", "perf"], "description": "CI Mac"}
 ]
 ```
 
 `mode` 被忽略。`source` 为 `tailnet`（不区分大小写）时成为 `Tailnet`；其他值包括空字符串都成为 `Lan`。`name` 会被整理成 id：ASCII 小写，保留字母、数字、`-` 和 `_`，其他字符收成单个 `-`，去掉首尾，空名字变成 `discovered`。`addr` 应是 HTTP(S) 基址；没有方案名时按 `https://` 处理。空地址被跳过。两条记录整理成同一个 id 时，后面的一条胜出。整理后的 id 若与某个 Manual id 相同，则跳过，不合并。
+
+可选字段 `tags`（字符串数组）和 `description`（字符串）是面向未来的 discover 扩展。存在时会像 Manual 元数据一样 upsert 进池，因此 `prefer_tags` 可以匹配已发现主机；它们也会写入 `store_path`，重启快照能保留。缺省时标签为空、无描述。未知 JSON 字段仍被忽略。标签环境变量仍然只作用于从 TOML 加载的 `[[upstreams]]` 条目。
 
 每次命令运行的上限是 `max(interval_ms, 60s)`。这一次结束或触顶之后才会开始下一次。非零退出或坏 JSON 保持原池不变，并设置 `discovery.last_error`（其中的 stderr 截断到 512 个字符）。文件不存在不是错误：`last_applied` 为 false，`refresh_count` 仍会增加。文件存在但读不了，才是错误。
 
@@ -509,7 +511,7 @@ store_path = "rex-gateway-discovered.json"
 - 监听是明文的。没有入站 TLS，没有双向 TLS，除了改 TOML 并重启之外也没有令牌吊销。
 - `reconnect_token` 不是会话。
 - 消息大小、在途 RPC、事件缓冲和探测超时是上面那些常数，不是配置项。
-- 已发现上游插入时没有标签、也没有描述。非空的 `prefer_tags` 匹配不到它们。标签环境变量只作用于从 TOML 加载的 `[[upstreams]]` 条目。
+- 没有 `tags` / `description` 的 discover JSON 仍会插入空元数据；只有自带这些字段的条目（或 Manual TOML / 环境覆盖）才会有标签。标签环境变量只作用于从 TOML 加载的 `[[upstreams]]` 条目。
 - 自动路由会跳过已撤回的已发现主机。显式 `host` 不会跳过。
 - forget、TTL 和容量上限不会删除 Rex 会话。之后的列举或事件会撤销 Rex 仍在报告的那个 id 的墓碑。
 - 活动时间戳要等会话回收器（或其他写入）跑过之后才落盘。

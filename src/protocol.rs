@@ -35,6 +35,44 @@ pub fn translate_session_id(value: &mut Value, upstream: &str, wrap: bool) -> bo
     true
 }
 
+/// Recursively strips gateway namespace prefixes from every nested `session_id` before the
+/// payload is forwarded to `upstream`. Bare `session:…` values (where [`unwrap_session_id`]
+/// returns `None`) are left alone. A namespaced id owned by a different upstream is an error.
+/// Values that contain `:` but are not a recognized namespaced form are left untouched —
+/// this helper never invents stripping.
+pub fn denamespace_request(value: &mut Value, upstream: &str) -> Result<(), String> {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                denamespace_request(item, upstream)?;
+            }
+        }
+        Value::Object(object) => {
+            for (key, item) in object.iter_mut() {
+                if key == "session_id" {
+                    if let Some(id) = item.as_str() {
+                        match unwrap_session_id(id) {
+                            None => {}
+                            Some((owner, real)) if owner == upstream => {
+                                *item = Value::String(real.to_owned());
+                            }
+                            Some((owner, _)) => {
+                                return Err(format!(
+                                    "mismatched nested session_id: owned by upstream {owner}, expected {upstream}"
+                                ));
+                            }
+                        }
+                    }
+                } else {
+                    denamespace_request(item, upstream)?;
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 /// Recursively wraps session references and replaces every nested data ticket with a
 /// gateway-issued ticket. Only well-known field names are interpreted.
 ///
@@ -219,6 +257,47 @@ mod tests {
         let mapped = map.take(value["ticket"].as_str().unwrap(), "bearer").unwrap();
         assert_eq!(mapped.upstream_ticket, "up-bare");
         assert_eq!(mapped.session_id.as_deref(), Some("local:session:req"));
+    }
+
+    #[test]
+    fn denamespace_strips_nested_matching_session_ids() {
+        let mut value = json!({
+            "session_id":"local:session:root",
+            "view":{"session_id":"local:session:view","label":"x"},
+            "alternates":[{"session_id":"local:session:child"},{"session_id":"session:bare"}],
+            "note":"local:session:not-a-field"
+        });
+        denamespace_request(&mut value, "local").unwrap();
+        assert_eq!(value["session_id"], "session:root");
+        assert_eq!(value["view"]["session_id"], "session:view");
+        assert_eq!(value["alternates"][0]["session_id"], "session:child");
+        assert_eq!(value["alternates"][1]["session_id"], "session:bare", "bare ids stay bare");
+        assert_eq!(value["note"], "local:session:not-a-field", "non-session_id fields untouched");
+    }
+
+    #[test]
+    fn denamespace_rejects_foreign_nested_owner() {
+        let mut value = json!({
+            "session_id":"local:session:root",
+            "view":{"session_id":"other:session:view"}
+        });
+        let err = denamespace_request(&mut value, "local").unwrap_err();
+        assert!(err.contains("other"), "{err}");
+        assert!(err.contains("expected local"), "{err}");
+        assert_eq!(value["session_id"], "session:root", "walk stops after first error but may have stripped earlier");
+    }
+
+    #[test]
+    fn denamespace_leaves_unrecognized_colon_values() {
+        let mut value = json!({
+            "session_id":"session:ok",
+            "view":{"session_id":"local:garbage"},
+            "meta":{"session_id":"not-a-session"}
+        });
+        denamespace_request(&mut value, "local").unwrap();
+        assert_eq!(value["session_id"], "session:ok");
+        assert_eq!(value["view"]["session_id"], "local:garbage");
+        assert_eq!(value["meta"]["session_id"], "not-a-session");
     }
 
     #[test]

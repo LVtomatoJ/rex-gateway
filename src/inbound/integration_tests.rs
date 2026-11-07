@@ -249,6 +249,49 @@ async fn spawn_fake_rex_frame_error(method: &str, error: Value) -> String {
     url
 }
 
+/// Fake Rex that echoes selected request fields under non-`session_id` keys so the gateway
+/// response path cannot re-wrap them. Used to prove outbound denamespace.
+async fn spawn_fake_rex_echo_forwarded_session_ids() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            tokio::spawn(async move {
+                let callback = |_: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+                    response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(SUBPROTOCOL));
+                    Ok(response)
+                };
+                let Ok(mut socket) = accept_hdr_async(stream, callback).await else { return };
+                while let Some(Ok(frame)) = socket.next().await {
+                    let tungstenite::Message::Text(text) = frame else { continue };
+                    let message: Value = serde_json::from_str(&text).unwrap();
+                    match message["type"].as_str() {
+                        Some("hello") => { let _ = socket.send(tungstenite::Message::Text(json!({"type":"welcome"}).to_string())).await; }
+                        Some("request") => {
+                            let payload = if message["method"] == "session.list" {
+                                json!({"sessions": []})
+                            } else {
+                                let req = &message["payload"];
+                                json!({
+                                    "ok": true,
+                                    "forwarded_top": req.get("session_id").cloned().unwrap_or(Value::Null),
+                                    "forwarded_view": req.pointer("/view/session_id").cloned().unwrap_or(Value::Null),
+                                    "forwarded_child": req.pointer("/alternates/0/session_id").cloned().unwrap_or(Value::Null),
+                                })
+                            };
+                            let reply = json!({"type":"response","id":message["id"],"payload":payload});
+                            let _ = socket.send(tungstenite::Message::Text(reply.to_string())).await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+    url
+}
+
 async fn rpc_frame(socket: &mut Agent, method: &str, payload: Value) -> Value {
     socket.send(tungstenite::Message::Text(json!({"type":"request","id":"r1","method":method,"payload":payload}).to_string())).await.unwrap();
     let raw = loop {
@@ -349,7 +392,7 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let welcome: Value = serde_json::from_str(&welcome).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["api_server_revision"], 32);
+    assert_eq!(welcome["api_server_revision"], 33);
     assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
@@ -1557,6 +1600,39 @@ async fn hostless_all_transport_failures_aggregate_error() {
     assert_eq!(snap.hostless_failover_exhausted, 1, "{snap:?}");
 }
 
+
+#[tokio::test]
+async fn nested_session_ids_are_denamespaced_before_upstream() {
+    let live = spawn_fake_rex_echo_forwarded_session_ids().await;
+    let h = start_gateway(&[("local", &live)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    wait_state(&h.pool, "local", UpstreamState::Online).await;
+    let mut socket = control_agent(h.addr).await;
+    h.state.sessions.record("local", "session:root");
+    let reply = rpc(&mut socket, "session.rename", json!({
+        "session_id":"local:session:root",
+        "view":{"session_id":"local:session:view","label":"x"},
+        "alternates":[{"session_id":"local:session:child"}]
+    })).await;
+    assert_eq!(reply["forwarded_top"], "session:root", "{reply}");
+    assert_eq!(reply["forwarded_view"], "session:view", "{reply}");
+    assert_eq!(reply["forwarded_child"], "session:child", "{reply}");
+}
+
+#[tokio::test]
+async fn foreign_nested_session_id_is_rejected() {
+    let live = spawn_fake_rex_echo_forwarded_session_ids().await;
+    let h = start_gateway(&[("local", &live)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    wait_state(&h.pool, "local", UpstreamState::Online).await;
+    let mut socket = control_agent(h.addr).await;
+    h.state.sessions.record("local", "session:root");
+    let reply = rpc(&mut socket, "session.rename", json!({
+        "session_id":"local:session:root",
+        "view":{"session_id":"other:session:view"}
+    })).await;
+    let err = reply["error"].as_str().unwrap_or("");
+    assert!(err.contains("other"), "{reply}");
+    assert!(err.contains("expected local") || err.contains("mismatched"), "{reply}");
+}
 
 #[tokio::test]
 async fn forwards_rex_frame_level_errors_without_decorating() {

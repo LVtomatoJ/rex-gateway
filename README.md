@@ -161,7 +161,7 @@ Welcome shape (ids are new on every connection):
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 32,
+  "api_server_revision": 33,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -186,7 +186,7 @@ Short version. Exact order, errors, and counters are below.
 
 **List.** `session.list` ignores its payload. Every ACL-allowed upstream that is `Online` or `Degraded` is queried at once. Results are concatenated in upstream-id order, keeping each Rex host's own order. `Offline` and `Unknown` are skipped. A partial failure adds `partial: true`, `failed_upstreams`, and `upstream_errors`. If every allowed upstream fails, the call errors with `all upstreams failed: …`. An ACL that names nothing returns `{"sessions":[]}`.
 
-**Sticky call.** A payload `session_id` of the form `<upstream>:session:…` goes only to that upstream, with the prefix removed. The id must be allowed. `Offline` or `Unknown` returns `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`. There is no failover.
+**Sticky call.** A payload `session_id` of the form `<upstream>:session:…` goes only to that upstream. The top-level prefix and every nested `session_id` owned by that upstream are stripped before the call is forwarded. A nested id owned by a different upstream is an error. The top-level id must be allowed. `Offline` or `Unknown` returns `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`. There is no failover.
 
 **Create.** No `session_id` and no `host`: the gateway reserves the best `Online` or `Degraded` upstream that still accepts creates, under your tag and host preferences, then calls it. A transport failure releases the reservation, marks that upstream, and tries the next candidate. An application error or a payload `host` does not. A pinned `host` that is `Offline` or `Unknown` returns `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host` (there is no session to remove yet). The same pinned-host Offline copy applies to every other method that names `host` without a namespaced `session_id` (for example `server.version`).
 
@@ -418,11 +418,13 @@ This repository does not include `rex-discover`, `rex`, or `tailscale`. `command
 
 ```json
 [
-  {"source": "tailnet", "name": "Build Mac", "addr": "https://mac.example:7297", "mode": ""}
+  {"source": "tailnet", "name": "Build Mac", "addr": "https://mac.example:7297", "mode": "", "tags": ["macos", "perf"], "description": "CI Mac"}
 ]
 ```
 
 `mode` is ignored. `source` of `tailnet` (any case) becomes `Tailnet`; every other value, including empty, becomes `Lan`. `name` is sanitized to an id: ASCII lower case, letters, digits, `-` and `_` kept, other characters become a single `-`, trimmed, and empty names become `discovered`. `addr` must be an HTTP(S) base; a missing scheme is treated as `https://`. Empty addresses are skipped. Two entries that sanitize to the same id: the later one wins. A sanitized id that equals a Manual id is skipped, not merged.
+
+Optional `tags` (string array) and `description` (string) are forward-compatible discover fields. When present they are upserted into the pool like Manual metadata, so `prefer_tags` can match discovered hosts, and they are written into `store_path` so a restart snapshot keeps them. Missing fields default to empty tags and no description. Unknown JSON fields are ignored. Tag environment overrides still apply only to `[[upstreams]]` entries loaded from TOML.
 
 Each command run is limited to `max(interval_ms, 60s)`. The next run waits until this one finishes or hits that limit. Nonzero exit or bad JSON leaves the pool as it was and sets `discovery.last_error` (stderr in that string is truncated to 512 characters). A missing file is not an error: `last_applied` is false and `refresh_count` still increases. A present file that cannot be read is an error.
 
@@ -509,7 +511,7 @@ What counts as activity differs:
 - Plaintext listen socket. No inbound TLS, no mutual TLS, no token revocation short of editing TOML and restarting.
 - `reconnect_token` is not a session.
 - Message size, in-flight RPCs, event buffer, and probe timeouts are the constants above, not config.
-- Discovered upstreams are inserted with no tags and no description. A non-empty `prefer_tags` list cannot match them. Tag environment overrides apply only to `[[upstreams]]` entries loaded from TOML.
+- Discover JSON without `tags` / `description` still inserts empty metadata; only entries that carry those fields (or Manual TOML / env overrides) get tags. Tag environment overrides apply only to `[[upstreams]]` entries loaded from TOML.
 - Automatic routing skips a withdrawn discovered host. An explicit `host` does not.
 - Forget, TTL, and the capacity cap do not delete Rex sessions. A later list or event undoes the tombstone for an id Rex still reports.
 - Activity timestamps are durable only after the session reaper (or another write) runs.

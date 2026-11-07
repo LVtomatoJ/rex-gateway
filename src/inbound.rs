@@ -30,7 +30,7 @@ use crate::{
     pool::UpstreamPool,
     status,
     sessions::{SessionStore, FORGOTTEN_ERROR},
-    protocol::{namespace_and_record, translate_session_id, MAX_MESSAGE_BYTES, SUBPROTOCOL},
+    protocol::{denamespace_request, namespace_and_record, translate_session_id, MAX_MESSAGE_BYTES, SUBPROTOCOL},
 };
 
 const DATA_SUBPROTOCOL: &str = "rex.data.terminal.v1";
@@ -180,7 +180,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":32});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":33});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -358,9 +358,12 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
         }
         return Err(format!("upstream {owner_upstream} is {}; the owning upstream is unavailable, remove/recreate this session", upstream.state.as_str()));
     }
+    // Top-level sticky routing above still used the external namespaced id. Strip the top-level
+    // prefix first (same validation as before), then recursively strip nested session_ids.
     if payload.get("session_id").is_some() && !translate_session_id(&mut payload, &owner_upstream, false) {
         return Err("invalid or mismatched namespaced session_id".into());
     }
+    denamespace_request(&mut payload, &owner_upstream)?;
     if let Some(object) = payload.as_object_mut() {
         object.remove("host"); object.remove("prefer_tags"); object.remove("avoid_tags");
         object.remove("prefer_hosts"); object.remove("avoid_hosts");
@@ -443,8 +446,13 @@ async fn create_with_failover(
             }
         };
         let id = upstream.id.clone();
+        let mut attempt = payload.clone();
+        if let Err(e) = denamespace_request(&mut attempt, &id) {
+            drop(reserved);
+            return Err(e);
+        }
         let call = match state.clients.get(&id) {
-            Some(client) => client.call("session.create", payload.clone()).await.map_err(|e| e.to_string()),
+            Some(client) => client.call("session.create", attempt).await.map_err(|e| e.to_string()),
             None => Err("upstream client missing".into()),
         };
         match call {
@@ -508,8 +516,12 @@ async fn hostless_with_failover(
             return Err(format!("{method} failed on all candidates: {detail}"));
         };
         let id = upstream.id.clone();
+        let mut attempt = payload.clone();
+        if let Err(e) = denamespace_request(&mut attempt, &id) {
+            return Err(e);
+        }
         let call = match state.clients.get(&id) {
-            Some(client) => client.call(method, payload.clone()).await.map_err(|e| e.to_string()),
+            Some(client) => client.call(method, attempt).await.map_err(|e| e.to_string()),
             None => Err("upstream client missing".into()),
         };
         match call {

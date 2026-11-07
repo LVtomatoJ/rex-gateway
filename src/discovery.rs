@@ -37,6 +37,12 @@ struct DiscoverEntry {
     addr: String,
     #[serde(default)]
     mode: String,
+    /// Optional capability tags (forward-compat with richer discover JSON).
+    #[serde(default)]
+    tags: Vec<String>,
+    /// Optional human-readable description.
+    #[serde(default)]
+    description: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +50,8 @@ pub struct ParsedUpstream {
     pub id: String,
     pub url: String,
     pub source: Source,
+    pub tags: Vec<String>,
+    pub description: Option<String>,
 }
 
 
@@ -185,7 +193,13 @@ pub fn parse_discover_json(text: &str) -> Result<Vec<ParsedUpstream>, String> {
         let id = sanitize_id(&entry.name);
         let Some(url) = normalize_url(&entry.addr) else { continue };
         let source = parse_source(&entry.source);
-        out.push(ParsedUpstream { id, url, source });
+        out.push(ParsedUpstream {
+            id,
+            url,
+            source,
+            tags: entry.tags,
+            description: entry.description,
+        });
         let _ = entry.mode; // retained for forward-compat with rex-discover output
     }
     Ok(out)
@@ -206,6 +220,8 @@ fn write_store_atomic(path: &Path, entries: &[ParsedUpstream]) -> Result<(), Str
             "name": e.id,
             "addr": e.url,
             "mode": "",
+            "tags": e.tags,
+            "description": e.description,
         })
     }).collect();
     let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
@@ -243,7 +259,7 @@ pub async fn apply(
             Some(existing) => existing.url != entry.url,
             None => true,
         };
-        pool.upsert_with_metadata(&entry.id, &entry.url, entry.source, Vec::new(), None).await;
+        pool.upsert_with_metadata(&entry.id, &entry.url, entry.source, entry.tags.clone(), entry.description.clone()).await;
         if url_changed || !clients.contains(&entry.id) {
             let client = Arc::new(ControlClient::new(
                 entry.id.clone(), entry.url.clone(), client_options, events.clone(),
@@ -409,9 +425,29 @@ mod tests {
             {"source":"tailnet","name":"omarchy-rex","addr":"https://omarchy-rex.tail.ts.net","mode":"builtin-443"},
             {"source":"LAN","name":"lan-42","addr":"192.168.1.42:7297","mode":"7297"}
         ]"#).unwrap();
-        assert_eq!(parsed[0], ParsedUpstream { id: "omarchy-rex".into(), url: "https://omarchy-rex.tail.ts.net".into(), source: Source::Tailnet });
+        assert_eq!(parsed[0], ParsedUpstream {
+            id: "omarchy-rex".into(),
+            url: "https://omarchy-rex.tail.ts.net".into(),
+            source: Source::Tailnet,
+            tags: vec![],
+            description: None,
+        });
         assert_eq!(parsed[1].source, Source::Lan);
         assert_eq!(parsed[1].url, "https://192.168.1.42:7297");
+        assert!(parsed[1].tags.is_empty());
+        assert!(parsed[1].description.is_none());
+    }
+
+    #[test]
+    fn parse_optional_tags_and_description() {
+        let parsed = parse_discover_json(r#"[
+            {"source":"tailnet","name":"Build Mac","addr":"https://mac.example:7297","mode":"","tags":["macos","perf"],"description":"CI Mac"},
+            {"source":"lan","name":"plain","addr":"http://10.0.0.1:7297","mode":"7297"}
+        ]"#).unwrap();
+        assert_eq!(parsed[0].tags, vec!["macos".to_string(), "perf".to_string()]);
+        assert_eq!(parsed[0].description.as_deref(), Some("CI Mac"));
+        assert!(parsed[1].tags.is_empty());
+        assert!(parsed[1].description.is_none());
     }
 
     #[tokio::test]
@@ -468,6 +504,40 @@ mod tests {
         let reloaded = read_path(&store).unwrap();
         assert_eq!(reloaded[0].id, "again");
         assert_eq!(reloaded[0].source, Source::Lan);
+    }
+
+    #[tokio::test]
+    async fn apply_updates_tags_and_description_and_store_keeps_them() {
+        let dir = tempdir().unwrap();
+        let pool = UpstreamPool::new();
+        let clients = ClientMap::new();
+        let sessions = SessionStore::open(dir.path().join("sessions.json"), Duration::from_secs(60), 16).unwrap();
+        let (events, _) = broadcast::channel(8);
+        let opts = Options { call_timeout: Duration::from_millis(50), ping_interval: Duration::from_secs(10), idle_timeout: Duration::from_secs(30) };
+
+        let entries = parse_discover_json(r#"[
+            {"source":"lan","name":"box-a","addr":"http://10.0.0.1:7297","mode":"7297","tags":["perf"],"description":"fast box"}
+        ]"#).unwrap();
+        apply(&pool, &clients, Some(&sessions), &entries, opts, events.clone()).await;
+        let u = pool.get("box-a").await.unwrap();
+        assert_eq!(u.tags, vec!["perf".to_string()]);
+        assert_eq!(u.description.as_deref(), Some("fast box"));
+
+        // Refresh updates metadata
+        let entries = parse_discover_json(r#"[
+            {"source":"lan","name":"box-a","addr":"http://10.0.0.1:7297","mode":"7297","tags":["perf","ci"],"description":"CI + compile"}
+        ]"#).unwrap();
+        apply(&pool, &clients, Some(&sessions), &entries, opts, events.clone()).await;
+        let u = pool.get("box-a").await.unwrap();
+        assert_eq!(u.tags, vec!["perf".to_string(), "ci".to_string()]);
+        assert_eq!(u.description.as_deref(), Some("CI + compile"));
+
+        let store = dir.path().join("store.json");
+        write_store_atomic(&store, &entries).unwrap();
+        let reloaded = read_path(&store).unwrap();
+        assert_eq!(reloaded[0].tags, vec!["perf".to_string(), "ci".to_string()]);
+        assert_eq!(reloaded[0].description.as_deref(), Some("CI + compile"));
+        assert_eq!(reloaded[0].id, "box-a");
     }
 
     #[tokio::test]
