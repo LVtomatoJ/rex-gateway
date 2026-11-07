@@ -17,7 +17,7 @@ It is a single Rust binary in this repository (`rex-gateway`). It does not embed
 ## What it does
 
 - Authenticates `GET /api/control`, `GET /api/data`, and `GET /status` with a bearer token before any WebSocket upgrade.
-- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **21**.
+- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **24**.
 - Fans `session.list` out to every allowed upstream and prefixes session ids with the upstream id.
 - Routes a namespaced session call back to that upstream, and routes a hostless `session.create` or other hostless call with the rules in [Routing and failover](#routing-and-failover).
 - Rewrites nested `ticket` strings to single-use gateway tickets and bridges `rex.data.terminal.v1` byte-for-byte.
@@ -161,7 +161,7 @@ Welcome shape (ids are new on every connection):
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 21,
+  "api_server_revision": 24,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -188,7 +188,7 @@ Short version. Exact order, errors, and counters are below.
 
 **Sticky call.** A payload `session_id` of the form `<upstream>:session:…` goes only to that upstream, with the prefix removed. The id must be allowed. `Offline` or `Unknown` returns `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`. There is no failover.
 
-**Create.** No `session_id` and no `host`: the gateway reserves the best `Online` or `Degraded` upstream that still accepts creates, under your tag and host preferences, then calls it. A transport failure releases the reservation, marks that upstream, and tries the next candidate. An application error or a payload `host` does not.
+**Create.** No `session_id` and no `host`: the gateway reserves the best `Online` or `Degraded` upstream that still accepts creates, under your tag and host preferences, then calls it. A transport failure releases the reservation, marks that upstream, and tries the next candidate. An application error or a payload `host` does not. A pinned `host` that is `Offline` or `Unknown` returns `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host` (there is no session to remove yet).
 
 **Other hostless calls.** No `session_id` and no `host` (`server.version` and anything else): try `Manual` before discovered, `Online` before `Degraded`, then upstream id. Same transport-only failover.
 
@@ -198,14 +198,14 @@ Short version. Exact order, errors, and counters are below.
 
 ## Development
 
-`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes, and the control-plane in-flight bound.
+`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes, event-lag notices, and the control-plane in-flight bound.
 
 ```sh
 cargo test --locked
 cargo build --locked
 ```
 
-On this tree, `cargo test --locked` passed 114 tests with rustc 1.99.1. `--locked` keeps the build on `Cargo.lock`; Cargo 1.83 cannot parse it.
+On this tree, `cargo test --locked` passed 125 tests with rustc 1.99.1. `--locked` keeps the build on `Cargo.lock`; Cargo 1.83 cannot parse it.
 
 The live scripts assume the repository root as the working directory, `127.0.0.1:7300`, and token `smoke-secret`. They are not part of `cargo test`.
 
@@ -290,7 +290,13 @@ Gateway failures use `payload.error` as a string. Rex frame errors (`{"code","me
 
 `seq` is one counter per agent connection for responses and events, assigned when the frame is written. The agent `id` is echoed by the gateway and is not the id used on the upstream socket. Upstream calls use a new UUID. Events and responses can therefore interleave in `seq` order.
 
-Events whose upstream the token cannot access are dropped. Each forwarded copy is namespaced once for that agent, so each agent gets its own gateway tickets. The broadcast channel holds 1024 events. A slow agent skips the gap; `events_lagged` adds that gap's count. `events_forwarded` counts successful sends, so several agents count several times for one upstream event.
+Events whose upstream the token cannot access are dropped. Each forwarded copy is namespaced once for that agent, so each agent gets its own gateway tickets. The broadcast channel holds 1024 events. A slow agent skips the gap. `events_lagged` adds that gap's count (`RecvError::Lagged(n)` adds `n`). The agent also gets one synthetic event, which shares the same `seq` counter:
+
+```json
+{"type":"event","seq":1,"payload":{"gateway":{"notice":"events_lagged","skipped":4}}}
+```
+
+Missed upstream events are not replayed. `events_forwarded` counts successful sends of upstream events only, so several agents count several times for one upstream event, and the lag notice is not included. `skipped` is a JSON number (the `u64` count).
 
 `session.list` rewrites nested `session_id` and `ticket` fields the same way other responses do. Items without a string `session_id` that starts with `session:` are dropped.
 
@@ -329,7 +335,7 @@ Explicit unusable preferences return:
 
 Selection and the reservation counter share one mutex, so overlapping creates see each other's reservation. The reservation lasts until the attempt finishes or `create_reservation_ttl_ms` (default 5000) passes, and is reaped on the next selection and on `GET /status`. A transport failure drops it and continues. The agent-facing exhaustion string is `session.create failed on all candidates: <id>: <reason>; …`.
 
-A payload `host` on any method, including create, skips scoring, reservations, and failover. It must be ACL-allowed and routable. It may name a discovered upstream that no longer accepts automatic creates. Unknown id: `upstream <id> is unknown`. ACL miss: `upstream <id> is not allowed`.
+A payload `host` on any method, including create, skips scoring, reservations, and failover. It must be ACL-allowed and routable. It may name a discovered upstream that no longer accepts automatic creates. Unknown id: `upstream <id> is unknown`. ACL miss: `upstream <id> is not allowed`. `Offline` or `Unknown` on `session.create` returns `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host`. The same states on a namespaced session call still return `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`.
 
 Transport errors that do failover are the control client's errors: connect failure, timeout, missing client, socket closed, and `upstream unavailable (retry in <ms> ms): …` while reconnect backoff is in effect. Backoff after a failed connect is 200 ms, doubled, capped at 5 seconds. During the wait the call fails fast with that `retry in` text instead of dialing again.
 
@@ -341,7 +347,7 @@ While an upstream is backing off, new calls fail until `retry in` elapses. The c
 
 `GET /api/data` uses `rex.data.terminal.v1` and the same bearer header. Auth runs before the upgrade. The control socket does not have to stay open for the data socket to run. Upstream Rex may still have its own attach lifetime; this gateway does not close the data bridge just because the control socket closed. `smoke_data.py` checks that order.
 
-Every nested string field named `ticket` in a response or event is replaced with a new 16-byte id, base64url without padding. The real upstream ticket stays in memory, bound to the bearer, single-use, and unused for at most `ticket_ttl_ms`. At `ticket_max` pending tickets the oldest is evicted. The reaper period is half the TTL, clamped to 50 ms … 5 seconds. Expiry is also checked on use.
+Every nested string field named `ticket` in a response or event is replaced with a new 16-byte id, base64url without padding. The real upstream ticket stays in memory, bound to the bearer, single-use, and unused for at most `ticket_ttl_ms`. Each rewritten ticket is also bound to the nearest enclosing namespaced `session_id` in that JSON object (a nested object's own `session_id` wins over its parent). A `data.connect` payload that has a ticket and no `session_id` of its own uses the request's session id. That covers tickets from `session.list`, `session.bootstrap`, `session.create`, events, and `data.connect`. At `ticket_max` pending tickets the oldest is evicted. The reaper period is half the TTL, clamped to 50 ms … 5 seconds. Expiry is also checked on use.
 
 The agent HELLO is the byte `0x01` plus those 16 raw bytes. The gateway then dials the owner's `/api/data` and sends `0x01` plus the decoded upstream ticket. After that, binary, text, ping, pong, and close frames are forwarded, including close code and reason. The gateway does not parse terminal bytes. It forwards each WebSocket message as one message; it does not promise to preserve fragment boundaries inside a message.
 
@@ -351,17 +357,17 @@ The agent HELLO is the byte `0x01` plus those 16 raw bytes. The gateway then dia
 | No HELLO within `data_connect_timeout_ms` | Binary `0x82 0x05`, close `1008` `HELLO timeout` |
 | HELLO not `0x01` plus 16 bytes | Binary `0x82 0x05`, close `1002` `malformed HELLO` |
 | Unknown, expired, evicted, already used | Binary `0x82 0x01`, close `1008` `bad or used ticket`. Wrong owner is the same response and does not burn the ticket |
-| Ticket's session reference is forgotten | Close `1008` `session reference expired/forgotten` (ticket already consumed) |
-| Owner upstream missing from the pool | Close `1011` `upstream unavailable` |
-| Upstream dial exceeds `data_connect_timeout_ms` | Close `1011` `upstream connect timeout` |
-| Upstream dial fails | Close `1011` `upstream connection failed` |
-| Stored upstream ticket is not base64url | Close `1011` `invalid upstream ticket` |
+| Ticket's session reference is forgotten | Close `1008` `session reference expired/forgotten`. Ticket stays spent and is not restored |
+| Owner upstream missing, or its data URL is not a client request | Close `1011` `upstream unavailable`. Ticket restored |
+| Upstream dial exceeds `data_connect_timeout_ms` | Close `1011` `upstream connect timeout`. Ticket restored |
+| Upstream dial fails | Close `1011` `upstream connection failed`. Ticket restored |
+| Stored upstream ticket is not base64url, after the upstream socket is open | Close `1011` `invalid upstream ticket`. Ticket stays spent |
 | Upstream data socket ends without a Close | Close `1011` `upstream offline` if the pool says `Offline`, otherwise `upstream closed` |
 | Forwarding agent bytes to the upstream fails | Close `1011` `upstream closed` |
 | Agent drops without a Close, or agent send fails | Upstream close `1001` `peer closed` |
 | No binary or text for `ws_idle_timeout_ms` | Both sides close `1001` `idle timeout` |
 
-Stream caps are checked before the ticket is taken, so close `1013` leaves it usable. Forgotten-session, missing-upstream, dial, and bad-encoding failures happen after `take`, so that gateway ticket is already spent.
+Stream caps are checked before the ticket is taken, so close `1013` leaves it usable. A forgotten session is refused after `take` and the ticket stays spent. Connect-path failures before the upstream socket is open put that same external id back with its original creation time, so the TTL does not restart. `tickets_consumed` goes up on `take` and down by one on a successful restore. If the original TTL has already elapsed, restore does not put the ticket back and `tickets_expired` increases. A full map can evict some other oldest ticket to make room for the restored one (`tickets_evicted`). If that external id is already present, restore fails and this ticket stays spent. Once the upstream socket is open the ticket stays spent, including a bad base64 ticket and a failed send of the upstream HELLO (that send failure returns without its own close frame).
 
 Rex's own ACCEPT (`0x81…`) and REJECT frames are relayed once the bridge is up. The gateway does not invent an ACCEPT.
 
@@ -390,7 +396,7 @@ Default file `rex-gateway-sessions.json` (gitignored under that name). Writes ar
 
 `session.forget` requires a namespaced id, checks the ACL, adds the id to `forgotten`, and returns `{"forgotten":true|false,"session_id":"…"}`. `forgotten` is false when the id was not in `entries`. Repeating it is safe. The Rex session is not deleted.
 
-Later control calls, list, attach, `data.connect`, and relayed terminal bytes refresh `last_active_ms` in memory. The reaper is what persists those touches. Listing refreshes every session the list returned, and `record` removes that id from `forgotten`. A session Rex still lists therefore comes back after a forget or a TTL drop. An unknown but well-formed `<upstream>:session:…` is accepted for routing even if this file has never stored it (`resolve` does not insert it). A malformed id is `unknown session reference`. A forgotten id is `session reference expired/forgotten` on list/send/read/bootstrap/attach/`data.connect`. A data socket that already holds a ticket for that id closes with 1008 and the same reason.
+Later control calls, list, attach, `data.connect`, and relayed terminal bytes refresh `last_active_ms` in memory. The reaper is what persists those touches. Listing refreshes every session the list returned, and `record` removes that id from `forgotten`. A session Rex still lists therefore comes back after a forget or a TTL drop. An unknown but well-formed `<upstream>:session:…` is accepted for routing even if this file has never stored it (`resolve` does not insert it). A malformed id is `unknown session reference`. A forgotten id is `session reference expired/forgotten` on list/send/read/bootstrap/attach/`data.connect`. A data ticket bound to that id (from list, bootstrap, create, an event, or `data.connect`) closes with 1008 and the same reason, and that ticket is not restored.
 
 Upstream ids must not contain `:`. The prefix is split on the first colon, and the remainder must start with `session:`.
 
@@ -479,7 +485,7 @@ Illustrative shape (values depend on the running process):
 
 `state` is `Unknown`, `Online`, `Degraded`, or `Offline`. `source` is `Manual`, `Tailnet`, or `Lan`. `latency_ms` is the last probe latency, or null when that probe failed or none has run. `last_error` is the latest probe or failover error. A later probe that receives a `sessions` array clears it. `session_count` is the last probe's session array length, not a CPU reading. Rex probes do not report CPU.
 
-Gauges, current values: `pending_tickets`, `session_refs`, `session_forgotten`, `active_control_connections`, `active_data_streams`. The rest of `counters` increase for the life of the process. `tickets_expired` counts TTL removals. `tickets_evicted` counts capacity drops. `session_forgotten` shrinks again if a later list or event records that id.
+Gauges, current values: `pending_tickets`, `session_refs`, `session_forgotten`, `active_control_connections`, `active_data_streams`. `tickets_issued`, the failover counters, `events_lagged`, and `events_forwarded` increase for the life of the process. `tickets_consumed` increases on take and decreases when a connect-path failure restores the ticket. `tickets_expired` counts TTL removals, including a restore that finds the original TTL already elapsed. `tickets_evicted` counts capacity drops, including one done to make room for a restore. `events_lagged` is the sum of skipped upstream events. `events_forwarded` counts delivered upstream events and not the `events_lagged` notice. `session_forgotten` shrinks again if a later list or event records that id.
 
 `discovery.mode` is `command`, `file`, or `none`. Ages are null until that event has happened. `last_applied` is whether the last successful refresh changed the pool from a snapshot. Disabled discovery still returns the object with `enabled: false` and `mode: "none"`.
 
@@ -489,7 +495,7 @@ The gateway sends WebSocket pings every `ws_ping_interval_ms` (default 20 second
 
 What counts as activity differs:
 
-- Agent control idle looks only at inbound text frames. Inbound ping and pong do not refresh it, and neither do events the gateway is writing out. An agent that only receives events is closed with `1001` `idle timeout` after `ws_idle_timeout_ms` (default 120 seconds) unless it sends a text frame in that window.
+- Agent control idle is application-idle. Inbound text refreshes it. So does a successfully forwarded upstream event, and so does the synthetic `events_lagged` notice. Inbound ping and pong do not. An agent that receives events or lag notices stays up. An agent with none of that traffic for `ws_idle_timeout_ms` (default 120 seconds) is closed with `1001` `idle timeout`, even while keepalive pings are flowing.
 - The upstream control client treats inbound ping, pong, and text as activity. The gateway's pings, once ponged, keep that socket up. On idle it closes the upstream with `1001` `idle timeout` and fails in-flight calls on that socket with `upstream idle timeout`.
 - A data bridge refreshes on binary or text in either direction, not on ping or pong. Idle closes both sides with `1001` `idle timeout`.
 

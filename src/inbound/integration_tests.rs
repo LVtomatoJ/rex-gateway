@@ -281,9 +281,12 @@ async fn start_gateway_with_control_limits(upstreams: &[(&str, &str)], call_time
     start_gateway_with_store(upstreams,call_timeout,probe_every,data_timeout,Duration::from_secs(20),Duration::from_secs(120),128,32,max_control_connections,max_control_connections_per_token,None).await
 }
 async fn start_gateway_with_store(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration, ping_interval: Duration, idle_timeout: Duration, max_data_streams: usize, max_data_streams_per_token: usize, max_control_connections: usize, max_control_connections_per_token: usize, store: Option<crate::sessions::SessionStore>) -> Harness {
+    start_gateway_with_event_cap(upstreams, call_timeout, probe_every, data_timeout, ping_interval, idle_timeout, max_data_streams, max_data_streams_per_token, max_control_connections, max_control_connections_per_token, store, 32).await
+}
+async fn start_gateway_with_event_cap(upstreams: &[(&str, &str)], call_timeout: Duration, probe_every: Duration, data_timeout: Duration, ping_interval: Duration, idle_timeout: Duration, max_data_streams: usize, max_data_streams_per_token: usize, max_control_connections: usize, max_control_connections_per_token: usize, store: Option<crate::sessions::SessionStore>, event_cap: usize) -> Harness {
     let pool = UpstreamPool::new();
     let clients = ClientMap::new();
-    let (events, _) = broadcast::channel(32);
+    let (events, _) = broadcast::channel(event_cap.max(1));
     for (id, url) in upstreams {
         pool.upsert(id, url, Source::Manual).await;
         clients.insert((*id).to_owned(), Arc::new(ControlClient::new((*id).to_owned(), (*url).to_owned(), crate::control_client::Options { call_timeout, ping_interval, idle_timeout }, events.clone())));
@@ -346,7 +349,7 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let welcome: Value = serde_json::from_str(&welcome).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["api_server_revision"], 21);
+    assert_eq!(welcome["api_server_revision"], 24);
     assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
@@ -491,7 +494,7 @@ async fn data_plane_upstream_connect_timeout_closes_with_1011() {
     let held = tokio::spawn(async move { let mut keep = Vec::new(); while let Ok((s, _)) = stuck.accept().await { keep.push(s); } });
     let h = start_gateway(&[("stuck", &url)], tmo(300), Duration::from_secs(3600), tmo(300)).await;
     let external = h.state.tickets.insert("stuck", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
-    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, external).unwrap();
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
 
     let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
     socket.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat().into())).await.unwrap();
@@ -501,7 +504,43 @@ async fn data_plane_upstream_connect_timeout_closes_with_1011() {
         other => panic!("expected close, got {other:?}"),
     }
     assert!(started.elapsed() < Duration::from_secs(3));
+    // Connect-path failure restores the gateway ticket so the agent may retry until TTL.
+    assert_eq!(h.state.tickets.pending(), 1, "ticket restored after connect timeout");
+    let restored = h.state.tickets.take(&external, SECRET).expect("same ticket takeable again");
+    assert_eq!(restored.upstream, "stuck");
+    assert_eq!(restored.upstream_ticket, "AAAAAAAAAAAAAAAAAAAAAA");
     held.abort();
+}
+
+#[tokio::test]
+async fn data_plane_upstream_connection_failed_restores_ticket() {
+    // Nothing listens: TCP connect fails immediately → 1011 + ticket restored.
+    let h = start_gateway(&[("down", "http://127.0.0.1:9")], tmo(300), Duration::from_secs(3600), tmo(500)).await;
+    let external = h.state.tickets.insert("down", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
+    let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat().into())).await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(5), socket.next()).await.expect("must not hang").unwrap().unwrap() {
+        tungstenite::Message::Close(Some(frame)) => assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1011, "upstream connection failed")),
+        other => panic!("expected close, got {other:?}"),
+    }
+    assert_eq!(h.state.tickets.pending(), 1, "ticket restored after connection failed");
+    assert!(h.state.tickets.take(&external, SECRET).is_some());
+}
+
+#[tokio::test]
+async fn data_plane_missing_upstream_restores_ticket() {
+    let h = start_gateway(&[("a", "http://127.0.0.1:9")], tmo(300), Duration::from_secs(3600), tmo(300)).await;
+    let external = h.state.tickets.insert("gone", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
+    let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat().into())).await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(5), socket.next()).await.expect("must not hang").unwrap().unwrap() {
+        tungstenite::Message::Close(Some(frame)) => assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1011, "upstream unavailable")),
+        other => panic!("expected close, got {other:?}"),
+    }
+    assert_eq!(h.state.tickets.pending(), 1);
+    assert!(h.state.tickets.take(&external, SECRET).is_some());
 }
 
 #[tokio::test]
@@ -536,6 +575,7 @@ async fn events_are_namespaced_forwarded_and_do_not_break_rpc() {
     assert!(h.state.sessions.contains("good:session:v"), "event must record nested session");
     let mapped = h.state.tickets.take(ticket, SECRET).unwrap();
     assert_eq!(mapped.upstream_ticket, "up-ticket");
+    assert_eq!(mapped.session_id.as_deref(), Some("good:session:v"), "event tickets bind to nearest session");
     let response=loop {
         match socket.next().await.unwrap().unwrap() {
             tungstenite::Message::Text(text)=>break serde_json::from_str::<Value>(&text).unwrap(),
@@ -585,6 +625,7 @@ async fn session_list_recursively_rewrites_nested_tickets() {
     assert_ne!(ticket, "list-ticket");
     let mapped = h.state.tickets.take(ticket, SECRET).unwrap();
     assert_eq!(mapped.upstream_ticket, "list-ticket");
+    assert_eq!(mapped.session_id.as_deref(), Some("live:session:view"), "list tickets bind to nearest session");
     assert!(h.state.sessions.contains("live:session:root"));
     assert!(h.state.sessions.contains("live:session:view"));
 }
@@ -1072,6 +1113,11 @@ async fn capability_tags_create_routing_bootstrap_and_owner_degradation() {
     assert_eq!(reply["upstreams"][1]["description"],"compile box");
     assert!(reply["upstreams"][1]["session_count"].is_u64());
     h.pool.mark("busy",UpstreamState::Offline,None,0).await;
+    let reply=rpc(&mut socket,"session.create",json!({"host":"busy"})).await;
+    let err=reply["error"].as_str().unwrap();
+    assert!(err.contains("Offline"), "{reply}");
+    assert!(err.contains("wait") || err.contains("choose a different host"), "{reply}");
+    assert!(!err.contains("remove/recreate"), "create has no session yet: {reply}");
     let reply=rpc(&mut socket,"session.bootstrap",json!({"session_id":"busy:session:busy"})).await;
     assert!(reply["error"].as_str().unwrap().contains("remove/recreate"));
     let reply=rpc(&mut socket,"session.list",json!({})).await;
@@ -1111,6 +1157,35 @@ async fn data_attach_after_forget_rejects_before_upstream() {
     let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
     socket.send(tungstenite::Message::Binary([&[1u8][..],&raw].concat())).await.unwrap();
     match socket.next().await.unwrap().unwrap(){tungstenite::Message::Close(Some(frame))=>assert_eq!((u16::from(frame.code),frame.reason.as_ref()),(1008,crate::sessions::FORGOTTEN_ERROR)),other=>panic!("{other:?}")}
+}
+
+/// Tickets rewritten out of session.list / bootstrap / events must refuse attach after
+/// session.forget without any manual bind_session — that was previously only wired for
+/// top-level data.connect responses.
+#[tokio::test]
+async fn list_issued_ticket_rejects_after_forget() {
+    let live = spawn_fake_rex(vec![json!({
+        "session_id":"session:root",
+        "view":{"session_id":"session:view","ticket":"AAAAAAAAAAAAAAAAAAAAAA"}
+    })], false).await;
+    let h = start_gateway(&[("live", &live)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    wait_state(&h.pool, "live", UpstreamState::Online).await;
+    let mut socket = control_agent(h.addr).await;
+    let reply = rpc(&mut socket, "session.list", json!({})).await;
+    let external = reply["sessions"][0]["view"]["ticket"].as_str().unwrap().to_owned();
+    let view_id = reply["sessions"][0]["view"]["session_id"].as_str().unwrap().to_owned();
+    assert_eq!(view_id, "live:session:view");
+    // Forget the view session the ticket is bound to.
+    assert_eq!(rpc(&mut socket, "session.forget", json!({"session_id": view_id})).await["forgotten"], true);
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
+    let mut data = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
+    data.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat())).await.unwrap();
+    match data.next().await.unwrap().unwrap() {
+        tungstenite::Message::Close(Some(frame)) => {
+            assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1008, crate::sessions::FORGOTTEN_ERROR));
+        }
+        other => panic!("expected forgotten close, got {other:?}"),
+    }
 }
 
 #[tokio::test]
@@ -1470,4 +1545,116 @@ async fn in_flight_control_rpc_bound_returns_clear_error() {
         Some("too many in-flight control RPCs"),
         "{overflow}"
     );
+}
+
+
+#[tokio::test]
+async fn lagged_events_notify_agent_with_gateway_notice() {
+    // Tiny broadcast buffer so flooding while the agent is slow to read produces Lagged.
+    let good = spawn_fake_rex(vec![], false).await;
+    let h = start_gateway_with_event_cap(
+        &[("good", &good)], tmo(500), Duration::from_secs(3600), tmo(300),
+        Duration::from_secs(20), Duration::from_secs(120), 128, 32, 128, 32, None, 2,
+    ).await;
+    wait_state(&h.pool, "good", UpstreamState::Online).await;
+    let mut socket = control_agent(h.addr).await;
+    let sender = h.state.events.clone();
+
+    // Flood far past capacity without giving the agent a chance to drain.
+    for i in 0..64u64 {
+        sender.send(UpstreamEvent {
+            upstream: "good".into(),
+            event: json!({"type":"event","seq":i,"payload":{"session_id":format!("session:e{i}"),"n":i}}),
+        }).unwrap();
+    }
+    // Brief pause so serve_agent observes Lagged (and may deliver a few early events).
+    tokio::time::sleep(tmo(50)).await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut saw_notice = false;
+    let mut skipped = 0u64;
+    while tokio::time::Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = match tokio::time::timeout(left, socket.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            _ => break,
+        };
+        match frame {
+            tungstenite::Message::Ping(bytes) => { let _ = socket.send(tungstenite::Message::Pong(bytes)).await; }
+            tungstenite::Message::Pong(_) => {}
+            tungstenite::Message::Text(text) => {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                if msg["type"] == "event" {
+                    if let Some(n) = msg["payload"]["gateway"]["skipped"].as_u64() {
+                        assert_eq!(msg["payload"]["gateway"]["notice"], "events_lagged");
+                        skipped = n;
+                        saw_notice = true;
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_notice, "agent must receive gateway events_lagged notice");
+    assert!(skipped >= 1, "skipped count must be positive, got {skipped}");
+    assert!(h.state.metrics.snapshot().events_lagged >= skipped);
+}
+
+#[tokio::test]
+async fn forwarded_events_refresh_control_application_idle() {
+    // Application-idle (not pong-idle): keepalive pings alone do not keep the socket, but
+    // successfully forwarded upstream events must refresh last_activity.
+    let good = spawn_fake_rex(vec![], false).await;
+    let h = start_gateway_with_keepalive(
+        &[("good", &good)], tmo(300), Duration::from_secs(3600), tmo(300), tmo(30), tmo(120),
+    ).await;
+    let mut socket = control_agent(h.addr).await;
+    let sender = h.state.events.clone();
+
+    // Keep delivering events across several idle windows; connection must stay open.
+    let keep_until = tokio::time::Instant::now() + Duration::from_millis(360);
+    let mut n = 0u64;
+    while tokio::time::Instant::now() < keep_until {
+        sender.send(UpstreamEvent {
+            upstream: "good".into(),
+            event: json!({"type":"event","seq":n,"payload":{"session_id":"session:alive","n":n}}),
+        }).unwrap();
+        n += 1;
+        // Drain any pending frames so the sink does not stall.
+        loop {
+            match tokio::time::timeout(tmo(10), socket.next()).await {
+                Ok(Some(Ok(tungstenite::Message::Text(_)))) => {}
+                Ok(Some(Ok(tungstenite::Message::Ping(bytes)))) => {
+                    let _ = socket.send(tungstenite::Message::Pong(bytes)).await;
+                }
+                Ok(Some(Ok(tungstenite::Message::Pong(_)))) => {}
+                Ok(Some(Ok(tungstenite::Message::Close(frame)))) => {
+                    panic!("idle closed while events were flowing: {frame:?}");
+                }
+                _ => break,
+            }
+        }
+        tokio::time::sleep(tmo(40)).await;
+    }
+    assert!(h.state.metrics.snapshot().events_forwarded >= 1, "expected at least one forward");
+
+    // After events stop, application idle must still reap.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match tokio::time::timeout(left, socket.next()).await {
+            Err(_) => panic!("idle agent was not closed after events stopped"),
+            Ok(None) | Ok(Some(Err(_))) => panic!("agent dropped without close frame"),
+            Ok(Some(Ok(tungstenite::Message::Ping(_)))) => {}
+            Ok(Some(Ok(tungstenite::Message::Pong(_)))) => {}
+            Ok(Some(Ok(tungstenite::Message::Text(_)))) => {} // late event
+            Ok(Some(Ok(tungstenite::Message::Close(frame)))) => {
+                let frame = frame.expect("close frame");
+                assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1001, "idle timeout"));
+                return;
+            }
+            Ok(Some(Ok(other))) => panic!("unexpected {other:?}"),
+        }
+    }
 }

@@ -17,7 +17,7 @@ Rex Gateway 是放在你自己的一台或多台 Rex 服务器前面的控制面
 ## 它做什么
 
 - 在 WebSocket 升级之前，用 Bearer 令牌认证 `GET /api/control`、`GET /api/data` 和 `GET /status`。
-- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **21**。
+- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **24**。
 - 把 `session.list` 并发发到每个允许的上游，并给会话 id 加上上游 id 前缀。
 - 带上游前缀的会话调用回到那台上游；没有会话 id 的 `session.create` 和其他无主机调用按[路由与故障转移](#路由与故障转移)处理。
 - 把嵌套的 `ticket` 字符串换成一次性网关票据，并按消息原样桥接 `rex.data.terminal.v1`。
@@ -161,7 +161,7 @@ avoid_hosts = []
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 21,
+  "api_server_revision": 24,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -188,7 +188,7 @@ avoid_hosts = []
 
 **粘滞调用。** 载荷里的 `session_id` 若是 `<上游>:session:…`，只发给那台上游，并去掉前缀。该 id 必须在 ACL 内。`Offline` 或 `Unknown` 返回 `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`。这条路径没有故障转移。
 
-**创建。** 没有 `session_id` 也没有 `host`：网关按标签和主机偏好，在仍接受创建、且为 `Online` 或 `Degraded` 的上游里预留一台，然后调用它。传输失败会释放预留、标记该上游，并尝试下一个候选。应用层错误或载荷里的 `host` 不会这样做。
+**创建。** 没有 `session_id` 也没有 `host`：网关按标签和主机偏好，在仍接受创建、且为 `Online` 或 `Degraded` 的上游里预留一台，然后调用它。传输失败会释放预留、标记该上游，并尝试下一个候选。应用层错误或载荷里的 `host` 不会这样做。被钉住的 `host` 若是 `Offline` 或 `Unknown`，返回 `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host`（这时还没有会话可以删）。
 
 **其他无主机调用。** 没有 `session_id` 也没有 `host`（例如 `server.version`，以及其他同类方法）：先 `Manual` 后发现来的主机，先 `Online` 后 `Degraded`，再按上游 id。同样只对传输错误做故障转移。
 
@@ -198,14 +198,14 @@ avoid_hosts = []
 
 ## 开发与测试
 
-`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码，以及控制面在途 RPC 上限。
+`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、票据退回、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码、事件滞后通知，以及控制面在途 RPC 上限。
 
 ```sh
 cargo test --locked
 cargo build --locked
 ```
 
-在当前这棵树上，`cargo test --locked` 用 rustc 1.99.1 通过了 114 项测试。`--locked` 让构建停在 `Cargo.lock` 上；Cargo 1.83 无法解析这份锁文件。
+在当前这棵树上，`cargo test --locked` 用 rustc 1.99.1 通过了 125 项测试。`--locked` 让构建停在 `Cargo.lock` 上；Cargo 1.83 无法解析这份锁文件。
 
 现场脚本的工作目录必须是仓库根，地址是 `127.0.0.1:7300`，令牌是 `smoke-secret`。它们不属于 `cargo test`。
 
@@ -290,7 +290,13 @@ cargo build --locked
 
 `seq` 是每条 agent 连接上响应和事件共用的计数器，在帧真正写出时赋值。agent 的 `id` 由网关原样放回，并不是上游套接字上使用的 id。上游调用使用新的 UUID。因此事件和响应会按写出顺序共用 `seq`。
 
-令牌无权访问的上游事件会被丢掉。转发给每个 agent 的副本只做一次命名空间处理，所以每个 agent 拿到自己的网关票据。广播通道容量是 1024。跟不上的 agent 会跳过缺口；`events_lagged` 加上这个缺口的数量。`events_forwarded` 按成功发送次数计数，多一个 agent 就多计一次。
+令牌无权访问的上游事件会被丢掉。转发给每个 agent 的副本只做一次命名空间处理，所以每个 agent 拿到自己的网关票据。广播通道容量是 1024。跟不上的 agent 会跳过缺口。`events_lagged` 加上这个缺口的数量（`RecvError::Lagged(n)` 加上 `n`）。Agent 还会收到一条合成事件，它和别的帧共用同一个 `seq`：
+
+```json
+{"type":"event","seq":1,"payload":{"gateway":{"notice":"events_lagged","skipped":4}}}
+```
+
+被跳过的上游事件不会重放。`events_forwarded` 只统计成功送出的上游事件，所以多一个 agent 就多计一次，这条滞后通知不计入。`skipped` 是 JSON 数字（那个 `u64` 计数）。
 
 `session.list` 会像其他响应一样改写嵌套的 `session_id` 和 `ticket`。没有以 `session:` 开头的字符串 `session_id` 的条目会被丢掉。
 
@@ -329,7 +335,7 @@ cargo build --locked
 
 选择和预留计数共用一把互斥锁，重叠的 create 能看见彼此的预留。预留保持到这次尝试结束，或过了 `create_reservation_ttl_ms`（默认 5000），并在下一次选择和 `GET /status` 时回收。传输失败会丢掉预留并继续。给 agent 的耗尽字符串是 `session.create failed on all candidates: <id>: <reason>; …`。
 
-任何方法（包括 create）的载荷 `host` 都会跳过打分、预留和故障转移。它必须在 ACL 内且可路由。它可以指向一台已经不再接受自动创建的已发现上游。未知 id：`upstream <id> is unknown`。ACL 拒绝：`upstream <id> is not allowed`。
+任何方法（包括 create）的载荷 `host` 都会跳过打分、预留和故障转移。它必须在 ACL 内且可路由。它可以指向一台已经不再接受自动创建的已发现上游。未知 id：`upstream <id> is unknown`。ACL 拒绝：`upstream <id> is not allowed`。`session.create` 打到 `Offline` 或 `Unknown` 时返回 `upstream <id> is Offline|Unknown; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host`。带前缀的会话调用在同样状态下仍然返回 `upstream <id> is Offline|Unknown; the owning upstream is unavailable, remove/recreate this session`。
 
 会触发故障转移的传输错误是控制客户端的错误：连接失败、超时、缺少客户端、套接字关闭，以及重连退避期间的 `upstream unavailable (retry in <ms> ms): …`。连接失败后的退避从 200 ms 起翻倍，最高 5 秒。等待期间调用会快速失败并带上这段 `retry in` 文本，而不是立刻再拨。
 
@@ -341,7 +347,7 @@ cargo build --locked
 
 `GET /api/data` 使用 `rex.data.terminal.v1` 和同一条 Bearer 头。认证发生在升级之前。数据套接字运行时，控制套接字不必保持打开。上游 Rex 自己可能仍有附着生命周期；控制套接字关闭时，这个网关不会因此拆掉数据桥。[`smoke_data.py`](smoke_data.py) 检查的就是这个顺序。
 
-响应或事件里每个名为 `ticket` 的嵌套字符串，都会换成新的 16 字节 id，使用无填充的 base64url。真正的上游票据留在内存里，绑定 Bearer、只能使用一次，未使用时最多存放 `ticket_ttl_ms`。待处理票据达到 `ticket_max` 时淘汰最旧的一条。回收周期是 TTL 的一半，夹在 50 ms 到 5 秒之间。使用时也会检查是否过期。
+响应或事件里每个名为 `ticket` 的嵌套字符串，都会换成新的 16 字节 id，使用无填充的 base64url。真正的上游票据留在内存里，绑定 Bearer、只能使用一次，未使用时最多存放 `ticket_ttl_ms`。每张改写后的票据还绑定到它所在 JSON 对象里最近的、已带上游前缀的 `session_id`（嵌套对象自己的 `session_id` 优先于父对象）。`data.connect` 的 payload 只有票据、自己没有 `session_id` 时，使用这次请求的会话 id。这覆盖 `session.list`、`session.bootstrap`、`session.create`、事件和 `data.connect` 发出的票据。待处理票据达到 `ticket_max` 时淘汰最旧的一条。回收周期是 TTL 的一半，夹在 50 ms 到 5 秒之间。使用时也会检查是否过期。
 
 Agent 的 HELLO 是字节 `0x01` 加上这 16 个原始字节。网关随后拨号所属上游的 `/api/data`，发送 `0x01` 加上解码后的上游票据。此后二进制、文本、ping、pong 和关闭帧都会转发，包括关闭码和原因。网关不解析终端字节。它把每条 WebSocket 消息当作一条消息转发，不保证保留消息内部的分片边界。
 
@@ -351,17 +357,17 @@ Agent 的 HELLO 是字节 `0x01` 加上这 16 个原始字节。网关随后拨�
 | `data_connect_timeout_ms` 内没有 HELLO | 二进制 `0x82 0x05`，关闭 `1008` `HELLO timeout` |
 | HELLO 不是 `0x01` 加 16 字节 | 二进制 `0x82 0x05`，关闭 `1002` `malformed HELLO` |
 | 未知、过期、被淘汰或已经用过 | 二进制 `0x82 0x01`，关闭 `1008` `bad or used ticket`。错误持有者得到同样的响应，且不消耗票据 |
-| 票据上的会话引用已被忘记 | 关闭 `1008` `session reference expired/forgotten`（票据此时已被消耗） |
-| 所属上游已不在池中 | 关闭 `1011` `upstream unavailable` |
-| 拨号上游超过 `data_connect_timeout_ms` | 关闭 `1011` `upstream connect timeout` |
-| 拨号上游失败 | 关闭 `1011` `upstream connection failed` |
-| 保存的上游票据不是 base64url | 关闭 `1011` `invalid upstream ticket` |
+| 票据上的会话引用已被忘记 | 关闭 `1008` `session reference expired/forgotten`。票据保持已消耗，不退回 |
+| 所属上游已不在池中，或它的数据 URL 不能变成客户端请求 | 关闭 `1011` `upstream unavailable`。票据退回 |
+| 拨号上游超过 `data_connect_timeout_ms` | 关闭 `1011` `upstream connect timeout`。票据退回 |
+| 拨号上游失败 | 关闭 `1011` `upstream connection failed`。票据退回 |
+| 上游套接字已经打开之后，保存的上游票据不是 base64url | 关闭 `1011` `invalid upstream ticket`。票据保持已消耗 |
 | 上游数据套接字没有 Close 就结束 | 若池中状态为 `Offline` 则关闭 `1011` `upstream offline`，否则 `upstream closed` |
 | 把 agent 字节转发到上游失败 | 关闭 `1011` `upstream closed` |
 | Agent 没有 Close 就断开，或发给 agent 失败 | 上游关闭 `1001` `peer closed` |
 | 在 `ws_idle_timeout_ms` 内没有二进制或文本 | 两侧都关闭 `1001` `idle timeout` |
 
-数据流上限在取走票据之前检查，因此关闭 `1013` 后票据仍可使用。会话已忘记、上游不在池中、拨号失败和票据编码错误发生在 `take` 之后，这张网关票据已经花掉。
+数据流上限在取走票据之前检查，因此关闭 `1013` 后票据仍可使用。会话已忘记是在 `take` 之后拒绝的，票据保持已消耗。上游套接字打开之前的连接失败会把同一个外部 id 放回去，创建时间不变，所以 TTL 不会重新计时。`tickets_consumed` 在 `take` 时加一，成功退回时减一。若原来的 TTL 已经走完，退回不会把票据放回去，并且 `tickets_expired` 增加。映射已满时，退回可能淘汰另一张最旧的票据来腾位置（`tickets_evicted`）。若这个外部 id 已经在映射里，退回失败，这张票据保持已消耗。上游套接字一旦打开，票据就保持已消耗，包括 base64 无效，以及向上游发送 HELLO 失败（这次发送失败直接返回，不再另发关闭帧）。
 
 桥建立之后，Rex 自己的 ACCEPT（`0x81…`）和 REJECT 会被转发。网关不会自己造一个 ACCEPT。
 
@@ -390,7 +396,7 @@ Agent 的 HELLO 是字节 `0x01` 加上这 16 个原始字节。网关随后拨�
 
 `session.forget` 要求带前缀的 id，检查 ACL，把 id 加入 `forgotten`，并返回 `{"forgotten":true|false,"session_id":"…"}`。id 原本不在 `entries` 里时 `forgotten` 为 false。重复调用是安全的。Rex 会话不会被删除。
 
-之后的控制调用、列举、attach、`data.connect` 以及转发的终端字节，会在内存里刷新 `last_active_ms`。把这些触摸写盘的是回收器。列举会刷新它返回的每个会话，并且 `record` 会把该 id 从 `forgotten` 里去掉。Rex 仍在列举的会话，在 forget 或 TTL 丢掉之后还会再出现。格式正确、但本文件从未存过的 `<上游>:session:…` 仍可用于路由（`resolve` 不会把它插入文件）。格式不对的 id 是 `unknown session reference`。已忘记的 id 在 list/send/read/bootstrap/attach/`data.connect` 上是 `session reference expired/forgotten`。数据套接字上已经持有该 id 票据时，以 1008 和同一句原因关闭。
+之后的控制调用、列举、attach、`data.connect` 以及转发的终端字节，会在内存里刷新 `last_active_ms`。把这些触摸写盘的是回收器。列举会刷新它返回的每个会话，并且 `record` 会把该 id 从 `forgotten` 里去掉。Rex 仍在列举的会话，在 forget 或 TTL 丢掉之后还会再出现。格式正确、但本文件从未存过的 `<上游>:session:…` 仍可用于路由（`resolve` 不会把它插入文件）。格式不对的 id 是 `unknown session reference`。已忘记的 id 在 list/send/read/bootstrap/attach/`data.connect` 上是 `session reference expired/forgotten`。绑定到该 id 的数据票据（来自列举、bootstrap、create、事件或 `data.connect`）以 1008 和同一句原因关闭，并且这张票据不退回。
 
 上游 id 不能包含 `:`。前缀在第一个冒号处切开，余下部分必须以 `session:` 开头。
 
@@ -479,7 +485,7 @@ store_path = "rex-gateway-discovered.json"
 
 `state` 为 `Unknown`、`Online`、`Degraded` 或 `Offline`。`source` 为 `Manual`、`Tailnet` 或 `Lan`。`latency_ms` 是上一次探测的延迟；该次探测失败或还没探测过时为 null。`last_error` 是最近的探测或故障转移错误。之后某次探测若收到 `sessions` 数组，会把它清掉。`session_count` 是上一次探测里会话数组的长度，不是 CPU。Rex 探测不采集 CPU。
 
-当前值（计量）：`pending_tickets`、`session_refs`、`session_forgotten`、`active_control_connections`、`active_data_streams`。`counters` 里其余字段在进程存活期间递增。`tickets_expired` 统计因 TTL 删除的票据。`tickets_evicted` 统计因容量丢掉的票据。若之后的列举或事件再次记录某个 id，`session_forgotten` 会减小。
+当前值（计量）：`pending_tickets`、`session_refs`、`session_forgotten`、`active_control_connections`、`active_data_streams`。`tickets_issued`、故障转移计数、`events_lagged` 和 `events_forwarded` 在进程存活期间递增。`tickets_consumed` 在取走时增加，连接失败把票据退回时减少。`tickets_expired` 统计因 TTL 删除的票据，包括退回时发现原来的 TTL 已经走完。`tickets_evicted` 统计因容量丢掉的票据，包括为退回腾位置而丢掉的。`events_lagged` 是被跳过的上游事件数量之和。`events_forwarded` 统计已送达的上游事件，不含 `events_lagged` 通知。若之后的列举或事件再次记录某个 id，`session_forgotten` 会减小。
 
 `discovery.mode` 为 `command`、`file` 或 `none`。对应事件还没发生时，年龄为 null。`last_applied` 表示最近一次成功刷新是否用快照更新了池。未启用发现时这个对象仍在，`enabled` 为 false，`mode` 为 `"none"`。
 
@@ -489,7 +495,7 @@ store_path = "rex-gateway-discovered.json"
 
 什么算活动并不相同：
 
-- Agent 控制连接的空闲只看入站文本帧。入站 ping 和 pong 不算，网关向外写的事件也不算。只接收事件的 agent，若在 `ws_idle_timeout_ms`（默认 120 秒）内不发送文本帧，会被以 `1001` `idle timeout` 关闭。
+- Agent 控制连接的空闲看的是应用数据。入站文本会刷新它。成功转发的上游事件也会，合成的 `events_lagged` 通知也会。入站 ping 和 pong 不算。正在收到事件或滞后通知的 agent 会保持连接。若在 `ws_idle_timeout_ms`（默认 120 秒）内这些都没有，即使保活 ping 还在发，也会以 `1001` `idle timeout` 关闭。
 - 上游控制客户端把入站 ping、pong 和文本都算作活动。网关发出的 ping 得到 pong 后，可以维持这条套接字。空闲时它以 `1001` `idle timeout` 关闭上游，并把这条套接字上尚未完成的调用失败为 `upstream idle timeout`。
 - 数据桥在任一方向的二进制或文本上刷新，ping 和 pong 不算。空闲时两侧都以 `1001` `idle timeout` 关闭。
 

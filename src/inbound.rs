@@ -24,7 +24,7 @@ use crate::{
     auth::{self, Authenticator},
     pool::{UpstreamState, TagPreferences},
     control_client::{ClientMap, UpstreamEvent, UpstreamReply},
-    data::{decode_hello, TicketMap},
+    data::{decode_hello, TakenTicket, TicketMap},
     discovery::DiscoveryHealth,
     metrics::{Gauge, Metrics, OwnerLimiter},
     pool::UpstreamPool,
@@ -174,7 +174,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":21});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":24});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -240,8 +240,20 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                 let event=match event {
                     Ok(event)=>event,
                     Err(broadcast::error::RecvError::Lagged(n))=>{
+                        // Tell the agent it missed events so it can resync (list/bootstrap).
+                        // Do not count this notice as events_forwarded — that counter is
+                        // upstream-originated deliveries only.
                         state.metrics.events_lagged.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
                         tracing::warn!(n,"agent event receiver lagged");
+                        seq += 1;
+                        let notice = json!({
+                            "type":"event",
+                            "seq":seq,
+                            "payload":{"gateway":{"notice":"events_lagged","skipped":n}}
+                        });
+                        if sink.send(Message::Text(notice.to_string())).await.is_err() { break; }
+                        // A lag notice is still useful agent traffic: refresh application idle.
+                        last_activity = std::time::Instant::now();
                         continue
                     },
                     Err(_)=>break
@@ -252,11 +264,13 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                 // namespace_and_record on an already-wrapped payload double-prefixes
                 // session ids (so recording fails) and re-issues orphan tickets.
                 let mut payload = event.event.get("payload").cloned().unwrap_or(Value::Null);
-                namespace_and_record(&mut payload, &event.upstream, &state.tickets, &owner, &state.sessions);
+                namespace_and_record(&mut payload, &event.upstream, &state.tickets, &owner, &state.sessions, None);
                 seq += 1;
                 let framed = json!({"type":"event","seq":seq,"payload":payload});
                 if sink.send(Message::Text(framed.to_string())).await.is_err() { break; }
                 state.metrics.events_forwarded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Forwarded events keep a passive listener alive (application-idle, not pong-idle).
+                last_activity = std::time::Instant::now();
             }
             _=pings.tick()=>if sink.send(Message::Ping(Vec::new())).await.is_err() { break; },
             _=idle.tick()=>if last_activity.elapsed()>=state.options.idle_timeout {
@@ -313,6 +327,13 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
         return Err(format!("upstream {owner_upstream} is unknown"));
     };
     if !upstream.state.is_routable() {
+        if method == "session.create" {
+            // Hard host pin on create: there is no session yet, so do not suggest remove/recreate.
+            return Err(format!(
+                "upstream {owner_upstream} is {}; pinned host is unavailable — wait until it is Online or Degraded, or choose a different host",
+                upstream.state.as_str()
+            ));
+        }
         return Err(format!("upstream {owner_upstream} is {}; the owning upstream is unavailable, remove/recreate this session", upstream.state.as_str()));
     }
     if payload.get("session_id").is_some() && !translate_session_id(&mut payload, &owner_upstream, false) {
@@ -340,8 +361,16 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut
     if method == "data.connect" && response.get("ticket").and_then(Value::as_str).is_none() {
         return Err("upstream data.connect omitted ticket".into());
     }
-    namespace_and_record(&mut response, &owner_upstream, &state.tickets, owner, &state.sessions);
-    if method=="data.connect" {if let (Some(ticket),Some(id))=(response.get("ticket").and_then(Value::as_str),external_session.as_deref()){state.tickets.bind_session(ticket,id);}}
+    // Bind tickets to the request session (covers bare data.connect ticket payloads) or to
+    // the nearest nested session_id found while walking the response.
+    namespace_and_record(
+        &mut response,
+        &owner_upstream,
+        &state.tickets,
+        owner,
+        &state.sessions,
+        external_session.as_deref(),
+    );
     Ok(AgentReply::Payload(response))
 }
 
@@ -405,7 +434,7 @@ async fn create_with_failover(
             Ok(reply) => {
                 reserved.finish();
                 let mut response = reply.payload;
-                namespace_and_record(&mut response, &id, &state.tickets, owner, &state.sessions);
+                namespace_and_record(&mut response, &id, &state.tickets, owner, &state.sessions, None);
                 return Ok(AgentReply::Payload(response));
             }
             Err(err) => {
@@ -468,7 +497,7 @@ async fn hostless_with_failover(
             }
             Ok(reply) => {
                 let mut response = reply.payload;
-                namespace_and_record(&mut response, &id, &state.tickets, owner, &state.sessions);
+                namespace_and_record(&mut response, &id, &state.tickets, owner, &state.sessions, None);
                 return Ok(AgentReply::Payload(response));
             }
             Err(err) => {
@@ -515,7 +544,7 @@ async fn list_sessions(state: &AppState, acl: &[String], owner: &str, store: &Se
                 // session/ticket fields the same way responses and events do.
                 let Some(raw) = session.get("session_id").and_then(Value::as_str) else { continue };
                 if !raw.starts_with("session:") { continue; }
-                namespace_and_record(&mut session, id, &state.tickets, owner, store);
+                namespace_and_record(&mut session, id, &state.tickets, owner, store, None);
                 sessions.push(session);
             },
             Err(error) => { tracing::warn!(upstream = id, %error, "session.list skipped upstream"); errors.insert(id.to_owned(), Value::String(error)); }
@@ -541,6 +570,12 @@ async fn data_upgrade(
 ) -> Result<Response, StatusCode> {
     let (_, owner) = authenticate(&headers, &state, DATA_SUBPROTOCOL)?;
     Ok(ws.protocols([DATA_SUBPROTOCOL]).max_message_size(MAX_MESSAGE_BYTES).on_upgrade(move |socket| proxy_data(socket, state, owner)))
+}
+
+/// Restore a just-taken ticket (connect failed before HELLO) and close the agent once.
+async fn restore_ticket_and_close(agent: &mut WebSocket, tickets: &TicketMap, taken: TakenTicket, reason: &'static str) {
+    tickets.restore(taken);
+    let _ = agent.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed(reason) }))).await;
 }
 
 async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
@@ -574,17 +609,18 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
     };
     // Lookup of a ticket attached to a forgotten session still leads to a clear refusal.
     // The gateway keeps the ticket's owning upstream private; stale tickets cannot be replayed.
-    let Some(ticket) = state.tickets.take(&external, &owner) else {
+    let Some(taken) = state.tickets.take(&external, &owner) else {
         let _ = agent.send(Message::Binary(vec![0x82, 0x01].into())).await;
         let _ = agent.send(Message::Close(Some(CloseFrame { code: 1008, reason: Cow::Borrowed("bad or used ticket") }))).await;
         return;
     };
-    if let Some(id)=ticket.session_id.as_deref(){
+    if let Some(id)=taken.ticket.session_id.as_deref(){
+        // Forgotten/expired session: leave the ticket burned (do not restore).
         if state.sessions.resolve(id).is_err(){let _=agent.send(Message::Close(Some(CloseFrame{code:1008,reason:Cow::Borrowed(FORGOTTEN_ERROR)}))).await;return;}
         state.sessions.touch(id);
     }
-    let Some(upstream) = state.pool.get(&ticket.upstream).await else {
-        let _ = agent.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed("upstream unavailable") }))).await;
+    let Some(upstream) = state.pool.get(&taken.ticket.upstream).await else {
+        restore_ticket_and_close(&mut agent, &state.tickets, taken, "upstream unavailable").await;
         return;
     };
     let url = format!("{}/api/data", upstream.url.trim_end_matches('/'));
@@ -592,7 +628,11 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
         .or_else(|| url.strip_prefix("https://").map(|u| format!("wss://{u}"))).unwrap_or(url);
     let mut request = match url.as_str().into_client_request().context("upstream data URL") {
         Ok(request) => request,
-        Err(error) => { tracing::warn!(%error, "invalid upstream data URL"); return; }
+        Err(error) => {
+            tracing::warn!(%error, "invalid upstream data URL");
+            restore_ticket_and_close(&mut agent, &state.tickets, taken, "upstream unavailable").await;
+            return;
+        }
     };
     request.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(DATA_SUBPROTOCOL));
     let mut upstream_socket = match tokio::time::timeout(
@@ -601,22 +641,24 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
     ).await {
         Ok(Ok((socket, _))) => socket,
         Err(_) => {
-            tracing::warn!(upstream = %ticket.upstream, "upstream data connection timed out");
-            let _ = agent.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed("upstream connect timeout") }))).await;
+            tracing::warn!(upstream = %taken.ticket.upstream, "upstream data connection timed out");
+            restore_ticket_and_close(&mut agent, &state.tickets, taken, "upstream connect timeout").await;
             return;
         }
         Ok(Err(error)) => {
             tracing::warn!(%error, "upstream data connection failed");
-            let _ = agent.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed("upstream connection failed") }))).await;
+            restore_ticket_and_close(&mut agent, &state.tickets, taken, "upstream connection failed").await;
             return;
         }
     };
+    // Connect succeeded: ticket is committed even if HELLO encode/send fails below.
     let mut upstream_hello = vec![1];
-    upstream_hello.extend(match base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &ticket.upstream_ticket) {
+    upstream_hello.extend(match base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &taken.ticket.upstream_ticket) {
         Ok(bytes) => bytes,
         Err(_) => { let _ = agent.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed("invalid upstream ticket") }))).await; return; }
     });
     if upstream_socket.send(tungstenite::Message::Binary(upstream_hello.into())).await.is_err() { return; }
+    let ticket = taken.ticket;
 
     let (mut upstream_sink, mut upstream_stream) = upstream_socket.split();
     let (mut agent_sink, mut agent_stream) = agent.split();
