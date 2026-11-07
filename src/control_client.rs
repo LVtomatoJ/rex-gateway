@@ -88,7 +88,10 @@ impl ControlClient {
     }
     async fn actor(url:String, options:Options, events:broadcast::Sender<UpstreamEvent>, upstream:String, mut rx:mpsc::Receiver<Command>) {
         let call_timeout = options.call_timeout;
-        let mut socket:Option<Socket>=None; let mut pending:HashMap<String,oneshot::Sender<Result<UpstreamReply>>>=HashMap::new();
+        let mut socket:Option<Socket>=None;
+        // Each in-flight RPC keeps its inserted Instant so we can fail hung ones even when
+        // the socket stays alive on ping/pong alone (caller timeout already closed the oneshot).
+        let mut pending:HashMap<String,PendingReply>=HashMap::new();
         let mut failures=0u32; let mut retry_at:Option<Instant>=None; let mut last_error=String::new();
         let mut pings=tokio::time::interval_at(Instant::now()+options.ping_interval, options.ping_interval); pings.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut idle=tokio::time::interval(std::cmp::max(options.idle_timeout / 5, Duration::from_millis(1))); idle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -96,15 +99,18 @@ impl ControlClient {
         loop {
             tokio::select! {
                 _=pings.tick(), if socket.is_some()=> {
+                    // Opportunistic reap: drop caller-timed-out slots and fail age-exceeded ones.
+                    reap_pending(&mut pending, call_timeout);
                     if let Some(s)=socket.as_mut() {
                         if s.send(Message::Ping(Vec::new())).await.is_err() { socket=None; }
                     }
                 }
                 _=idle.tick(), if socket.is_some()=> {
+                    reap_pending(&mut pending, call_timeout);
                     if last_activity.elapsed() < options.idle_timeout { continue; }
                     let _=socket.as_mut().unwrap().send(Message::Close(Some(tokio_tungstenite::tungstenite::protocol::CloseFrame { code:1001.into(), reason:"idle timeout".into() }))).await;
                     socket=None;
-                    for (_,reply) in pending.drain() { let _=reply.send(Err(anyhow!("upstream idle timeout"))); }
+                    for (_,pending) in pending.drain() { let _=pending.reply.send(Err(anyhow!("upstream idle timeout"))); }
                 }
                 command=rx.recv()=> {
                     let Some(cmd)=command else { break };
@@ -129,16 +135,17 @@ impl ControlClient {
                     }
                     let frame=json!({"type":"request","id":cmd.id,"method":cmd.method,"payload":cmd.payload}).to_string();
                     // Calls that timed out on the caller side must not accumulate forever.
-                    pending.retain(|_,reply|!reply.is_closed());
-                    let id=cmd.id.clone(); pending.insert(cmd.id,cmd.reply);
+                    reap_pending(&mut pending, call_timeout);
+                    let id=cmd.id.clone();
+                    pending.insert(cmd.id, PendingReply { inserted: Instant::now(), reply: cmd.reply });
                     let sent=match tokio::time::timeout(call_timeout,socket.as_mut().unwrap().send(Message::Text(frame))).await {
                         Ok(result)=>result.map_err(anyhow::Error::from),
                         Err(_)=>Err(anyhow!("upstream send timed out")),
                     };
                     if let Err(e)=sent {
-                        if let Some(reply)=pending.remove(&id) { let _=reply.send(Err(e)); }
+                        if let Some(p)=pending.remove(&id) { let _=p.reply.send(Err(e)); }
                         socket=None;
-                        for (_,reply) in pending.drain() { let _=reply.send(Err(anyhow!("upstream socket closed"))); }
+                        for (_,p) in pending.drain() { let _=p.reply.send(Err(anyhow!("upstream socket closed"))); }
                     }
                 }
                 incoming=async { socket.as_mut().unwrap().next().await }, if socket.is_some()=> {
@@ -149,10 +156,10 @@ impl ControlClient {
                             let Ok(message)=serde_json::from_str::<Value>(&text) else { continue };
                             match message["type"].as_str() {
                                 Some("response")=> {
-                                    if let Some(reply)=message["id"].as_str().and_then(|id|pending.remove(id)) {
+                                    if let Some(p)=message["id"].as_str().and_then(|id|pending.remove(id)) {
                                         let error = message.get("error").cloned().filter(|e| !e.is_null());
                                         let payload = message.get("payload").cloned().unwrap_or(Value::Null);
-                                        let _=reply.send(Ok(UpstreamReply { payload, error }));
+                                        let _=p.reply.send(Ok(UpstreamReply { payload, error }));
                                     }
                                 }
                                 Some("event")=> { let _=events.send(UpstreamEvent { upstream:upstream.clone(), event:message }); }
@@ -165,7 +172,7 @@ impl ControlClient {
                         }
                         Some(Ok(Message::Close(_)))|None|Some(Err(_))=> {
                             socket=None;
-                            for (_,reply) in pending.drain() { let _=reply.send(Err(anyhow!("upstream socket closed"))); }
+                            for (_,p) in pending.drain() { let _=p.reply.send(Err(anyhow!("upstream socket closed"))); }
                         }
                         _=>{}
                     }
@@ -174,6 +181,35 @@ impl ControlClient {
         }
     }
 }
+
+struct PendingReply {
+    inserted: Instant,
+    reply: oneshot::Sender<Result<UpstreamReply>>,
+}
+
+/// Drop slots whose caller already timed out, and fail any still-open slot older than
+/// `call_timeout`. Keeps the pending map from growing when an upstream accepts a request
+/// but never answers while the socket stays alive on keepalive alone.
+fn reap_pending(pending: &mut HashMap<String, PendingReply>, call_timeout: Duration) {
+    let now = Instant::now();
+    let mut expired = Vec::new();
+    pending.retain(|id, entry| {
+        if entry.reply.is_closed() {
+            return false;
+        }
+        if now.saturating_duration_since(entry.inserted) >= call_timeout {
+            expired.push(id.clone());
+            return true; // remove after send below (need ownership of Sender)
+        }
+        true
+    });
+    for id in expired {
+        if let Some(entry) = pending.remove(&id) {
+            let _ = entry.reply.send(Err(anyhow!("upstream response timed out")));
+        }
+    }
+}
+
 async fn open_socket(url:&str)->Result<Socket> {
     let url=format!("{}/api/control",url.trim_end_matches('/'));
     let url=url.strip_prefix("http://").map(|rest|format!("ws://{rest}")).or_else(||url.strip_prefix("https://").map(|rest|format!("wss://{rest}"))).unwrap_or(url);
@@ -273,6 +309,72 @@ mod tests {
         assert_eq!(ms, [200, 400, 800, 1600, 3200, 5000, 5000, 5000]);
         assert_eq!(backoff_delay(u32::MAX), BACKOFF_MAX);
         assert_eq!(backoff_delay(0), BACKOFF_BASE);
+    }
+
+    async fn mock_upstream_never_responds() -> String {
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr=listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream,_)=listener.accept().await.unwrap();
+            let mut socket=tokio_tungstenite::accept_hdr_async(stream, |_: &tokio_tungstenite::tungstenite::handshake::server::Request, mut response: tokio_tungstenite::tungstenite::handshake::server::Response| { response.headers_mut().insert("sec-websocket-protocol", SUBPROTOCOL.parse().unwrap()); Ok(response) }).await.unwrap();
+            socket.next().await;
+            socket.send(Message::Text(json!({"type":"welcome"}).to_string())).await.unwrap();
+            // Accept requests and answer only with Pong so the socket stays "active".
+            while let Some(Ok(frame))=socket.next().await {
+                match frame {
+                    Message::Ping(_)=> { let _=socket.send(Message::Pong(Vec::new())).await; }
+                    Message::Text(_)=> { /* swallow; never respond */ }
+                    _=>{}
+                }
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn reaps_hung_pending_when_upstream_never_responds() {
+        let url=mock_upstream_never_responds().await;
+        let (events,_)=broadcast::channel(4);
+        let client=ControlClient::new(
+            "silent".into(),
+            url,
+            Options {
+                call_timeout: Duration::from_millis(150),
+                ping_interval: Duration::from_millis(40),
+                idle_timeout: Duration::from_secs(30),
+            },
+            events,
+        );
+        let err = client.call("session.list", json!({})).await.expect_err("must time out");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("upstream request timeout") || msg.contains("upstream response timed out") || msg.contains("upstream response lost"),
+            "unexpected error: {msg}"
+        );
+        // Give the actor a ping/idle tick so closed oneshots are reaped without tearing the socket.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        // A second call against the same silent-but-alive upstream must still time out cleanly:
+        // hung-pending reap must not leave the actor wedged.
+        let err2 = client.call("session.list", json!({})).await.expect_err("second call also times out");
+        let msg2 = format!("{err2:#}");
+        assert!(
+            msg2.contains("upstream request timeout") || msg2.contains("upstream response timed out") || msg2.contains("upstream response lost"),
+            "unexpected error: {msg2}"
+        );
+    }
+
+    #[test]
+    fn reap_pending_drops_closed_and_ages_out_open() {
+        let (tx_closed, rx_closed) = oneshot::channel::<Result<UpstreamReply>>();
+        drop(rx_closed); // caller already gone
+        let (tx_open, _rx_open) = oneshot::channel::<Result<UpstreamReply>>();
+        let old = Instant::now() - Duration::from_secs(10);
+        let mut pending = HashMap::from([
+            ("closed".into(), PendingReply { inserted: Instant::now(), reply: tx_closed }),
+            ("aged".into(), PendingReply { inserted: old, reply: tx_open }),
+        ]);
+        reap_pending(&mut pending, Duration::from_secs(1));
+        assert!(pending.is_empty(), "closed and aged entries must be removed");
     }
 }
 

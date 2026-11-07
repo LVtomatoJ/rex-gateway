@@ -180,7 +180,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":30});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":31});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -797,11 +797,14 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
                 }
                 Some(Ok(tungstenite::Message::Frame(_))) => {}
                 Some(Err(_)) | None => {
+                    // Unexpected mid-bridge drop (no clean Close): tell the agent, then finish
+                    // the sink so the TCP/WebSocket teardown is not left half-open.
                     let reason = match state.pool.get(&ticket.upstream).await {
                         Some(u) if u.state == UpstreamState::Offline => "upstream offline",
                         _ => "upstream closed",
                     };
                     let _ = agent_sink.send(Message::Close(Some(CloseFrame { code: 1011, reason: Cow::Borrowed(reason) }))).await;
+                    let _ = agent_sink.close().await;
                     break;
                 }
             },
@@ -826,7 +829,8 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
     }
 }
 
-/// Notify the agent that forwarding to the upstream failed mid-bridge (no clean upstream Close).
+/// Notify the agent that forwarding to the upstream failed mid-bridge (no clean upstream Close),
+/// then finish the agent sink (same completion the clean Close / idle paths perform).
 async fn close_agent_upstream_closed(agent_sink: &mut (impl SinkExt<Message> + Unpin)) {
     let _ = agent_sink
         .send(Message::Close(Some(CloseFrame {
@@ -834,6 +838,7 @@ async fn close_agent_upstream_closed(agent_sink: &mut (impl SinkExt<Message> + U
             reason: Cow::Borrowed("upstream closed"),
         })))
         .await;
+    let _ = agent_sink.close().await;
 }
 
 /// Notify the upstream data socket that the agent disappeared without a Close frame.

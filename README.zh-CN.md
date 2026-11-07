@@ -17,7 +17,7 @@ Rex Gateway 是放在你自己的一台或多台 Rex 服务器前面的控制面
 ## 它做什么
 
 - 在 WebSocket 升级之前，用 Bearer 令牌认证 `GET /api/control`、`GET /api/data` 和 `GET /status`。
-- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **30**。
+- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **31**。
 - 把 `session.list` 并发发到每个允许的上游，并给会话 id 加上上游 id 前缀。
 - 带上游前缀的会话调用回到那台上游；没有会话 id 的 `session.create` 和其他无主机调用按[路由与故障转移](#路由与故障转移)处理。
 - 把嵌套的 `ticket` 字符串换成一次性网关票据，并按消息原样桥接 `rex.data.terminal.v1`。
@@ -161,7 +161,7 @@ avoid_hosts = []
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 30,
+  "api_server_revision": 31,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -198,14 +198,14 @@ avoid_hosts = []
 
 ## 开发与测试
 
-`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、票据退回、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码（含已忘记会话的二进制 REJECT，以及 Offline 附着拒绝）、事件滞后通知、控制响应刷新空闲（含在途溢出回复）、钉住主机离线文案、控制面在途 RPC 上限、panic 时释放在途槽位，以及 agent WebSocket 帧/消息 1 MiB 上限。
+`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、票据退回、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码（含已忘记会话的二进制 REJECT、Offline 附着拒绝，以及意外上游断开后结束 agent sink）、事件滞后通知、控制响应刷新空闲（含在途溢出回复）、钉住主机离线文案、控制面在途 RPC 上限、panic 时释放在途槽位、挂起的上游控制面 pending RPC 收割，以及 agent WebSocket 帧/消息 1 MiB 上限。
 
 ```sh
 cargo test --locked
 cargo build --locked
 ```
 
-在当前这棵树上，`cargo test --locked` 用 rustc 1.99.1 通过了 133 项测试。`--locked` 让构建停在 `Cargo.lock` 上；Cargo 1.83 无法解析这份锁文件。
+在当前这棵树上，`cargo test --locked` 用 rustc 1.99.1 通过了 135 项测试。`--locked` 让构建停在 `Cargo.lock` 上；Cargo 1.83 无法解析这份锁文件。
 
 现场脚本的工作目录必须是仓库根，地址是 `127.0.0.1:7300`，令牌是 `smoke-secret`。它们不属于 `cargo test`。
 
@@ -364,8 +364,8 @@ Agent 的 HELLO 是字节 `0x01` 加上这 16 个原始字节。网关随后拨�
 | 拨号上游失败 | 关闭 `1011` `upstream connection failed`。票据退回 |
 | 上游套接字已经打开之后，保存的上游票据不是 base64url | 关闭 `1011` `invalid upstream ticket`。票据退回 |
 | 上游套接字打开后，向上游发送 HELLO 失败 | 关闭 `1011` `upstream HELLO failed`。票据退回 |
-| 上游数据套接字没有 Close 就结束 | 若池中状态为 `Offline` 则关闭 `1011` `upstream offline`，否则 `upstream closed` |
-| 把 agent 字节转发到上游失败 | 关闭 `1011` `upstream closed` |
+| 上游数据套接字没有 Close 就结束 | 若池中状态为 `Offline` 则关闭 `1011` `upstream offline`，否则 `upstream closed`，然后结束 agent sink |
+| 把 agent 字节转发到上游失败 | 关闭 `1011` `upstream closed`，然后结束 agent sink |
 | Agent 没有 Close 就断开，或发给 agent 失败 | 上游关闭 `1001` `peer closed` |
 | 在 `ws_idle_timeout_ms` 内没有二进制或文本 | 两侧都关闭 `1001` `idle timeout` |
 
@@ -499,7 +499,7 @@ store_path = "rex-gateway-discovered.json"
 什么算活动并不相同：
 
 - Agent 控制连接的空闲看的是应用数据。入站文本会刷新它。成功送达的控制面响应（包括立即返回的 `too many in-flight control RPCs` 溢出回复）、成功转发的上游事件，以及合成的 `events_lagged` 通知也会。入站 ping 和 pong 不算。正在收到响应、事件或滞后通知的 agent 会保持连接。若在 `ws_idle_timeout_ms`（默认 120 秒）内这些都没有，即使保活 ping 还在发，也会以 `1001` `idle timeout` 关闭。
-- 上游控制客户端把入站 ping、pong 和文本都算作活动。网关发出的 ping 得到 pong 后，可以维持这条套接字。空闲时它以 `1001` `idle timeout` 关闭上游，并把这条套接字上尚未完成的调用失败为 `upstream idle timeout`。
+- 上游控制客户端把入站 ping、pong 和文本都算作活动。网关发出的 ping 得到 pong 后，可以维持这条套接字。空闲时它以 `1001` `idle timeout` 关闭上游，并把这条套接字上尚未完成的调用失败为 `upstream idle timeout`。与空闲关闭无关，调用方已经超时（oneshot 已关闭）或等待超过 `upstream_call_timeout_ms` 的未完成 RPC，会在 ping / idle tick 上被收割，并以 `upstream response timed out` 失败，因此「只保活、不答 RPC」的上游不会把槽位一直挂到下一次调用。
 - 数据桥在任一方向的二进制或文本上刷新，ping 和 pong 不算。空闲时两侧都以 `1001` `idle timeout` 关闭。
 
 `ws_idle_timeout_ms` 必须大于 `ws_ping_interval_ms`。
