@@ -17,7 +17,7 @@ Rex Gateway 是放在你自己的一台或多台 Rex 服务器前面的控制面
 ## 它做什么
 
 - 在 WebSocket 升级之前，用 Bearer 令牌认证 `GET /api/control`、`GET /api/data` 和 `GET /status`。
-- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **35**。
+- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **36**。
 - 把 `session.list` 并发发到每个允许的上游，并给会话 id 加上上游 id 前缀。
 - 带上游前缀的会话调用回到那台上游；没有会话 id 的 `session.create` 和其他无主机调用按[路由与故障转移](#路由与故障转移)处理。
 - 把嵌套的 `ticket` 字符串换成一次性网关票据，并按消息原样桥接 `rex.data.terminal.v1`。
@@ -161,7 +161,7 @@ avoid_hosts = []
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 35,
+  "api_server_revision": 36,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -198,7 +198,7 @@ avoid_hosts = []
 
 ## 开发与测试
 
-`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、票据退回、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码（含已忘记会话的二进制 REJECT、Offline 附着拒绝，以及意外上游断开后结束 agent sink）、事件滞后通知、控制响应刷新空闲（含在途溢出回复）、钉住主机离线文案、控制面在途 RPC 上限、panic 时释放在途槽位、挂起的上游控制面 pending RPC 收割、上游控制面应用空闲（ping/pong 不刷新）、数据桥关闭原因截断到 123 字节，agent WebSocket 帧/消息 1 MiB 上限、`session.attach_all` 扇出、仅嵌套会话引用的路由、数据桥关闭握手排空、按 agent 过滤事件订阅与共享 detach，以及上游控制连接重连后重新订阅。
+`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、票据退回、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码（含已忘记会话的二进制 REJECT、Offline 附着拒绝，以及意外上游断开后结束 agent sink）、事件滞后通知、控制响应刷新空闲（含在途溢出回复）、钉住主机离线文案、控制面在途 RPC 上限、panic 时释放在途槽位、挂起的上游控制面 pending RPC 收割、上游控制面应用空闲（ping/pong 不刷新）、数据桥关闭原因截断到 123 字节，agent WebSocket 帧/消息 1 MiB 上限、`session.attach_all` 扇出、仅嵌套会话引用的路由、数据桥关闭握手排空、按 agent 过滤事件订阅与共享 detach、最后一个持有者关闭时向上游 detach，以及上游控制连接重连后重新订阅（只重放仍有 agent 持有的）。
 
 ```sh
 cargo test --locked
@@ -213,7 +213,7 @@ cargo build --locked
 | --- | --- | --- |
 | [`smoke.py`](smoke.py) | 无令牌和错误令牌为 401；欢迎消息；`session.list` 给出 `local:session:` id；`server.version`；带 `event_scope` `session` 的 `session.attach` | 示例配置，且令牌能列出至少一个会话 |
 | [`smoke_data.py`](smoke_data.py) | 网关票据为 16 字节；数据面 ACCEPT `0x81`；快照和 `HELLO_FROM_GATEWAY` 字节；重用票据为 `0x82 0x01` 且关闭码 1008 | 列出的会话里有聚焦块，并且 `PATH` 上有 `rex`（用 `REX_BIN` 覆盖） |
-| [`smoke_events.py`](smoke_events.py) | 两个 agent 各自只收到自己 attach 的会话的事件；另一个 agent 仍持有该会话时，一个 agent 的 `session.detach` 由网关本地应答；`/status` 含 `events_dropped_scope` / `events_dropped_acl` | 至少两个列出的会话，且能直连 `127.0.0.1:7297` 上的 Rex（脚本用自己的客户端去触发会话事件） |
+| [`smoke_events.py`](smoke_events.py) | 两个 agent 各自只收到自己 attach 的会话的事件；另一个 agent 仍持有该会话时，一个 agent 的 `session.detach` 由网关本地应答；`/status` 含 `events_dropped_scope` / `events_dropped_acl`；关闭最后一个持有某会话的 agent 后，网关的上游连接会从该会话 detach（用 `session.list_clients` 检查） | 至少两个列出的会话，且能直连 `127.0.0.1:7297` 上的 Rex（脚本用自己的客户端去触发会话事件） |
 | [`smoke_tags.py`](smoke_tags.py) | `session.bootstrap` 报出 `local` 的标签 `perf` / `ci`；无法满足的 `prefer_tags` 会报错；`/status` 含这些标签 | 与示例相同的上游元数据，以及一个活会话 |
 | [`smoke_ttl.py`](smoke_ttl.py) | 回收器清掉未使用票据；超时后的 HELLO 为 `0x82 0x01`；计量回到零 | 用 `REX_GATEWAY_TICKET_TTL_MS=2000` 启动网关，并且 Rex 上存在 `smoke_data.py` 顶部写死的会话和块（此脚本不会自己发现它们） |
 | [`smoke_sessions.py`](smoke_sessions.py) | 用列出的引用做 attach 和数据面 ACCEPT；`--check-gc` 检查 `session.forget`；`--after-ttl` 期望 `session reference expired/forgotten` | 至少一个列出的会话。重启步骤是手工的：用同一个 `REX_GATEWAY_SESSION_STORE_PATH` 停掉再启动网关。脚本还会发送 `session.rename`；`smoke.py` 注明当前 Rex 已不再实现该方法。若 Rex 返回帧级错误，脚本失败 |
@@ -297,9 +297,10 @@ cargo build --locked
 - `session.attach_all` 取 `session` 时覆盖每台成功附着的上游上的所有会话；取 `all` 时覆盖全部事件。
 - 若 agent 在该上游有 `all`，或事件最浅层的 `session_id` 已被 attach（或被 `attach_all` `session` 覆盖），事件就发给它。没有 `session_id` 的事件只发给 `all` 订阅者。
 - 订阅在调用上游之前记下（Rex 可能先于响应发出第一批事件），调用失败或返回错误时回滚。
-- `session.detach` 只移除本 agent 的 attach。只有没有别的 agent 连接还持有该会话时才发到 Rex；否则网关像 Rex 一样自己回 `{}`。关闭 agent 连接会释放它的持有，但不会向上游 detach；多余的上游订阅会被过滤掉。
+- `session.detach` 只移除本 agent 的 attach。只有没有别的 agent 连接还持有该会话时才发到 Rex；否则网关像 Rex 一样自己回 `{}`。关闭 agent 连接会释放它的持有。对于它是最后一个持有者的每个会话，网关会在该连接及其在途请求都结束后向上游发送 `session.detach`。如果 detach 在途时另一个 agent attach 了同一会话，网关会在 detach 之后再 attach 一次（Rex 的 `session.attach` 是幂等的）。
+- Rex 没有能从连接上移除 `session.attach_all` 或 `all` 范围的调用，`session.detach` 也不影响它们。最后一个持有它们的 agent 断开后，共享的上游连接仍会收到这些事件，由网关过滤掉（计入 `events_dropped_scope`）。它们会在该上游控制连接下一次重连时被丢弃，见下文。
 
-Rex 在连接关闭时会忘掉该连接的订阅。上游控制连接重连时（探测会在 `probe_interval_ms` 内重新打开它），网关会在触发重连的那次请求之前，把在这条连接上成功过的订阅重放一遍（`all` / `session` 用 `session.attach_all`，再对每个会话发 `session.attach`），并给在该上游有订阅的每个 agent 发：
+Rex 在连接关闭时会忘掉该连接的订阅。上游控制连接重连时（探测会在 `probe_interval_ms` 内重新打开它），网关会在触发重连的那次请求之前，把在这条连接上成功过、且仍有 agent 连接持有的订阅重放一遍（`all` / `session` 用 `session.attach_all`，再对每个会话发 `session.attach`），并给在该上游有订阅的每个 agent 发：
 
 ```json
 {"type":"event","seq":7,"payload":{"gateway":{"notice":"upstream_resubscribed","upstream":"local"}}}

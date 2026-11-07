@@ -107,7 +107,8 @@ pub async fn serve(
     events: broadcast::Sender<UpstreamEvent>,
     discovery: DiscoveryHealth,
 ) -> Result<()> {
-    let state = AppState { pool, clients, auth, tickets, sessions, metrics, data_limiter: OwnerLimiter::new(), control_limiter: OwnerLimiter::new(), options, events, discovery, holds: HoldRegistry::default() };
+    let holds = HoldRegistry::new(clients.clone());
+    let state = AppState { pool, clients, auth, tickets, sessions, metrics, data_limiter: OwnerLimiter::new(), control_limiter: OwnerLimiter::new(), options, events, discovery, holds };
     let router = router(state);
     let listener = tokio::net::TcpListener::bind(listen).await?;
     tracing::info!(%listen, "gateway listening");
@@ -183,7 +184,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":35});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":36});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -411,10 +412,16 @@ async fn handle(state: &AppState, acl: &[String], owner: &str, subs: &AgentSubsc
         if !subs.detach(&owner_upstream, session) { return Ok(AgentReply::Payload(json!({}))); }
     }
     let undo = effect.as_ref().map(|effect| subs.begin(&owner_upstream, effect));
-    let call = match state.clients.get(&owner_upstream) {
+    let client = state.clients.get(&owner_upstream);
+    if let Some(client) = &client { state.holds.watch(client); }
+    let call = match &client {
         Some(client) => client.call(method, payload).await.map_err(|e| e.to_string()),
         None => Err("upstream client missing".to_owned()),
     };
+    if let (Some(SubscriptionEffect::Detach { session }), Some(client), Ok(reply)) = (&effect, &client, &call) {
+        // Another agent may have attached while this detach was in flight.
+        if !reply.is_application_error() { state.holds.reattach_if_held(client, &owner_upstream, session).await; }
+    }
     if !matches!(&call, Ok(reply) if !reply.is_application_error()) {
         if let Some(undo) = undo { subs.undo(undo); }
     }
@@ -578,7 +585,7 @@ async fn hostless_with_failover(
         let effect = SubscriptionEffect::classify(method, &attempt);
         let undo = effect.as_ref().map(|effect| subs.begin(&id, effect));
         let call = match state.clients.get(&id) {
-            Some(client) => client.call(method, attempt).await.map_err(|e| e.to_string()),
+            Some(client) => { state.holds.watch(&client); client.call(method, attempt).await.map_err(|e| e.to_string()) }
             None => Err("upstream client missing".into()),
         };
         if !matches!(&call, Ok(reply) if !reply.is_application_error()) {
@@ -645,6 +652,7 @@ async fn attach_all_fanout(state: &AppState, acl: &[String], owner: &str, subs: 
         let Some(client) = state.clients.get(id) else { return (id, Err(("upstream client missing".to_owned(), None))) };
         let effect = SubscriptionEffect::classify("session.attach_all", payload);
         let undo = effect.as_ref().map(|effect| subs.begin(id, effect));
+        state.holds.watch(&client);
         let result = match client.call("session.attach_all", payload.clone()).await {
             Err(e) => Err((format!("{e:#}"), None)),
             Ok(reply) => match reply.error.filter(|e| !e.is_null()) {

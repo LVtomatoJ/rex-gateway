@@ -17,7 +17,7 @@ It is a single Rust binary in this repository (`rex-gateway`). It does not embed
 ## What it does
 
 - Authenticates `GET /api/control`, `GET /api/data`, and `GET /status` with a bearer token before any WebSocket upgrade.
-- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **35**.
+- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **36**.
 - Fans `session.list` out to every allowed upstream and prefixes session ids with the upstream id.
 - Routes a namespaced session call back to that upstream, and routes a hostless `session.create` or other hostless call with the rules in [Routing and failover](#routing-and-failover).
 - Rewrites nested `ticket` strings to single-use gateway tickets and bridges `rex.data.terminal.v1` byte-for-byte.
@@ -161,7 +161,7 @@ Welcome shape (ids are new on every connection):
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 35,
+  "api_server_revision": 36,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -198,7 +198,7 @@ Short version. Exact order, errors, and counters are below.
 
 ## Development
 
-`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes (including forgotten-session binary REJECT, Offline attach refuse, and finishing the agent sink after an unexpected upstream drop), event-lag notices, control-response idle refresh (including in-flight overflow replies), host-pin offline errors, the control-plane in-flight bound, panic-safe in-flight slot release, hung upstream-control pending RPC reap, upstream-control application-idle (ping/pong do not refresh), data-bridge close-reason truncation to 123 bytes, agent WebSocket frame/message caps at 1 MiB, `session.attach_all` fan-out, nested-only session routing, the data-bridge close-handshake drain, per-agent event subscription filtering and shared detach, and re-subscribing an upstream control socket after reconnect.
+`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes (including forgotten-session binary REJECT, Offline attach refuse, and finishing the agent sink after an unexpected upstream drop), event-lag notices, control-response idle refresh (including in-flight overflow replies), host-pin offline errors, the control-plane in-flight bound, panic-safe in-flight slot release, hung upstream-control pending RPC reap, upstream-control application-idle (ping/pong do not refresh), data-bridge close-reason truncation to 123 bytes, agent WebSocket frame/message caps at 1 MiB, `session.attach_all` fan-out, nested-only session routing, the data-bridge close-handshake drain, per-agent event subscription filtering and shared detach, detaching upstream when the last holding agent connection closes, and re-subscribing an upstream control socket after reconnect (only what agents still hold).
 
 ```sh
 cargo test --locked
@@ -213,7 +213,7 @@ The live scripts assume the repository root as the working directory, `127.0.0.1
 | --- | --- | --- |
 | [`smoke.py`](smoke.py) | 401 without a token and with the wrong token; welcome; a `local:session:` id from `session.list`; `server.version`; `session.attach` with `event_scope` `session` | Example config, and at least one session on an upstream the token can list |
 | [`smoke_data.py`](smoke_data.py) | Gateway ticket is 16 bytes; data ACCEPT `0x81`; snapshot and `HELLO_FROM_GATEWAY` bytes; reused ticket is `0x82 0x01` and close 1008 | A listed session with a focused block, and `rex` on `PATH` (override with `REX_BIN`) |
-| [`smoke_events.py`](smoke_events.py) | Two agents each get only events for the session they attached; one agent's `session.detach` is answered locally while the other still holds the session; `/status` has `events_dropped_scope` / `events_dropped_acl` | At least two listed sessions, and Rex reachable directly at `127.0.0.1:7297` (the script pokes sessions with its own client) |
+| [`smoke_events.py`](smoke_events.py) | Two agents each get only events for the session they attached; one agent's `session.detach` is answered locally while the other still holds the session; `/status` has `events_dropped_scope` / `events_dropped_acl`; closing the last agent that holds a session detaches the gateway's upstream connection from it (checked with `session.list_clients`) | At least two listed sessions, and Rex reachable directly at `127.0.0.1:7297` (the script pokes sessions with its own client) |
 | [`smoke_tags.py`](smoke_tags.py) | `session.bootstrap` reports `local` tags `perf`/`ci`; unsatisfiable `prefer_tags` errors; `/status` shows those tags | Same example upstream metadata, and a live session |
 | [`smoke_ttl.py`](smoke_ttl.py) | Reaper clears an unused ticket; late HELLO is `0x82 0x01`; gauges return to zero | Gateway started with `REX_GATEWAY_TICKET_TTL_MS=2000`, plus the hardcoded session and block at the top of `smoke_data.py` (this script does not discover them) |
 | [`smoke_sessions.py`](smoke_sessions.py) | Attach and data ACCEPT using a listed reference; `--check-gc` checks `session.forget`; `--after-ttl` expects `session reference expired/forgotten` | A listed session. The restart step is manual: stop and start the gateway on the same `REX_GATEWAY_SESSION_STORE_PATH`. The script also sends `session.rename`, which `smoke.py` notes current Rex no longer implements. A frame error there fails the script |
@@ -297,9 +297,10 @@ Each upstream has one control connection shared by every agent, and Rex subscrip
 - `session.attach_all` with `session` covers every session on each upstream it attached; with `all`, every event.
 - An event goes to an agent when it has `all` on that upstream, or the event's shallowest `session_id` is attached (or covered by `attach_all` `session`). Events without a `session_id` only go to `all` subscribers.
 - The subscription is recorded before the upstream call (Rex can send the first events ahead of its response) and rolled back if the call fails or returns an error.
-- `session.detach` removes only this agent's attach. It reaches Rex only when no other agent connection still holds that session; otherwise the gateway answers `{}` itself, as Rex does. Closing an agent connection releases its holds without detaching upstream; leftover upstream subscriptions are filtered out.
+- `session.detach` removes only this agent's attach. It reaches Rex only when no other agent connection still holds that session; otherwise the gateway answers `{}` itself, as Rex does. Closing an agent connection releases its holds. For each session it was the last holder of, the gateway sends `session.detach` upstream once the connection and its in-flight requests are done. If another agent attaches that session while a detach is in flight, the gateway attaches it again after the detach (Rex `session.attach` is idempotent).
+- Rex has no call that removes `session.attach_all` or scope `all` from a connection, and `session.detach` does not affect them. After the last agent holding one disconnects, the shared upstream socket keeps receiving those events and the gateway filters them out (`events_dropped_scope`). They are dropped at the next reconnect of that upstream control socket, as described next.
 
-Rex forgets a socket's subscriptions when it closes. When an upstream control socket reconnects (the probe reopens it within `probe_interval_ms`), the gateway replays the subscriptions that succeeded on it (`session.attach_all` for `all` / `session`, then `session.attach` per session) before the request that reopened it, and every agent subscribed on that upstream gets:
+Rex forgets a socket's subscriptions when it closes. When an upstream control socket reconnects (the probe reopens it within `probe_interval_ms`), the gateway replays the subscriptions that succeeded on it and that some agent connection still holds (`session.attach_all` for `all` / `session`, then `session.attach` per session) before the request that reopened it, and every agent subscribed on that upstream gets:
 
 ```json
 {"type":"event","seq":7,"payload":{"gateway":{"notice":"upstream_resubscribed","upstream":"local"}}}

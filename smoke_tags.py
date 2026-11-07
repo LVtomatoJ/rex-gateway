@@ -7,7 +7,8 @@ s,status=connect('smoke-secret');assert '101' in status
 frame(s,{'type':'hello'});assert json.loads(recv(s)[1])['type']=='welcome'
 def rpc(method,payload):
     frame(s,{'type':'request','id':'tags','method':method,'payload':payload})
-    reply=json.loads(recv(s)[1])
+    # Subscribed session events can arrive ahead of the response; skip them.
+    while (reply:=json.loads(recv(s)[1])).get('type')!='response': pass
     # Gateway-originated errors stay in payload.error; Rex frame errors are top-level.
     if 'error' in reply and 'payload' not in reply:
         return {'error': reply['error']}

@@ -336,6 +336,7 @@ async fn start_gateway_with_event_cap(upstreams: &[(&str, &str)], call_timeout: 
     }
     probe::spawn(pool.clone(), clients.clone(), probe_every);
     let metrics = Metrics::new();
+    let holds = crate::subscriptions::HoldRegistry::new(clients.clone());
     let state = AppState {
         pool: pool.clone(),
         clients,
@@ -351,7 +352,7 @@ async fn start_gateway_with_event_cap(upstreams: &[(&str, &str)], call_timeout: 
         control_limiter: OwnerLimiter::new(),
         events,
         discovery: crate::discovery::DiscoveryHealth::disabled(),
-        holds: crate::subscriptions::HoldRegistry::default(),
+        holds,
     };
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -393,7 +394,7 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let welcome: Value = serde_json::from_str(&welcome).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["api_server_revision"], 35);
+    assert_eq!(welcome["api_server_revision"], 36);
     assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
@@ -2334,4 +2335,64 @@ async fn failed_attach_does_not_subscribe_and_resubscribe_notice_reaches_subscri
     let notice = next_text(&mut y, tmo(500)).await.expect("notice");
     assert_eq!(notice["payload"]["gateway"], json!({"notice":"upstream_resubscribed","upstream":"bad"}));
     assert!(next_text(&mut x, tmo(100)).await.is_none(), "unsubscribed agent gets no resubscribe notice");
+}
+
+/// Fake Rex control server that answers every request with `{}` and records `(method, payload)`.
+async fn spawn_fake_rex_recording() -> (String, Arc<std::sync::Mutex<Vec<(String, Value)>>>) {
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let log = seen.clone();
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else { return };
+            let log = log.clone();
+            tokio::spawn(async move {
+                let callback = |_: &Request, mut response: Response| -> Result<Response, ErrorResponse> {
+                    response.headers_mut().insert("sec-websocket-protocol", HeaderValue::from_static(SUBPROTOCOL));
+                    Ok(response)
+                };
+                let Ok(mut socket) = accept_hdr_async(stream, callback).await else { return };
+                while let Some(Ok(tungstenite::Message::Text(text))) = socket.next().await {
+                    let message: Value = serde_json::from_str(&text).unwrap();
+                    match message["type"].as_str() {
+                        Some("hello") => { let _ = socket.send(tungstenite::Message::Text(json!({"type":"welcome"}).to_string())).await; }
+                        Some("request") => {
+                            log.lock().unwrap().push((message["method"].as_str().unwrap_or_default().to_owned(), message["payload"].clone()));
+                            let payload = if message["method"] == "session.attach_all" || message["method"] == "session.list" { json!({"sessions":[]}) } else { json!({}) };
+                            let _ = socket.send(tungstenite::Message::Text(json!({"type":"response","id":message["id"],"payload":payload}).to_string())).await;
+                        }
+                        _ => {}
+                    }
+                }
+            });
+        }
+    });
+    (format!("http://{addr}"), seen)
+}
+
+#[tokio::test]
+async fn closing_last_holder_detaches_session_upstream() {
+    let (url, seen) = spawn_fake_rex_recording().await;
+    let h = start_gateway(&[("rec", &url)], tmo(500), Duration::from_secs(3600), tmo(300)).await;
+    wait_state(&h.pool, "rec", UpstreamState::Online).await;
+    let mut x = control_agent(h.addr).await;
+    let mut y = control_agent(h.addr).await;
+    rpc(&mut x, "session.attach", json!({"session_id":"rec:session:a","event_scope":"session"})).await;
+    rpc(&mut x, "session.attach", json!({"session_id":"rec:session:b","event_scope":"session"})).await;
+    rpc(&mut x, "session.attach_all", json!({"event_scope":"all"})).await;
+    rpc(&mut y, "session.attach", json!({"session_id":"rec:session:a","event_scope":"session"})).await;
+    let detaches = || seen.lock().unwrap().iter().filter(|(m, _)| m == "session.detach").map(|(_, p)| p.clone()).collect::<Vec<_>>();
+    x.close(None).await.unwrap();
+    let deadline = tokio::time::Instant::now() + tmo(2000);
+    while detaches().is_empty() && tokio::time::Instant::now() < deadline { tokio::time::sleep(tmo(20)).await; }
+    tokio::time::sleep(tmo(100)).await;
+    assert_eq!(detaches(), vec![json!({"session_id":"session:b"})], "a is still held by y; all cannot be detached");
+    assert_eq!(h.state.holds.holders("rec", "session:a"), 1);
+    assert_eq!(h.state.holds.scope_holders("rec"), (0, 0), "x's scope all released");
+    drop(y);
+    let deadline = tokio::time::Instant::now() + tmo(2000);
+    while detaches().len() < 2 && tokio::time::Instant::now() < deadline { tokio::time::sleep(tmo(20)).await; }
+    assert_eq!(detaches(), vec![json!({"session_id":"session:b"}), json!({"session_id":"session:a"})]);
+    assert_eq!(h.state.holds.holders("rec", "session:a"), 0);
 }

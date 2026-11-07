@@ -144,7 +144,10 @@ fn backoff_delay(failures: u32) -> Duration {
 /// WebSocket when the first call arrives (and again after any socket loss). Failed connects
 /// back off exponentially so a dead upstream is not hammered, and fail fast meanwhile.
 #[derive(Clone)]
-pub struct ControlClient { tx: mpsc::Sender<Command>, call_timeout: Duration }
+pub struct ControlClient { tx: mpsc::Sender<Command>, call_timeout: Duration, replay_filter: Arc<std::sync::Mutex<Option<ReplayFilter>>> }
+
+/// Narrows the subscription set replayed after a reconnect (upstream id, recorded set).
+pub type ReplayFilter = Arc<dyn Fn(&str, &mut Subscriptions) + Send + Sync>;
 
 impl ControlClient {
     /// `call_timeout` bounds every call and each (re)connect attempt of this upstream.
@@ -152,8 +155,15 @@ impl ControlClient {
         let call_timeout = options.call_timeout;
         let upstream = id;
         let (tx, rx) = mpsc::channel(64);
-        tokio::spawn(Self::actor(url, options, events, upstream, rx));
-        Self { tx, call_timeout }
+        let replay_filter = Arc::new(std::sync::Mutex::new(None));
+        tokio::spawn(Self::actor(url, options, events, upstream, rx, replay_filter.clone()));
+        Self { tx, call_timeout, replay_filter }
+    }
+    /// Install the filter applied to the recorded subscriptions before each reconnect replay.
+    /// The first one installed wins.
+    pub fn set_replay_filter(&self, filter: ReplayFilter) {
+        let mut guard = self.replay_filter.lock().expect("replay filter");
+        if guard.is_none() { *guard = Some(filter); }
     }
     pub async fn call(&self, method: &str, payload: Value) -> Result<UpstreamReply> {
         self.call_timeout(method, payload, self.call_timeout).await
@@ -166,7 +176,7 @@ impl ControlClient {
         // Errors the actor reports (connect failure, socket closed, ...) pass through unchanged.
         tokio::time::timeout(timeout,rx).await.context("upstream request timeout")?.map_err(|_| anyhow!("upstream response lost"))?
     }
-    async fn actor(url:String, options:Options, events:broadcast::Sender<UpstreamEvent>, upstream:String, mut rx:mpsc::Receiver<Command>) {
+    async fn actor(url:String, options:Options, events:broadcast::Sender<UpstreamEvent>, upstream:String, mut rx:mpsc::Receiver<Command>, replay_filter:Arc<std::sync::Mutex<Option<ReplayFilter>>>) {
         let call_timeout = options.call_timeout;
         let mut socket:Option<Socket>=None;
         // Each in-flight RPC keeps its inserted Instant so we can fail hung ones even when
@@ -211,6 +221,9 @@ impl ControlClient {
                         match opened {
                             Ok(mut opened)=>{
                                 last_activity=Instant::now(); failures=0; retry_at=None; last_error.clear();
+                                // Drop what no agent holds any more (Rex cannot undo attach_all / scope all).
+                                let filter=replay_filter.lock().expect("replay filter").clone();
+                                if let Some(filter)=filter { filter(&upstream,&mut subscriptions); }
                                 if ever_connected && !subscriptions.is_empty() {
                                     // Rex dropped this socket's subscriptions with the old socket.
                                     let mut replayed=true;
@@ -612,6 +625,37 @@ mod tests {
         ], "only the successful attach is replayed, before the new call");
         let notice = events_rx.try_recv().expect("resubscribe notice");
         assert_eq!((notice.upstream.as_str(), &notice.event), ("up", &json!({"type":RESUBSCRIBED_EVENT_TYPE})));
+    }
+
+    #[tokio::test]
+    async fn replay_filter_drops_subscriptions_nobody_holds() {
+        let (seen_tx, mut seen) = tokio::sync::mpsc::unbounded_channel();
+        let url = mock_upstream_recording(seen_tx).await;
+        let (events, _events_rx) = broadcast::channel(16);
+        let options = Options { call_timeout: Duration::from_millis(500), ping_interval: Duration::from_secs(20), idle_timeout: Duration::from_secs(120) };
+        let client = ControlClient::new("up".into(), url, options, events);
+        // Stale: scope all and session:b are no longer held; session:a and attach_all session are.
+        client.set_replay_filter(Arc::new(|upstream: &str, subs: &mut Subscriptions| {
+            assert_eq!(upstream, "up");
+            subs.all = false;
+            subs.sessions.retain(|s| s == "session:a");
+        }));
+        client.set_replay_filter(Arc::new(|_: &str, subs: &mut Subscriptions| *subs = Subscriptions::default()));
+        client.call("session.attach_all", json!({"event_scope":"all"})).await.unwrap();
+        client.call("session.attach_all", json!({"event_scope":"session"})).await.unwrap();
+        client.call("session.attach", json!({"session_id":"session:a","event_scope":"session"})).await.unwrap();
+        client.call("session.attach", json!({"session_id":"session:b","event_scope":"session"})).await.unwrap();
+        assert!(client.call("test.drop", json!({})).await.is_err());
+        client.call("server.version", json!({})).await.unwrap();
+        let mut second = Vec::new();
+        while let Ok(Some((conn, method, payload))) = tokio::time::timeout(Duration::from_millis(200), seen.recv()).await {
+            if conn == 2 { second.push((method, payload)); }
+        }
+        assert_eq!(second, vec![
+            ("session.attach_all".to_owned(), json!({"event_scope":"session"})),
+            ("session.attach".to_owned(), json!({"session_id":"session:a","event_scope":"session"})),
+            ("server.version".to_owned(), json!({})),
+        ], "first filter wins; stale all and session:b are not replayed");
     }
 }
 

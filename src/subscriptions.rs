@@ -6,17 +6,31 @@
 
 use std::{collections::HashMap, sync::{Arc, Mutex}};
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use crate::control_client::{SubscriptionEffect, Subscriptions};
+use crate::control_client::{ClientMap, ControlClient, ReplayFilter, SubscriptionEffect, Subscriptions};
 
 /// Gateway-wide count of agent connections holding an explicit per-session attach, keyed by
-/// `(upstream, raw session id)`. `session.detach` only reaches Rex when no other agent holds
-/// that session, because Rex would otherwise stop sending its events to everyone.
+/// `(upstream, raw session id)`, plus per-upstream counts of agents holding scope `all` /
+/// `attach_all` `session`. `session.detach` only reaches Rex when no other agent holds that
+/// session, because Rex would otherwise stop sending its events to everyone. When an agent
+/// connection closes, sessions it was the last holder of are detached upstream.
 #[derive(Clone, Default)]
-pub struct HoldRegistry { inner: Arc<Mutex<HashMap<(String, String), usize>>> }
+pub struct HoldRegistry {
+    inner: Arc<Mutex<HashMap<(String, String), usize>>>,
+    scopes: Arc<Mutex<HashMap<String, ScopeHolds>>>,
+    /// Where to send the upstream detach when the last holder closes. `None` in unit tests.
+    clients: Option<ClientMap>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ScopeHolds { all: usize, all_sessions: usize }
+
+#[derive(Clone, Copy)]
+enum Scope { All, AllSessions }
 
 impl HoldRegistry {
+    pub fn new(clients: ClientMap) -> Self { Self { clients: Some(clients), ..Self::default() } }
     fn acquire(&self, upstream: &str, session: &str) {
         *self.inner.lock().expect("holds").entry((upstream.to_owned(), session.to_owned())).or_default() += 1;
     }
@@ -32,6 +46,57 @@ impl HoldRegistry {
     }
     pub fn holders(&self, upstream: &str, session: &str) -> usize {
         self.inner.lock().expect("holds").get(&(upstream.to_owned(), session.to_owned())).copied().unwrap_or(0)
+    }
+    fn scope(&self, upstream: &str, scope: Scope, acquire: bool) {
+        let mut guard = self.scopes.lock().expect("scopes");
+        let holds = guard.entry(upstream.to_owned()).or_default();
+        let count = match scope { Scope::All => &mut holds.all, Scope::AllSessions => &mut holds.all_sessions };
+        *count = if acquire { *count + 1 } else { count.saturating_sub(1) };
+        if *holds == ScopeHolds::default() { guard.remove(upstream); }
+    }
+    /// `(all, attach_all session)` holder counts on one upstream.
+    #[cfg(test)]
+    pub fn scope_holders(&self, upstream: &str) -> (usize, usize) {
+        self.scopes.lock().expect("scopes").get(upstream).map_or((0, 0), |h| (h.all, h.all_sessions))
+    }
+
+    /// Replay filter for an upstream control client: after a reconnect, re-subscribe only
+    /// what some agent connection still holds. Rex has no call that undoes `attach_all` or
+    /// scope `all`, so a reconnect is the only point where stale ones can be dropped.
+    pub fn replay_filter(&self) -> ReplayFilter {
+        let (inner, scopes) = (self.inner.clone(), self.scopes.clone());
+        Arc::new(move |upstream: &str, subs: &mut Subscriptions| {
+            let held = scopes.lock().expect("scopes").get(upstream).copied().unwrap_or_default();
+            subs.all &= held.all > 0;
+            subs.all_sessions &= held.all_sessions > 0;
+            let sessions = inner.lock().expect("holds");
+            subs.sessions.retain(|session| sessions.contains_key(&(upstream.to_owned(), session.clone())));
+        })
+    }
+
+    /// Let `client` prune its replay set against these holds (idempotent).
+    pub fn watch(&self, client: &ControlClient) { client.set_replay_filter(self.replay_filter()); }
+
+    /// Detach `session` on Rex in the background (the last holder's connection closed).
+    fn detach_upstream(&self, upstream: &str, session: &str) {
+        let Some(client) = self.clients.as_ref().and_then(|clients| clients.get(upstream)) else { return };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+        let (holds, upstream, session) = (self.clone(), upstream.to_owned(), session.to_owned());
+        runtime.spawn(async move {
+            match client.call("session.detach", json!({"session_id": session})).await {
+                Ok(reply) if !reply.is_application_error() => holds.reattach_if_held(&client, &upstream, &session).await,
+                Ok(_) | Err(_) => tracing::debug!(%upstream, %session, "upstream detach after agent close failed"),
+            }
+        });
+    }
+
+    /// A forwarded `session.detach` raced an attach from another agent connection: put the
+    /// session back on the shared upstream socket (Rex attach is idempotent).
+    pub async fn reattach_if_held(&self, client: &ControlClient, upstream: &str, session: &str) {
+        if self.holders(upstream, session) == 0 { return; }
+        if let Err(error) = client.call("session.attach", json!({"session_id": session, "event_scope": "session"})).await {
+            tracing::warn!(%upstream, %session, %error, "re-attach after racing detach failed");
+        }
     }
 }
 
@@ -58,13 +123,13 @@ impl AgentSubscriptions {
                     self.holds.acquire(upstream, session);
                     undo.new_session = Some(session.clone());
                 }
-                if *all && !subs.all { subs.all = true; undo.set_all = true; }
+                if *all && !subs.all { subs.all = true; undo.set_all = true; self.holds.scope(upstream, Scope::All, true); }
             }
             SubscriptionEffect::BootstrapDefault { all } | SubscriptionEffect::AttachAll { all } if *all => {
-                if !subs.all { subs.all = true; undo.set_all = true; }
+                if !subs.all { subs.all = true; undo.set_all = true; self.holds.scope(upstream, Scope::All, true); }
             }
             SubscriptionEffect::AttachAll { .. } => {
-                if !subs.all_sessions { subs.all_sessions = true; undo.set_all_sessions = true; }
+                if !subs.all_sessions { subs.all_sessions = true; undo.set_all_sessions = true; self.holds.scope(upstream, Scope::AllSessions, true); }
             }
             SubscriptionEffect::BootstrapDefault { .. } | SubscriptionEffect::Detach { .. } => {}
         }
@@ -77,8 +142,8 @@ impl AgentSubscriptions {
         if let Some(session) = undo.new_session {
             if subs.sessions.remove(&session) { self.holds.release(&undo.upstream, &session); }
         }
-        if undo.set_all { subs.all = false; }
-        if undo.set_all_sessions { subs.all_sessions = false; }
+        if undo.set_all { subs.all = false; self.holds.scope(&undo.upstream, Scope::All, false); }
+        if undo.set_all_sessions { subs.all_sessions = false; self.holds.scope(&undo.upstream, Scope::AllSessions, false); }
     }
 
     /// Record the session Rex picked for a session-less `session.bootstrap`.
@@ -120,8 +185,13 @@ impl AgentSubscriptions {
 impl Drop for AgentSubscriptions {
     fn drop(&mut self) {
         let guard = self.per_upstream.get_mut().unwrap_or_else(|e| e.into_inner());
+        // Runs once the connection loop and every in-flight RPC task are done with it.
         for (upstream, subs) in guard.iter() {
-            for session in &subs.sessions { self.holds.release(upstream, session); }
+            for session in &subs.sessions {
+                if self.holds.release(upstream, session) == 0 { self.holds.detach_upstream(upstream, session); }
+            }
+            if subs.all { self.holds.scope(upstream, Scope::All, false); }
+            if subs.all_sessions { self.holds.scope(upstream, Scope::AllSessions, false); }
         }
     }
 }
@@ -205,6 +275,35 @@ mod tests {
         drop(y);
         assert_eq!(holds.holders("up", "session:a"), 0);
         assert!(x.detach("up", "session:a"), "nobody holds it any more");
+    }
+
+    #[test]
+    fn scope_holds_follow_begin_undo_drop_and_prune_replay() {
+        let holds = HoldRegistry::default();
+        let x = AgentSubscriptions::new(holds.clone());
+        let y = AgentSubscriptions::new(holds.clone());
+        x.begin("up", &SubscriptionEffect::AttachAll { all: true });
+        x.begin("up", &SubscriptionEffect::AttachAll { all: true });
+        y.begin("up", &SubscriptionEffect::AttachAll { all: false });
+        let failed = y.begin("up", &attach("session:a", true));
+        assert_eq!(holds.scope_holders("up"), (2, 1));
+        y.undo(failed);
+        assert_eq!(holds.scope_holders("up"), (1, 1));
+        y.begin("up", &attach("session:b", false));
+        let recorded = || Subscriptions { all: true, all_sessions: true, sessions: ["session:a".to_owned(), "session:b".to_owned()].into() };
+        let filter = holds.replay_filter();
+        let mut subs = recorded();
+        filter("up", &mut subs);
+        assert_eq!(subs, Subscriptions { all: true, all_sessions: true, sessions: ["session:b".to_owned()].into() });
+        drop(x);
+        let mut subs = recorded();
+        filter("up", &mut subs);
+        assert_eq!(subs, Subscriptions { all: false, all_sessions: true, sessions: ["session:b".to_owned()].into() }, "all no longer held");
+        drop(y);
+        assert_eq!(holds.scope_holders("up"), (0, 0));
+        let mut subs = recorded();
+        filter("up", &mut subs);
+        assert!(subs.is_empty(), "nothing held: nothing replayed");
     }
 
     #[test]

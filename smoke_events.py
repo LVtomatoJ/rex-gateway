@@ -79,3 +79,35 @@ req = urllib.request.Request('http://127.0.0.1:7300/status', headers={'Authoriza
 with urllib.request.urlopen(req) as r: counters = json.load(r)['counters']
 assert counters['events_dropped_scope'] >= 1 and 'events_dropped_acl' in counters, counters
 print('PASS /status', {k: counters[k] for k in ('events_forwarded', 'events_dropped_scope', 'events_dropped_acl')})
+
+# Closing the last agent holding a session detaches the shared upstream connection from it.
+def direct():
+    d = socket.create_connection(('127.0.0.1', 7297)); d.settimeout(5)
+    key = base64.b64encode(os.urandom(16)).decode()
+    d.sendall(f'GET /api/control HTTP/1.1\r\nHost: 127.0.0.1:7297\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: rex.control.v1\r\n\r\n'.encode())
+    buf = b''
+    while b'\r\n\r\n' not in buf: buf += d.recv(4096)
+    frame(d, {'type': 'hello'}); recv(d)
+    return d
+def clients_on(d, raw_session):
+    n = clients_on.n = getattr(clients_on, 'n', 0) + 1
+    frame(d, {'type': 'request', 'id': f'c{n}', 'method': 'session.list_clients', 'payload': {'session_id': raw_session}})
+    while True:
+        msg = json.loads(recv(d)[1])
+        if msg.get('id') == f'c{n}': return len(msg['payload']['clients'])
+d = direct()
+frame(d, {'type': 'request', 'id': 'da', 'method': 'session.attach', 'payload': {'session_id': raw(a), 'event_scope': 'session'}})
+while json.loads(recv(d)[1]).get('id') != 'da': pass
+time.sleep(0.3)
+baseline = clients_on(d, raw(a))
+z = agent()
+assert 'error' not in rpc(z, 'session.attach', {'session_id': a, 'event_scope': 'session'})['payload']
+time.sleep(0.3)
+held = clients_on(d, raw(a))
+assert held == baseline + 1, (baseline, held)
+z.close()
+time.sleep(1.0)
+after = clients_on(d, raw(a))
+d.close()
+assert after == baseline, (baseline, held, after)
+print('PASS closing the last holder detached the gateway connection upstream', (baseline, held, after))
