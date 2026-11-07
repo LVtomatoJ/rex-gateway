@@ -40,6 +40,12 @@ const DATA_SUBPROTOCOL: &str = "rex.data.terminal.v1";
 /// (events, keepalive, idle) while spawned handlers await upstream.
 const MAX_IN_FLIGHT_CONTROL_RPCS: usize = 16;
 
+/// Agent control and data upgrades: match upstream `websocket_config()` so a single frame
+/// cannot exceed the advertised 1 MiB message cap (tungstenite's default frame cap is 16 MiB).
+fn apply_agent_ws_limits(ws: WebSocketUpgrade) -> WebSocketUpgrade {
+    ws.max_message_size(MAX_MESSAGE_BYTES).max_frame_size(MAX_MESSAGE_BYTES)
+}
+
 /// What the agent control response frame carries after a successful `handle`.
 /// Gateway-originated failures stay `Err(String)` → `payload: {"error":…}` for
 /// backward compatibility. Rex frame-level errors (`response.error`) are forwarded
@@ -151,7 +157,7 @@ async fn control_upgrade(
     State(state): State<AppState>,
 ) -> Result<Response, StatusCode> {
     let (acl, owner) = authenticate(&headers, &state, SUBPROTOCOL)?;
-    Ok(ws.protocols([SUBPROTOCOL]).max_message_size(MAX_MESSAGE_BYTES).on_upgrade(move |socket| serve_agent(socket, state, acl, owner)))
+    Ok(apply_agent_ws_limits(ws).protocols([SUBPROTOCOL]).on_upgrade(move |socket| serve_agent(socket, state, acl, owner)))
 }
 
 async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, owner: String) {
@@ -174,7 +180,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":28});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":29});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -583,7 +589,7 @@ async fn data_upgrade(
     State(state): State<AppState>,
 ) -> Result<Response, StatusCode> {
     let (_, owner) = authenticate(&headers, &state, DATA_SUBPROTOCOL)?;
-    Ok(ws.protocols([DATA_SUBPROTOCOL]).max_message_size(MAX_MESSAGE_BYTES).on_upgrade(move |socket| proxy_data(socket, state, owner)))
+    Ok(apply_agent_ws_limits(ws).protocols([DATA_SUBPROTOCOL]).on_upgrade(move |socket| proxy_data(socket, state, owner)))
 }
 
 /// Restore a just-taken ticket (failure before upstream HELLO is delivered) and close the agent once.
@@ -735,7 +741,9 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
                     }
                 }
                 Some(Ok(Message::Close(frame))) => {
+                    // Complete the close on the upstream side (same as peer-closed / idle paths).
                     let _ = upstream_sink.send(tungstenite::Message::Close(frame.map(to_upstream_close))).await;
+                    let _ = upstream_sink.close().await;
                     break;
                 }
                 Some(Err(_)) | None => {
@@ -775,6 +783,7 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
                 }
                 Some(Ok(tungstenite::Message::Close(frame))) => {
                     let _ = agent_sink.send(Message::Close(frame.map(to_agent_close))).await;
+                    let _ = agent_sink.close().await;
                     break;
                 }
                 Some(Ok(tungstenite::Message::Frame(_))) => {}

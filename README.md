@@ -17,7 +17,7 @@ It is a single Rust binary in this repository (`rex-gateway`). It does not embed
 ## What it does
 
 - Authenticates `GET /api/control`, `GET /api/data`, and `GET /status` with a bearer token before any WebSocket upgrade.
-- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **28**.
+- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **29**.
 - Fans `session.list` out to every allowed upstream and prefixes session ids with the upstream id.
 - Routes a namespaced session call back to that upstream, and routes a hostless `session.create` or other hostless call with the rules in [Routing and failover](#routing-and-failover).
 - Rewrites nested `ticket` strings to single-use gateway tickets and bridges `rex.data.terminal.v1` byte-for-byte.
@@ -161,7 +161,7 @@ Welcome shape (ids are new on every connection):
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 28,
+  "api_server_revision": 29,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -198,14 +198,14 @@ Short version. Exact order, errors, and counters are below.
 
 ## Development
 
-`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes (including forgotten-session binary REJECT), event-lag notices, control-response idle refresh, host-pin offline errors, the control-plane in-flight bound, and panic-safe in-flight slot release.
+`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes (including forgotten-session binary REJECT), event-lag notices, control-response idle refresh, host-pin offline errors, the control-plane in-flight bound, panic-safe in-flight slot release, and agent WebSocket frame/message caps at 1 MiB.
 
 ```sh
 cargo test --locked
 cargo build --locked
 ```
 
-On this tree, `cargo test --locked` passed 130 tests with rustc 1.99.1. `--locked` keeps the build on `Cargo.lock`; Cargo 1.83 cannot parse it.
+On this tree, `cargo test --locked` passed 131 tests with rustc 1.99.1. `--locked` keeps the build on `Cargo.lock`; Cargo 1.83 cannot parse it.
 
 The live scripts assume the repository root as the working directory, `127.0.0.1:7300`, and token `smoke-secret`. They are not part of `cargo test`.
 

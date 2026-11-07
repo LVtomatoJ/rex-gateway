@@ -349,7 +349,7 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let welcome: Value = serde_json::from_str(&welcome).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["api_server_revision"], 28);
+    assert_eq!(welcome["api_server_revision"], 29);
     assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
@@ -1035,6 +1035,32 @@ async fn control_gateway_limit_closes_1013_without_welcome() {
     };
     assert_eq!((u16::from(close.code), close.reason.as_ref()), (1013, "gateway control connection limit"));
 }
+
+#[tokio::test]
+async fn agent_control_rejects_frame_over_max_message_bytes() {
+    // Agent sockets must apply max_frame_size == MAX_MESSAGE_BYTES (not tungstenite's 16 MiB
+    // default). A single frame one byte over the cap must fail the read and end the socket.
+    let h = start_gateway(&[("local", &spawn_fake_rex(vec![], false).await)], tmo(500), tmo(5_000), tmo(500)).await;
+    let mut socket = control_agent(h.addr).await;
+    let oversized = "x".repeat(MAX_MESSAGE_BYTES + 1);
+    let frame = json!({"type":"request","id":"big","method":"server.version","payload":{"pad":oversized}}).to_string();
+    assert!(frame.len() > MAX_MESSAGE_BYTES);
+    // Send may succeed (client-side) while the server rejects during frame parse.
+    let _ = socket.send(tungstenite::Message::Text(frame)).await;
+    let closed = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(tungstenite::Message::Close(_))) | Some(Err(_)) | None => return,
+                Some(Ok(tungstenite::Message::Ping(b))) => {
+                    let _ = socket.send(tungstenite::Message::Pong(b)).await;
+                }
+                _ => {}
+            }
+        }
+    }).await;
+    assert!(closed.is_ok(), "gateway must drop the agent after an oversize frame");
+}
+
 
 #[tokio::test]
 async fn namespaced_call_to_offline_upstream_returns_clear_error() {
