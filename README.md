@@ -17,7 +17,7 @@ It is a single Rust binary in this repository (`rex-gateway`). It does not embed
 ## What it does
 
 - Authenticates `GET /api/control`, `GET /api/data`, and `GET /status` with a bearer token before any WebSocket upgrade.
-- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **25**.
+- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **26**.
 - Fans `session.list` out to every allowed upstream and prefixes session ids with the upstream id.
 - Routes a namespaced session call back to that upstream, and routes a hostless `session.create` or other hostless call with the rules in [Routing and failover](#routing-and-failover).
 - Rewrites nested `ticket` strings to single-use gateway tickets and bridges `rex.data.terminal.v1` byte-for-byte.
@@ -161,7 +161,7 @@ Welcome shape (ids are new on every connection):
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 25,
+  "api_server_revision": 26,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -368,7 +368,7 @@ The agent HELLO is the byte `0x01` plus those 16 raw bytes. The gateway then dia
 | Agent drops without a Close, or agent send fails | Upstream close `1001` `peer closed` |
 | No binary or text for `ws_idle_timeout_ms` | Both sides close `1001` `idle timeout` |
 
-Stream caps are checked before the ticket is taken, so close `1013` leaves it usable. A forgotten session is refused after `take` and the ticket stays spent. Failures before the upstream HELLO is delivered — missing upstream, invalid data URL, connect timeout, connection failed, invalid upstream ticket bytes, or HELLO send failure — put that same external id back with its original creation time, so the TTL does not restart and the agent may retry until expiry. `tickets_consumed` goes up on `take` and down by one on a successful restore. If the original TTL has already elapsed, restore does not put the ticket back and `tickets_expired` increases. A full map can evict some other oldest ticket to make room for the restored one (`tickets_evicted`). If that external id is already present, restore fails and this ticket stays spent. After a successful HELLO send the ticket is committed (the upstream may have consumed it).
+Stream caps are checked before the ticket is taken, so close `1013` leaves it usable. A forgotten session is refused after `take` and the ticket stays spent. Failures before the upstream HELLO is delivered — missing upstream, invalid data URL, connect timeout, connection failed, invalid upstream ticket bytes, or HELLO send failure — put that same external id back with its original creation time, so the TTL does not restart and the agent may retry until expiry. `tickets_consumed` goes up on `take` and down by one on a successful restore. `tickets_restored` increases only when restore puts the ticket back. If the original TTL has already elapsed, restore does not put the ticket back and `tickets_expired` increases. A full map can evict some other oldest ticket to make room for the restored one (`tickets_evicted`). If that external id is already present, restore fails and this ticket stays spent (neither `tickets_restored` nor a consume undo). After a successful HELLO send the ticket is committed (the upstream may have consumed it).
 
 Rex's own ACCEPT (`0x81…`) and REJECT frames are relayed once the bridge is up. The gateway does not invent an ACCEPT.
 
@@ -464,6 +464,7 @@ Illustrative shape (values depend on the running process):
     "tickets_consumed": 4,
     "tickets_expired": 1,
     "tickets_evicted": 0,
+    "tickets_restored": 0,
     "create_transport_failovers": 0,
     "hostless_transport_failovers": 0,
     "create_failover_exhausted": 0,
@@ -486,7 +487,7 @@ Illustrative shape (values depend on the running process):
 
 `state` is `Unknown`, `Online`, `Degraded`, or `Offline`. `source` is `Manual`, `Tailnet`, or `Lan`. `latency_ms` is the last probe latency, or null when that probe failed or none has run. `last_error` is the latest probe or failover error. A later probe that receives a `sessions` array clears it. `session_count` is the last probe's session array length, not a CPU reading. Rex probes do not report CPU.
 
-Gauges, current values: `pending_tickets`, `session_refs`, `session_forgotten`, `active_control_connections`, `active_data_streams`. `tickets_issued`, the failover counters, `events_lagged`, and `events_forwarded` increase for the life of the process. `tickets_consumed` increases on take and decreases when a connect-path failure restores the ticket. `tickets_expired` counts TTL removals, including a restore that finds the original TTL already elapsed. `tickets_evicted` counts capacity drops, including one done to make room for a restore. `events_lagged` is the sum of skipped upstream events. `events_forwarded` counts delivered upstream events and not the `events_lagged` notice. `session_forgotten` shrinks again if a later list or event records that id.
+Gauges, current values: `pending_tickets`, `session_refs`, `session_forgotten`, `active_control_connections`, `active_data_streams`. `tickets_issued`, the failover counters, `events_lagged`, and `events_forwarded` increase for the life of the process. `tickets_consumed` increases on take and decreases when a connect-path failure restores the ticket. `tickets_restored` counts successful restores for the life of the process (failed restores do not bump it). `tickets_expired` counts TTL removals, including a restore that finds the original TTL already elapsed. `tickets_evicted` counts capacity drops, including one done to make room for a restore. `events_lagged` is the sum of skipped upstream events. `events_forwarded` counts delivered upstream events and not the `events_lagged` notice. `session_forgotten` shrinks again if a later list or event records that id.
 
 `discovery.mode` is `command`, `file`, or `none`. Ages are null until that event has happened. `last_applied` is whether the last successful refresh changed the pool from a snapshot. Disabled discovery still returns the object with `enabled: false` and `mode: "none"`.
 

@@ -17,7 +17,7 @@ Rex Gateway 是放在你自己的一台或多台 Rex 服务器前面的控制面
 ## 它做什么
 
 - 在 WebSocket 升级之前，用 Bearer 令牌认证 `GET /api/control`、`GET /api/data` 和 `GET /status`。
-- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **25**。
+- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **26**。
 - 把 `session.list` 并发发到每个允许的上游，并给会话 id 加上上游 id 前缀。
 - 带上游前缀的会话调用回到那台上游；没有会话 id 的 `session.create` 和其他无主机调用按[路由与故障转移](#路由与故障转移)处理。
 - 把嵌套的 `ticket` 字符串换成一次性网关票据，并按消息原样桥接 `rex.data.terminal.v1`。
@@ -161,7 +161,7 @@ avoid_hosts = []
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 25,
+  "api_server_revision": 26,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -368,7 +368,7 @@ Agent 的 HELLO 是字节 `0x01` 加上这 16 个原始字节。网关随后拨�
 | Agent 没有 Close 就断开，或发给 agent 失败 | 上游关闭 `1001` `peer closed` |
 | 在 `ws_idle_timeout_ms` 内没有二进制或文本 | 两侧都关闭 `1001` `idle timeout` |
 
-数据流上限在取走票据之前检查，因此关闭 `1013` 后票据仍可使用。会话已忘记是在 `take` 之后拒绝的，票据保持已消耗。上游 HELLO 送达之前的失败——上游缺失、数据 URL 无效、连接超时、连接失败、上游票据字节无效，或 HELLO 发送失败——会把同一个外部 id 放回去，创建时间不变，所以 TTL 不会重新计时，agent 可以在过期前重试。`tickets_consumed` 在 `take` 时加一，成功退回时减一。若原来的 TTL 已经走完，退回不会把票据放回去，并且 `tickets_expired` 增加。映射已满时，退回可能淘汰另一张最旧的票据来腾位置（`tickets_evicted`）。若这个外部 id 已经在映射里，退回失败，这张票据保持已消耗。HELLO 发送成功后票据才算提交（上游可能已经消耗了自己的票据）。
+数据流上限在取走票据之前检查，因此关闭 `1013` 后票据仍可使用。会话已忘记是在 `take` 之后拒绝的，票据保持已消耗。上游 HELLO 送达之前的失败——上游缺失、数据 URL 无效、连接超时、连接失败、上游票据字节无效，或 HELLO 发送失败——会把同一个外部 id 放回去，创建时间不变，所以 TTL 不会重新计时，agent 可以在过期前重试。`tickets_consumed` 在 `take` 时加一，成功退回时减一。只有退回真正把票据放回去时，`tickets_restored` 才会加一。若原来的 TTL 已经走完，退回不会把票据放回去，并且 `tickets_expired` 增加。映射已满时，退回可能淘汰另一张最旧的票据来腾位置（`tickets_evicted`）。若这个外部 id 已经在映射里，退回失败，这张票据保持已消耗（既不增加 `tickets_restored`，也不撤销消耗计数）。HELLO 发送成功后票据才算提交（上游可能已经消耗了自己的票据）。
 
 桥建立之后，Rex 自己的 ACCEPT（`0x81…`）和 REJECT 会被转发。网关不会自己造一个 ACCEPT。
 
@@ -464,6 +464,7 @@ store_path = "rex-gateway-discovered.json"
     "tickets_consumed": 4,
     "tickets_expired": 1,
     "tickets_evicted": 0,
+    "tickets_restored": 0,
     "create_transport_failovers": 0,
     "hostless_transport_failovers": 0,
     "create_failover_exhausted": 0,
@@ -486,7 +487,7 @@ store_path = "rex-gateway-discovered.json"
 
 `state` 为 `Unknown`、`Online`、`Degraded` 或 `Offline`。`source` 为 `Manual`、`Tailnet` 或 `Lan`。`latency_ms` 是上一次探测的延迟；该次探测失败或还没探测过时为 null。`last_error` 是最近的探测或故障转移错误。之后某次探测若收到 `sessions` 数组，会把它清掉。`session_count` 是上一次探测里会话数组的长度，不是 CPU。Rex 探测不采集 CPU。
 
-当前值（计量）：`pending_tickets`、`session_refs`、`session_forgotten`、`active_control_connections`、`active_data_streams`。`tickets_issued`、故障转移计数、`events_lagged` 和 `events_forwarded` 在进程存活期间递增。`tickets_consumed` 在取走时增加，连接失败把票据退回时减少。`tickets_expired` 统计因 TTL 删除的票据，包括退回时发现原来的 TTL 已经走完。`tickets_evicted` 统计因容量丢掉的票据，包括为退回腾位置而丢掉的。`events_lagged` 是被跳过的上游事件数量之和。`events_forwarded` 统计已送达的上游事件，不含 `events_lagged` 通知。若之后的列举或事件再次记录某个 id，`session_forgotten` 会减小。
+当前值（计量）：`pending_tickets`、`session_refs`、`session_forgotten`、`active_control_connections`、`active_data_streams`。`tickets_issued`、故障转移计数、`events_lagged` 和 `events_forwarded` 在进程存活期间递增。`tickets_consumed` 在取走时增加，连接失败把票据退回时减少。`tickets_restored` 统计进程存活期间成功退回的次数（退回失败不加）。`tickets_expired` 统计因 TTL 删除的票据，包括退回时发现原来的 TTL 已经走完。`tickets_evicted` 统计因容量丢掉的票据，包括为退回腾位置而丢掉的。`events_lagged` 是被跳过的上游事件数量之和。`events_forwarded` 统计已送达的上游事件，不含 `events_lagged` 通知。若之后的列举或事件再次记录某个 id，`session_forgotten` 会减小。
 
 `discovery.mode` 为 `command`、`file` 或 `none`。对应事件还没发生时，年龄为 null。`last_applied` 表示最近一次成功刷新是否用快照更新了池。未启用发现时这个对象仍在，`enabled` 为 false，`mode` 为 `"none"`。
 

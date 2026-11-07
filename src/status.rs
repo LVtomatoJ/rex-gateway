@@ -52,6 +52,7 @@ pub fn build(
             "tickets_consumed": counters.tickets_consumed,
             "tickets_expired": counters.tickets_expired,
             "tickets_evicted": counters.tickets_evicted,
+            "tickets_restored": counters.tickets_restored,
             "create_transport_failovers": counters.create_transport_failovers,
             "hostless_transport_failovers": counters.hostless_transport_failovers,
             "create_failover_exhausted": counters.create_failover_exhausted,
@@ -115,7 +116,7 @@ mod tests {
         pool.mark("a", UpstreamState::Online, Some(12), 3).await;
         pool.mark_failure("b", "connection refused".into()).await;
         let counters = MetricsSnapshot {
-            tickets_issued: 5, tickets_consumed: 3, tickets_expired: 1, tickets_evicted: 1,
+            tickets_issued: 5, tickets_consumed: 3, tickets_expired: 1, tickets_evicted: 1, tickets_restored: 2,
             active_control: 2, active_data: 1,
             create_transport_failovers: 2, hostless_transport_failovers: 3,
             create_failover_exhausted: 1, hostless_failover_exhausted: 0,
@@ -143,7 +144,7 @@ mod tests {
         assert_eq!(all["counters"], json!({
             "pending_tickets": 4, "session_refs": 3, "session_forgotten": 2,
             "active_control_connections": 2, "active_data_streams": 1,
-            "tickets_issued": 5, "tickets_consumed": 3, "tickets_expired": 1, "tickets_evicted": 1,
+            "tickets_issued": 5, "tickets_consumed": 3, "tickets_expired": 1, "tickets_evicted": 1, "tickets_restored": 2,
             "create_transport_failovers": 2, "hostless_transport_failovers": 3,
             "create_failover_exhausted": 1, "hostless_failover_exhausted": 0,
             "events_lagged": 4, "events_forwarded": 9,

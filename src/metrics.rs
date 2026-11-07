@@ -13,6 +13,8 @@ pub struct Metrics {
     pub tickets_expired: AtomicU64,
     /// Tickets dropped early because the map was at capacity.
     pub tickets_evicted: AtomicU64,
+    /// Tickets successfully put back after a connect-path / HELLO failure (monotonic).
+    pub tickets_restored: AtomicU64,
     pub active_control: AtomicU64,
     pub active_data: AtomicU64,
     /// Hostless `session.create` transport-error hops (each tried upstream recorded).
@@ -35,6 +37,7 @@ pub struct MetricsSnapshot {
     pub tickets_consumed: u64,
     pub tickets_expired: u64,
     pub tickets_evicted: u64,
+    pub tickets_restored: u64,
     pub active_control: u64,
     pub active_data: u64,
     pub create_transport_failovers: u64,
@@ -60,6 +63,7 @@ impl Metrics {
             tickets_consumed: self.tickets_consumed.load(Relaxed),
             tickets_expired: self.tickets_expired.load(Relaxed),
             tickets_evicted: self.tickets_evicted.load(Relaxed),
+            tickets_restored: self.tickets_restored.load(Relaxed),
             active_control: self.active_control.load(Relaxed),
             active_data: self.active_data.load(Relaxed),
             create_transport_failovers: self.create_transport_failovers.load(Relaxed),
