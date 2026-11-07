@@ -349,7 +349,7 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let welcome: Value = serde_json::from_str(&welcome).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["api_server_revision"], 23);
+    assert_eq!(welcome["api_server_revision"], 24);
     assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
@@ -494,7 +494,7 @@ async fn data_plane_upstream_connect_timeout_closes_with_1011() {
     let held = tokio::spawn(async move { let mut keep = Vec::new(); while let Ok((s, _)) = stuck.accept().await { keep.push(s); } });
     let h = start_gateway(&[("stuck", &url)], tmo(300), Duration::from_secs(3600), tmo(300)).await;
     let external = h.state.tickets.insert("stuck", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
-    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, external).unwrap();
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
 
     let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
     socket.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat().into())).await.unwrap();
@@ -504,7 +504,43 @@ async fn data_plane_upstream_connect_timeout_closes_with_1011() {
         other => panic!("expected close, got {other:?}"),
     }
     assert!(started.elapsed() < Duration::from_secs(3));
+    // Connect-path failure restores the gateway ticket so the agent may retry until TTL.
+    assert_eq!(h.state.tickets.pending(), 1, "ticket restored after connect timeout");
+    let restored = h.state.tickets.take(&external, SECRET).expect("same ticket takeable again");
+    assert_eq!(restored.upstream, "stuck");
+    assert_eq!(restored.upstream_ticket, "AAAAAAAAAAAAAAAAAAAAAA");
     held.abort();
+}
+
+#[tokio::test]
+async fn data_plane_upstream_connection_failed_restores_ticket() {
+    // Nothing listens: TCP connect fails immediately → 1011 + ticket restored.
+    let h = start_gateway(&[("down", "http://127.0.0.1:9")], tmo(300), Duration::from_secs(3600), tmo(500)).await;
+    let external = h.state.tickets.insert("down", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
+    let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat().into())).await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(5), socket.next()).await.expect("must not hang").unwrap().unwrap() {
+        tungstenite::Message::Close(Some(frame)) => assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1011, "upstream connection failed")),
+        other => panic!("expected close, got {other:?}"),
+    }
+    assert_eq!(h.state.tickets.pending(), 1, "ticket restored after connection failed");
+    assert!(h.state.tickets.take(&external, SECRET).is_some());
+}
+
+#[tokio::test]
+async fn data_plane_missing_upstream_restores_ticket() {
+    let h = start_gateway(&[("a", "http://127.0.0.1:9")], tmo(300), Duration::from_secs(3600), tmo(300)).await;
+    let external = h.state.tickets.insert("gone", "AAAAAAAAAAAAAAAAAAAAAA", SECRET);
+    let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
+    let mut socket = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
+    socket.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat().into())).await.unwrap();
+    match tokio::time::timeout(Duration::from_secs(5), socket.next()).await.expect("must not hang").unwrap().unwrap() {
+        tungstenite::Message::Close(Some(frame)) => assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1011, "upstream unavailable")),
+        other => panic!("expected close, got {other:?}"),
+    }
+    assert_eq!(h.state.tickets.pending(), 1);
+    assert!(h.state.tickets.take(&external, SECRET).is_some());
 }
 
 #[tokio::test]
@@ -1077,6 +1113,11 @@ async fn capability_tags_create_routing_bootstrap_and_owner_degradation() {
     assert_eq!(reply["upstreams"][1]["description"],"compile box");
     assert!(reply["upstreams"][1]["session_count"].is_u64());
     h.pool.mark("busy",UpstreamState::Offline,None,0).await;
+    let reply=rpc(&mut socket,"session.create",json!({"host":"busy"})).await;
+    let err=reply["error"].as_str().unwrap();
+    assert!(err.contains("Offline"), "{reply}");
+    assert!(err.contains("wait") || err.contains("choose a different host"), "{reply}");
+    assert!(!err.contains("remove/recreate"), "create has no session yet: {reply}");
     let reply=rpc(&mut socket,"session.bootstrap",json!({"session_id":"busy:session:busy"})).await;
     assert!(reply["error"].as_str().unwrap().contains("remove/recreate"));
     let reply=rpc(&mut socket,"session.list",json!({})).await;

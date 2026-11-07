@@ -29,7 +29,7 @@ agent's data-plane HELLO read and the connect to the upstream data socket. Zero 
 ## Protocol and routing decisions
 
 * `GET /api/control`, subprotocol `rex.control.v1`, bearer token required before upgrade.
-  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 23).
+  Agent sends `{"type":"hello"}`, then receives a gateway welcome (revision 24).
 * `session.list` fans out concurrently to allowed upstreams and returns `local:session:<uuid>`-style
   namespaced IDs (recursively wrapping nested `session_id` / `ticket` fields the same way as
   other responses) in sorted upstream-ID order. Upstreams that are not routable (`Online` or
@@ -131,7 +131,9 @@ reports real sessions, outstanding reserves and their sum (`effective_session_co
 ACL-filtered `upstreams` array with the same capability/load fields. Real Rex requires
 `event_scope` of `"session"` or `"all"` on bootstrap (otherwise Rex returns a frame-level
 `bad_request` which the gateway now forwards unchanged). Unavailable owners cause bootstrap
-to error with remove/recreate guidance; the data plane still closes 1011 on unexpected stream loss.
+to error with remove/recreate guidance; a hard-pin `session.create` against an Offline/Unknown
+host instead tells the agent to wait or choose a different host (there is no session yet). The
+data plane still closes 1011 on unexpected stream loss.
 CPU is not gathered by Rex probes, so session count is the current load signal.
 
 ```sh
@@ -189,7 +191,10 @@ all receive REJECT `0x82 0x01` (indistinguishable to the caller); malformed HELL
 `0x82 0x05`. An agent that connects but never sends HELLO within `data_connect_timeout_ms` gets
 `0x82 0x05` and a close `1008 "HELLO timeout"`; if the upstream data socket cannot be opened in that
 time (or fails), the agent socket is closed with `1011 "upstream connect timeout"` /
-`"upstream connection failed"`. A wrong-owner attempt does not burn the legitimate owner's live ticket.
+`"upstream connection failed"`. Connect-path failures before the upstream HELLO is forwarded
+(missing upstream, invalid data URL, connect timeout, connection failed) restore the unused
+gateway ticket under the same external id with its original TTL, so the agent may retry the
+same ticket until it expires. A wrong-owner attempt does not burn the legitimate owner's live ticket.
 
 ## Durable session references and cleanup
 

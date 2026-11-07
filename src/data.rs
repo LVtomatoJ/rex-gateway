@@ -17,6 +17,20 @@ pub struct Ticket {
     pub session_id: Option<String>,
 }
 
+/// Result of a successful [`TicketMap::take`]: enough to [`TicketMap::restore`] the same
+/// external id with the original creation Instant (TTL does not reset).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TakenTicket {
+    pub external: String,
+    pub ticket: Ticket,
+    created: Instant,
+}
+
+impl std::ops::Deref for TakenTicket {
+    type Target = Ticket;
+    fn deref(&self) -> &Ticket { &self.ticket }
+}
+
 struct Entry { ticket: Ticket, created: Instant, seq: u64 }
 
 #[derive(Default)]
@@ -92,13 +106,15 @@ impl TicketMap {
         external
     }
 
-    pub fn take(&self, external: &str, owner: &str) -> Option<Ticket> {
+    pub fn take(&self, external: &str, owner: &str) -> Option<TakenTicket> {
         self.take_at(external, owner, Instant::now())
     }
 
     /// Consumes a ticket. Unknown, expired, already-used and wrong-owner tickets all yield `None`
     /// (callers cannot tell them apart). A wrong-owner attempt does not burn a live ticket.
-    pub fn take_at(&self, external: &str, owner: &str, now: Instant) -> Option<Ticket> {
+    /// The returned [`TakenTicket`] can be put back with [`restore`] / [`restore_at`] if the
+    /// agent never reaches the upstream (connect-path failure before HELLO is forwarded).
+    pub fn take_at(&self, external: &str, owner: &str, now: Instant) -> Option<TakenTicket> {
         let mut inner = self.lock();
         let entry = inner.entries.get(external)?;
         if self.expired(entry.created, now) {
@@ -112,7 +128,40 @@ impl TicketMap {
         let entry = inner.entries.remove(external)?;
         inner.order.remove(&entry.seq);
         self.metrics.tickets_consumed.fetch_add(1, Relaxed);
-        Some(entry.ticket)
+        Some(TakenTicket { external: external.to_owned(), ticket: entry.ticket, created: entry.created })
+    }
+
+    /// Puts a previously taken ticket back under the same external id with its original
+    /// `created` Instant. Returns `false` (and leaves metrics alone aside from expiry) when
+    /// the ticket has already expired or the external id is occupied again.
+    pub fn restore(&self, taken: TakenTicket) -> bool {
+        self.restore_at(taken, Instant::now())
+    }
+
+    pub fn restore_at(&self, taken: TakenTicket, now: Instant) -> bool {
+        if self.expired(taken.created, now) {
+            self.metrics.tickets_expired.fetch_add(1, Relaxed);
+            return false;
+        }
+        let mut inner = self.lock();
+        if inner.entries.contains_key(&taken.external) {
+            return false;
+        }
+        while inner.entries.len() >= self.max {
+            let Some((_, oldest)) = inner.order.pop_first() else { break };
+            inner.entries.remove(&oldest);
+            self.metrics.tickets_evicted.fetch_add(1, Relaxed);
+        }
+        let seq = inner.next_seq;
+        inner.next_seq += 1;
+        inner.order.insert(seq, taken.external.clone());
+        inner.entries.insert(taken.external.clone(), Entry {
+            ticket: taken.ticket,
+            created: taken.created,
+            seq,
+        });
+        self.metrics.tickets_consumed.fetch_sub(1, Relaxed);
+        true
     }
 
     /// Purges every expired entry and returns how many were removed.
@@ -179,9 +228,11 @@ mod tests {
         let external = map.insert_at("local", "real-ticket", "secret", None, now);
         assert_eq!(map.take_at(&external, "other", now), None);
         assert_eq!(map.pending(), 1, "wrong owner must not burn the ticket");
-        assert_eq!(map.take_at(&external, "secret", now), Some(Ticket {
+        let taken = map.take_at(&external, "secret", now).expect("owner takes once");
+        assert_eq!(taken.external, external);
+        assert_eq!(taken.ticket, Ticket {
             upstream: "local".into(), upstream_ticket: "real-ticket".into(), owner: "secret".into(), session_id: None,
-        }));
+        });
         assert_eq!(map.take_at(&external, "secret", now), None, "single use");
         assert_eq!(map.pending(), 0);
         let snap = metrics.snapshot();
@@ -282,6 +333,70 @@ mod tests {
         assert_eq!(ticket.session_id.as_deref(), Some("local:session:a"));
         let unbound = map.insert_at("local", "real2", "secret", None, now);
         assert_eq!(map.take_at(&unbound, "secret", now).unwrap().session_id, None);
+    }
+
+    #[test]
+    fn take_then_restore_preserves_external_mapping_and_ttl() {
+        let (map, metrics) = map(8);
+        let t0 = Instant::now();
+        let external = map.insert_at("local", "real-ticket", "secret", Some("local:session:a"), t0);
+        let taken = map.take_at(&external, "secret", t0).unwrap();
+        assert_eq!(map.pending(), 0);
+        assert_eq!(metrics.snapshot().tickets_consumed, 1);
+        assert!(map.restore_at(taken, t0 + Duration::from_secs(5)));
+        assert_eq!(map.pending(), 1);
+        assert_eq!(metrics.snapshot().tickets_consumed, 0, "successful restore undoes consume");
+        // Original created Instant: still valid just before TTL, expired at TTL.
+        let again = map.take_at(&external, "secret", t0 + TTL - Duration::from_millis(1)).unwrap();
+        assert_eq!(again.ticket.upstream, "local");
+        assert_eq!(again.ticket.upstream_ticket, "real-ticket");
+        assert_eq!(again.ticket.session_id.as_deref(), Some("local:session:a"));
+        assert!(map.restore_at(again, t0 + TTL - Duration::from_millis(1)));
+        assert_eq!(map.take_at(&external, "secret", t0 + TTL), None, "original TTL still applies after restore");
+        assert_eq!(map.pending(), 0);
+    }
+
+    #[test]
+    fn restore_of_expired_taken_ticket_fails() {
+        let (map, metrics) = map(8);
+        let t0 = Instant::now();
+        let external = map.insert_at("a", "t", "secret", None, t0);
+        let taken = map.take_at(&external, "secret", t0).unwrap();
+        assert!(!map.restore_at(taken, t0 + TTL), "expired taken ticket must not reinsert");
+        assert_eq!(map.pending(), 0);
+        assert_eq!(map.take_at(&external, "secret", t0 + TTL), None);
+        assert_eq!(metrics.snapshot().tickets_expired, 1);
+        assert_eq!(metrics.snapshot().tickets_consumed, 1, "failed restore leaves consume counted");
+    }
+
+    #[test]
+    fn restore_does_not_overwrite_live_ticket() {
+        let (map, metrics) = map(8);
+        let t0 = Instant::now();
+        let external = map.insert_at("a", "t1", "secret", None, t0);
+        let taken = map.take_at(&external, "secret", t0).unwrap();
+        assert!(map.restore_at(taken.clone(), t0));
+        assert!(!map.restore_at(taken, t0), "must not overwrite an occupied external id");
+        assert_eq!(map.pending(), 1);
+        assert_eq!(metrics.snapshot().tickets_consumed, 0);
+        let live = map.take_at(&external, "secret", t0).unwrap();
+        assert_eq!(live.ticket.upstream_ticket, "t1");
+    }
+
+    #[test]
+    fn restore_gets_fresh_eviction_seq() {
+        let (map, metrics) = map(2);
+        let t0 = Instant::now();
+        let a = map.insert_at("a", "t0", "secret", None, t0);
+        let b = map.insert_at("a", "t1", "secret", None, t0);
+        let taken_a = map.take_at(&a, "secret", t0).unwrap();
+        assert!(map.restore_at(taken_a, t0));
+        // Capacity full with B (older seq) then A (restored, newer seq). Insert C evicts B.
+        let c = map.insert_at("a", "t2", "secret", None, t0);
+        assert_eq!(map.take_at(&b, "secret", t0), None, "oldest unre-stored entry evicted");
+        assert!(map.take_at(&a, "secret", t0).is_some(), "restored ticket is youngest");
+        assert!(map.take_at(&c, "secret", t0).is_some());
+        assert_eq!(metrics.snapshot().tickets_evicted, 1);
     }
 
     #[test]
