@@ -349,7 +349,7 @@ async fn control_agent_with_auth(addr: SocketAddr, authorization: &'static str) 
     let welcome = socket.next().await.unwrap().unwrap().into_text().unwrap();
     let welcome: Value = serde_json::from_str(&welcome).unwrap();
     assert_eq!(welcome["type"], "welcome");
-    assert_eq!(welcome["api_server_revision"], 27);
+    assert_eq!(welcome["api_server_revision"], 28);
     assert_eq!(welcome["limits"]["max_in_flight_control_rpcs"], MAX_IN_FLIGHT_CONTROL_RPCS);
     socket
 }
@@ -1270,7 +1270,14 @@ async fn data_attach_after_forget_rejects_before_upstream() {
     let raw=base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD,external).unwrap();
     let mut socket=agent(h.addr,"/api/data",DATA_SUBPROTOCOL).await;
     socket.send(tungstenite::Message::Binary([&[1u8][..],&raw].concat())).await.unwrap();
-    match socket.next().await.unwrap().unwrap(){tungstenite::Message::Close(Some(frame))=>assert_eq!((u16::from(frame.code),frame.reason.as_ref()),(1008,crate::sessions::FORGOTTEN_ERROR)),other=>panic!("{other:?}")}
+    let first = socket.next().await.unwrap().unwrap();
+    assert_eq!(first, tungstenite::Message::Binary(vec![0x82, 0x01].into()), "forgotten attach must send binary REJECT like bad-ticket");
+    match socket.next().await.unwrap().unwrap() {
+        tungstenite::Message::Close(Some(frame)) => {
+            assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1008, crate::sessions::FORGOTTEN_ERROR));
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 /// Tickets rewritten out of session.list / bootstrap / events must refuse attach after
@@ -1294,6 +1301,8 @@ async fn list_issued_ticket_rejects_after_forget() {
     let raw = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, &external).unwrap();
     let mut data = agent(h.addr, "/api/data", DATA_SUBPROTOCOL).await;
     data.send(tungstenite::Message::Binary([&[1u8][..], &raw].concat())).await.unwrap();
+    let first = data.next().await.unwrap().unwrap();
+    assert_eq!(first, tungstenite::Message::Binary(vec![0x82, 0x01].into()), "forgotten attach must send binary REJECT");
     match data.next().await.unwrap().unwrap() {
         tungstenite::Message::Close(Some(frame)) => {
             assert_eq!((u16::from(frame.code), frame.reason.as_ref()), (1008, crate::sessions::FORGOTTEN_ERROR));
@@ -1654,6 +1663,58 @@ async fn in_flight_control_rpc_bound_returns_clear_error() {
         }
     }
     let overflow = overflow.expect("overflow response must arrive promptly");
+    assert_eq!(
+        overflow["payload"]["error"].as_str(),
+        Some("too many in-flight control RPCs"),
+        "{overflow}"
+    );
+}
+
+/// A panicked RPC handler must still free its in-flight slot so later calls are not stuck
+/// behind a phantom occupancy until the agent reconnects.
+#[tokio::test]
+async fn panicked_control_rpc_releases_in_flight_slot() {
+    let hung = spawn_fake_rex(vec![], true).await;
+    let h = start_gateway(&[("hung", &hung)], Duration::from_secs(5), Duration::from_secs(3600), tmo(300)).await;
+    h.pool.mark("hung", UpstreamState::Online, Some(1), 0).await;
+    let mut socket = control_agent(h.addr).await;
+
+    // Panic returns a clear gateway error and must not tear down the agent socket.
+    let boom = rpc(&mut socket, "gateway.__test_panic", json!({})).await;
+    assert_eq!(boom["error"].as_str(), Some("control RPC task panicked"), "{boom}");
+
+    // Slot freed: occupying all 16 with hung upstream calls, then overflow must still fire.
+    for i in 0..MAX_IN_FLIGHT_CONTROL_RPCS {
+        socket.send(tungstenite::Message::Text(
+            json!({"type":"request","id":format!("hold-{i}"),"method":"server.version","payload":{"host":"hung"}}).to_string(),
+        )).await.unwrap();
+    }
+    tokio::time::sleep(tmo(50)).await;
+    socket.send(tungstenite::Message::Text(
+        json!({"type":"request","id":"overflow","method":"server.version","payload":{"host":"hung"}}).to_string(),
+    )).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let mut overflow: Option<Value> = None;
+    while tokio::time::Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let frame = match tokio::time::timeout(remaining, socket.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            _ => break,
+        };
+        match frame {
+            tungstenite::Message::Ping(bytes) => { let _ = socket.send(tungstenite::Message::Pong(bytes)).await; }
+            tungstenite::Message::Text(text) => {
+                let msg: Value = serde_json::from_str(&text).unwrap();
+                if msg["type"] == "response" && msg["id"] == "overflow" {
+                    overflow = Some(msg);
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    let overflow = overflow.expect("overflow response must arrive promptly after panic freed its slot");
     assert_eq!(
         overflow["payload"]["error"].as_str(),
         Some("too many in-flight control RPCs"),

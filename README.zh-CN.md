@@ -17,7 +17,7 @@ Rex Gateway 是放在你自己的一台或多台 Rex 服务器前面的控制面
 ## 它做什么
 
 - 在 WebSocket 升级之前，用 Bearer 令牌认证 `GET /api/control`、`GET /api/data` 和 `GET /status`。
-- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **27**。
+- 使用子协议 `rex.control.v1`。欢迎消息里的 `api_server_revision` 是 **28**。
 - 把 `session.list` 并发发到每个允许的上游，并给会话 id 加上上游 id 前缀。
 - 带上游前缀的会话调用回到那台上游；没有会话 id 的 `session.create` 和其他无主机调用按[路由与故障转移](#路由与故障转移)处理。
 - 把嵌套的 `ticket` 字符串换成一次性网关票据，并按消息原样桥接 `rex.data.terminal.v1`。
@@ -161,7 +161,7 @@ avoid_hosts = []
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 27,
+  "api_server_revision": 28,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -198,14 +198,14 @@ avoid_hosts = []
 
 ## 开发与测试
 
-`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、票据退回、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码、事件滞后通知、控制响应刷新空闲、钉住主机离线文案，以及控制面在途 RPC 上限。
+`cargo test --locked` 是完全在本仓库内运行的检查。它不需要 Rex。覆盖配置解析、认证、票据 TTL 与归属、票据退回、会话重启 / TTL / 容量、发现的对账规则、探测状态、路由、故障转移、帧级错误透传、数据面关闭码（含已忘记会话的二进制 REJECT）、事件滞后通知、控制响应刷新空闲、钉住主机离线文案、控制面在途 RPC 上限，以及 panic 时释放在途槽位。
 
 ```sh
 cargo test --locked
 cargo build --locked
 ```
 
-在当前这棵树上，`cargo test --locked` 用 rustc 1.99.1 通过了 125 项测试。`--locked` 让构建停在 `Cargo.lock` 上；Cargo 1.83 无法解析这份锁文件。
+在当前这棵树上，`cargo test --locked` 用 rustc 1.99.1 通过了 130 项测试。`--locked` 让构建停在 `Cargo.lock` 上；Cargo 1.83 无法解析这份锁文件。
 
 现场脚本的工作目录必须是仓库根，地址是 `127.0.0.1:7300`，令牌是 `smoke-secret`。它们不属于 `cargo test`。
 
@@ -280,7 +280,7 @@ cargo build --locked
 
 只有 `type` 为 `request` 的文本帧会被分发。非法 JSON 和其他类型会被忽略。第一帧必须是 `hello`；否则在欢迎消息之前关闭套接字。
 
-每条 agent 连接同时最多进行 16 个上游调用。这些调用在途时，套接字循环仍负责入站帧、事件转发、ping 和空闲关闭。超出上限时立刻返回，不会调用上游：
+每条 agent 连接同时最多进行 16 个上游调用。这些调用在途时，套接字循环仍负责入站帧、事件转发、ping 和空闲关闭。处理函数 panic 时仍会释放槽位，并以 `payload.error` `control RPC task panicked` 应答，避免容量泄漏到重连。超出上限时立刻返回，不会调用上游：
 
 ```json
 {"type":"response","id":"<id>","seq":1,"payload":{"error":"too many in-flight control RPCs"}}
@@ -357,7 +357,7 @@ Agent 的 HELLO 是字节 `0x01` 加上这 16 个原始字节。网关随后拨�
 | `data_connect_timeout_ms` 内没有 HELLO | 二进制 `0x82 0x05`，关闭 `1008` `HELLO timeout` |
 | HELLO 不是 `0x01` 加 16 字节 | 二进制 `0x82 0x05`，关闭 `1002` `malformed HELLO` |
 | 未知、过期、被淘汰或已经用过 | 二进制 `0x82 0x01`，关闭 `1008` `bad or used ticket`。错误持有者得到同样的响应，且不消耗票据 |
-| 票据上的会话引用已被忘记 | 关闭 `1008` `session reference expired/forgotten`。票据保持已消耗，不退回 |
+| 票据上的会话引用已被忘记 | 二进制 `0x82 0x01`，关闭 `1008` `session reference expired/forgotten`。票据保持已消耗，不退回 |
 | 所属上游已不在池中，或它的数据 URL 不能变成客户端请求 | 关闭 `1011` `upstream unavailable`。票据退回 |
 | 拨号上游超过 `data_connect_timeout_ms` | 关闭 `1011` `upstream connect timeout`。票据退回 |
 | 拨号上游失败 | 关闭 `1011` `upstream connection failed`。票据退回 |
@@ -397,7 +397,7 @@ Agent 的 HELLO 是字节 `0x01` 加上这 16 个原始字节。网关随后拨�
 
 `session.forget` 要求带前缀的 id，检查 ACL，把 id 加入 `forgotten`，并返回 `{"forgotten":true|false,"session_id":"…"}`。id 原本不在 `entries` 里时 `forgotten` 为 false。重复调用是安全的。Rex 会话不会被删除。
 
-之后的控制调用、列举、attach、`data.connect` 以及转发的终端字节，会在内存里刷新 `last_active_ms`。把这些触摸写盘的是回收器。列举会刷新它返回的每个会话，并且 `record` 会把该 id 从 `forgotten` 里去掉。Rex 仍在列举的会话，在 forget 或 TTL 丢掉之后还会再出现。格式正确、但本文件从未存过的 `<上游>:session:…` 仍可用于路由（`resolve` 不会把它插入文件）。格式不对的 id 是 `unknown session reference`。已忘记的 id 在 list/send/read/bootstrap/attach/`data.connect` 上是 `session reference expired/forgotten`。绑定到该 id 的数据票据（来自列举、bootstrap、create、事件或 `data.connect`）以 1008 和同一句原因关闭，并且这张票据不退回。
+之后的控制调用、列举、attach、`data.connect` 以及转发的终端字节，会在内存里刷新 `last_active_ms`。把这些触摸写盘的是回收器。列举会刷新它返回的每个会话，并且 `record` 会把该 id 从 `forgotten` 里去掉。Rex 仍在列举的会话，在 forget 或 TTL 丢掉之后还会再出现。格式正确、但本文件从未存过的 `<上游>:session:…` 仍可用于路由（`resolve` 不会把它插入文件）。格式不对的 id 是 `unknown session reference`。已忘记的 id 在 list/send/read/bootstrap/attach/`data.connect` 上是 `session reference expired/forgotten`。绑定到该 id 的数据票据（来自列举、bootstrap、create、事件或 `data.connect`）先发二进制 `0x82 0x01`，再以 1008 和同一句原因关闭，并且这张票据不退回。
 
 上游 id 不能包含 `:`。前缀在第一个冒号处切开，余下部分必须以 `session:` 开头。
 

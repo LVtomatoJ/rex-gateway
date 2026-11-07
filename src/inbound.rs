@@ -1,4 +1,4 @@
-use std::{borrow::Cow, net::SocketAddr, sync::Arc, time::Duration};
+use std::{borrow::Cow, net::SocketAddr, panic::AssertUnwindSafe, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use axum::{
@@ -12,7 +12,7 @@ use axum::{
     routing::get,
     Router,
 };
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio_tungstenite::{
@@ -174,7 +174,7 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
             return;
         }
     }
-    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":27});
+    let welcome = json!({"type":"welcome","protocol":SUBPROTOCOL,"limits":{"max_message_bytes":MAX_MESSAGE_BYTES,"max_in_flight_control_rpcs":MAX_IN_FLIGHT_CONTROL_RPCS},"client":{"id":format!("client:{}",uuid::Uuid::new_v4()),"reconnect_token":uuid::Uuid::new_v4().to_string()},"api_server_revision":28});
     if socket.send(Message::Text(welcome.to_string())).await.is_err() { return; }
     let (mut sink, mut stream) = socket.split();
     let mut events = state.events.subscribe();
@@ -212,8 +212,13 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
                         let owner = owner.clone();
                         let tx = rpc_tx.clone();
                         tokio::spawn(async move {
-                            let result = handle(&state, &acl, &owner, &method, payload).await;
-                            // Agent may have closed; dropping the response is fine (no panic).
+                            // catch_unwind so a panicked handler still frees the in-flight slot
+                            // (otherwise overflow would stick until the agent reconnects).
+                            let result = AssertUnwindSafe(handle(&state, &acl, &owner, &method, payload))
+                                .catch_unwind()
+                                .await
+                                .unwrap_or_else(|_| Err("control RPC task panicked".into()));
+                            // Agent may have closed; dropping the response is fine.
                             let _ = tx.send((id, result)).await;
                         });
                     }
@@ -285,6 +290,11 @@ async fn serve_agent(mut socket: WebSocket, state: AppState, acl: Vec<String>, o
 }
 
 async fn handle(state: &AppState, acl: &[String], owner: &str, method: &str, mut payload: Value) -> Result<AgentReply, String> {
+    // Test-only: prove a panicked RPC still releases its in-flight slot (see integration test).
+    #[cfg(test)]
+    if method == "gateway.__test_panic" {
+        panic!("intentional test panic");
+    }
     let external_session=payload.get("session_id").and_then(Value::as_str).map(str::to_owned);
     if method == "session.list" { return list_sessions(state, acl, owner, &state.sessions).await.map(AgentReply::Payload); }
     if method == "session.forget" {
@@ -631,8 +641,13 @@ async fn proxy_data(mut agent: WebSocket, state: AppState, owner: String) {
         return;
     };
     if let Some(id)=taken.ticket.session_id.as_deref(){
-        // Forgotten/expired session: leave the ticket burned (do not restore).
-        if state.sessions.resolve(id).is_err(){let _=agent.send(Message::Close(Some(CloseFrame{code:1008,reason:Cow::Borrowed(FORGOTTEN_ERROR)}))).await;return;}
+        // Forgotten/expired session: binary REJECT (same opcode family as bad ticket) then
+        // close with the control-plane forgotten reason. Leave the ticket burned (do not restore).
+        if state.sessions.resolve(id).is_err(){
+            let _ = agent.send(Message::Binary(vec![0x82, 0x01].into())).await;
+            let _ = agent.send(Message::Close(Some(CloseFrame{code:1008,reason:Cow::Borrowed(FORGOTTEN_ERROR)}))).await;
+            return;
+        }
         state.sessions.touch(id);
     }
     let Some(upstream) = state.pool.get(&taken.ticket.upstream).await else {

@@ -17,7 +17,7 @@ It is a single Rust binary in this repository (`rex-gateway`). It does not embed
 ## What it does
 
 - Authenticates `GET /api/control`, `GET /api/data`, and `GET /status` with a bearer token before any WebSocket upgrade.
-- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **27**.
+- Speaks `rex.control.v1`. The welcome message's `api_server_revision` is **28**.
 - Fans `session.list` out to every allowed upstream and prefixes session ids with the upstream id.
 - Routes a namespaced session call back to that upstream, and routes a hostless `session.create` or other hostless call with the rules in [Routing and failover](#routing-and-failover).
 - Rewrites nested `ticket` strings to single-use gateway tickets and bridges `rex.data.terminal.v1` byte-for-byte.
@@ -161,7 +161,7 @@ Welcome shape (ids are new on every connection):
 {
   "type": "welcome",
   "protocol": "rex.control.v1",
-  "api_server_revision": 27,
+  "api_server_revision": 28,
   "limits": {
     "max_message_bytes": 1048576,
     "max_in_flight_control_rpcs": 16
@@ -198,14 +198,14 @@ Short version. Exact order, errors, and counters are below.
 
 ## Development
 
-`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes, event-lag notices, control-response idle refresh, host-pin offline errors, and the control-plane in-flight bound.
+`cargo test --locked` is the check that runs entirely inside this repository. It does not need a Rex server. It covers config parsing, auth, ticket TTL and ownership, ticket restore, session restart / TTL / capacity, discovery apply rules, probe state, routing, failover, frame-error pass-through, data-plane close codes (including forgotten-session binary REJECT), event-lag notices, control-response idle refresh, host-pin offline errors, the control-plane in-flight bound, and panic-safe in-flight slot release.
 
 ```sh
 cargo test --locked
 cargo build --locked
 ```
 
-On this tree, `cargo test --locked` passed 125 tests with rustc 1.99.1. `--locked` keeps the build on `Cargo.lock`; Cargo 1.83 cannot parse it.
+On this tree, `cargo test --locked` passed 130 tests with rustc 1.99.1. `--locked` keeps the build on `Cargo.lock`; Cargo 1.83 cannot parse it.
 
 The live scripts assume the repository root as the working directory, `127.0.0.1:7300`, and token `smoke-secret`. They are not part of `cargo test`.
 
@@ -280,7 +280,7 @@ A discovery `command` is spawned as an argument vector, not a shell, with the ga
 
 Only text frames whose `type` is `request` are dispatched. Invalid JSON and any other type are ignored. The first frame must be `hello`; anything else closes the socket before welcome.
 
-Each agent connection runs at most 16 upstream calls at once. The socket loop stays responsible for inbound frames, event forwarding, pings, and idle close while those calls are in flight. Overflow is immediate and does not call upstream:
+Each agent connection runs at most 16 upstream calls at once. The socket loop stays responsible for inbound frames, event forwarding, pings, and idle close while those calls are in flight. A panicked handler still frees its slot and answers with `payload.error` `control RPC task panicked` so capacity does not leak until reconnect. Overflow is immediate and does not call upstream:
 
 ```json
 {"type":"response","id":"<id>","seq":1,"payload":{"error":"too many in-flight control RPCs"}}
@@ -357,7 +357,7 @@ The agent HELLO is the byte `0x01` plus those 16 raw bytes. The gateway then dia
 | No HELLO within `data_connect_timeout_ms` | Binary `0x82 0x05`, close `1008` `HELLO timeout` |
 | HELLO not `0x01` plus 16 bytes | Binary `0x82 0x05`, close `1002` `malformed HELLO` |
 | Unknown, expired, evicted, already used | Binary `0x82 0x01`, close `1008` `bad or used ticket`. Wrong owner is the same response and does not burn the ticket |
-| Ticket's session reference is forgotten | Close `1008` `session reference expired/forgotten`. Ticket stays spent and is not restored |
+| Ticket's session reference is forgotten | Binary `0x82 0x01`, close `1008` `session reference expired/forgotten`. Ticket stays spent and is not restored |
 | Owner upstream missing, or its data URL is not a client request | Close `1011` `upstream unavailable`. Ticket restored |
 | Upstream dial exceeds `data_connect_timeout_ms` | Close `1011` `upstream connect timeout`. Ticket restored |
 | Upstream dial fails | Close `1011` `upstream connection failed`. Ticket restored |
@@ -397,7 +397,7 @@ Default file `rex-gateway-sessions.json` (gitignored under that name). Writes ar
 
 `session.forget` requires a namespaced id, checks the ACL, adds the id to `forgotten`, and returns `{"forgotten":true|false,"session_id":"…"}`. `forgotten` is false when the id was not in `entries`. Repeating it is safe. The Rex session is not deleted.
 
-Later control calls, list, attach, `data.connect`, and relayed terminal bytes refresh `last_active_ms` in memory. The reaper is what persists those touches. Listing refreshes every session the list returned, and `record` removes that id from `forgotten`. A session Rex still lists therefore comes back after a forget or a TTL drop. An unknown but well-formed `<upstream>:session:…` is accepted for routing even if this file has never stored it (`resolve` does not insert it). A malformed id is `unknown session reference`. A forgotten id is `session reference expired/forgotten` on list/send/read/bootstrap/attach/`data.connect`. A data ticket bound to that id (from list, bootstrap, create, an event, or `data.connect`) closes with 1008 and the same reason, and that ticket is not restored.
+Later control calls, list, attach, `data.connect`, and relayed terminal bytes refresh `last_active_ms` in memory. The reaper is what persists those touches. Listing refreshes every session the list returned, and `record` removes that id from `forgotten`. A session Rex still lists therefore comes back after a forget or a TTL drop. An unknown but well-formed `<upstream>:session:…` is accepted for routing even if this file has never stored it (`resolve` does not insert it). A malformed id is `unknown session reference`. A forgotten id is `session reference expired/forgotten` on list/send/read/bootstrap/attach/`data.connect`. A data ticket bound to that id (from list, bootstrap, create, an event, or `data.connect`) gets binary `0x82 0x01` then close 1008 with the same reason, and that ticket is not restored.
 
 Upstream ids must not contain `:`. The prefix is split on the first colon, and the remainder must start with `session:`.
 
